@@ -1623,7 +1623,6 @@ class Scan : public UnaryPrimitive {
         os << "Max";
         break;
     }
-    os << " Reduce";
   }
   bool is_equivalent(const Primitive& other) const override;
 
