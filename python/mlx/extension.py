@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from setuptools import Extension, find_namespace_packages, setup
+from setuptools import Extension
 from setuptools.command.build_ext import build_ext
 
 import mlx
@@ -30,17 +30,14 @@ class CMakeBuild(build_ext):
         debug = int(os.environ.get("DEBUG", 0)) if self.debug is None else self.debug
         cfg = "Debug" if debug else "Release"
 
-        # CMake lets you override the generator - we need to check this.
-        # Can be set with Conda-Build, for example.
-        cmake_generator = os.environ.get("CMAKE_GENERATOR", "")
-
-        # Set Python_EXECUTABLE instead if you use PYBIND11_FINDPYTHON
-        # EXAMPLE_VERSION_INFO shows you how to pass a value into the C++ code
-        # from Python.
+        # Point CMake at the interpreter running the build. Otherwise
+        # find_package(Python) picks whichever interpreter it finds first,
+        # which is not the one nanobind and mlx are installed into.
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}{os.sep}",
             f"-DCMAKE_BUILD_TYPE={cfg}",
             "-DBUILD_SHARED_LIBS=ON",
+            f"-DPython_EXECUTABLE={sys.executable}",
         ]
         build_args = []
         # Adding CMake arguments set as environment variable
@@ -57,11 +54,7 @@ class CMakeBuild(build_ext):
         # Set CMAKE_BUILD_PARALLEL_LEVEL to control the parallel build level
         # across all generators.
         if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ:
-            # self.parallel is a Python 3 only way to set parallel jobs by hand
-            # using -j in the build_ext call, not supported by pip or PyPA-build.
-            if hasattr(self, "parallel") and self.parallel:
-                # CMake 3.12+ only.
-                build_args += [f"-j{self.parallel}"]
+            build_args += [f"-j{os.cpu_count()}"]
 
         build_temp = Path(self.build_temp) / ext.name
         if not build_temp.exists():
@@ -77,7 +70,7 @@ class CMakeBuild(build_ext):
             ["cmake", "--build", ".", *build_args], cwd=build_temp, check=True
         )
 
-    def run(self):
+    def run(self) -> None:
         super().run()
 
         # Based on https://github.com/pypa/setuptools/blob/main/setuptools/command/build_ext.py#L102

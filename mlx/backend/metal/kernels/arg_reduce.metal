@@ -1,6 +1,5 @@
 // Copyright © 2023 Apple Inc.
 
-#include <metal_atomic>
 #include <metal_simdgroup>
 
 #include "mlx/backend/metal/kernels/utils.h"
@@ -17,7 +16,7 @@ template <typename U>
 struct ArgMin {
   static constexpr constant U init = Limits<U>::max;
 
-  IndexValPair<U> reduce(IndexValPair<U> best, IndexValPair<U> current) {
+  IndexValPair<U> reduce(IndexValPair<U> best, IndexValPair<U> current) thread {
     if (best.val > current.val ||
         (best.val == current.val && best.index > current.index)) {
       return current;
@@ -28,7 +27,7 @@ struct ArgMin {
 
   template <int N>
   IndexValPair<U>
-  reduce_many(IndexValPair<U> best, thread U* vals, uint32_t offset) {
+  reduce_many(IndexValPair<U> best, thread U* vals, uint32_t offset) thread {
     for (int i = 0; i < N; i++) {
       if (vals[i] < best.val) {
         best.val = vals[i];
@@ -43,7 +42,7 @@ template <typename U>
 struct ArgMax {
   static constexpr constant U init = Limits<U>::min;
 
-  IndexValPair<U> reduce(IndexValPair<U> best, IndexValPair<U> current) {
+  IndexValPair<U> reduce(IndexValPair<U> best, IndexValPair<U> current) thread {
     if (best.val < current.val ||
         (best.val == current.val && best.index > current.index)) {
       return current;
@@ -54,7 +53,7 @@ struct ArgMax {
 
   template <int N>
   IndexValPair<U>
-  reduce_many(IndexValPair<U> best, thread U* vals, uint32_t offset) {
+  reduce_many(IndexValPair<U> best, thread U* vals, uint32_t offset) thread {
     for (int i = 0; i < N; i++) {
       if (vals[i] > best.val) {
         best.val = vals[i];
@@ -71,19 +70,20 @@ IndexValPair<U> simd_shuffle_down(IndexValPair<U> data, uint16_t delta) {
       simd_shuffle_down(data.index, delta), simd_shuffle_down(data.val, delta)};
 }
 
-template <typename T, typename Op, int N_READS>
+template <typename T, typename Op, int N_READS = 4>
 [[kernel]] void arg_reduce_general(
     const device T* in [[buffer(0)]],
     device uint32_t* out [[buffer(1)]],
-    const device int* shape [[buffer(2)]],
-    const device size_t* in_strides [[buffer(3)]],
-    const device size_t* out_strides [[buffer(4)]],
-    const device size_t& ndim [[buffer(5)]],
-    const device size_t& axis_stride [[buffer(6)]],
-    const device size_t& axis_size [[buffer(7)]],
-    uint gid [[thread_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint lsize [[threads_per_threadgroup]],
+    const constant int* shape [[buffer(2)]],
+    const constant int64_t* in_strides [[buffer(3)]],
+    const constant int64_t* out_strides [[buffer(4)]],
+    const constant size_t& ndim [[buffer(5)]],
+    const constant int64_t& axis_stride [[buffer(6)]],
+    const constant size_t& axis_size [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]],
+    uint3 gsize [[threads_per_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint3 lsize [[threads_per_threadgroup]],
     uint simd_size [[threads_per_simdgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
@@ -105,17 +105,18 @@ template <typename T, typename Op, int N_READS>
 
   // Compute the input/output index. There is one beginning and one output for
   // the whole threadgroup.
-  auto in_idx = elem_to_loc(gid / lsize, shape, in_strides, ndim);
-  auto out_idx = elem_to_loc(gid / lsize, shape, out_strides, ndim);
+  int64_t row_idx = gid.y + static_cast<int64_t>(gsize.y) * gid.z;
+  auto in_idx = elem_to_loc(row_idx, shape, in_strides, ndim);
+  auto out_idx = elem_to_loc(row_idx, shape, out_strides, ndim);
 
   IndexValPair<T> best{0, Op::init};
 
   threadgroup IndexValPair<T> local_data[32];
 
   // Loop over the reduction axis in lsize*N_READS buckets
-  for (uint r = 0; r < ceildiv(axis_size, N_READS * lsize); r++) {
+  for (uint r = 0; r < ceildiv(axis_size, N_READS * lsize.x); r++) {
     // Read the current value
-    uint32_t current_index = r * lsize * N_READS + lid * N_READS;
+    uint32_t current_index = r * lsize.x * N_READS + lid.x * N_READS;
     uint32_t offset = current_index;
     const device T* current_in = in + in_idx + current_index * axis_stride;
     T vals[N_READS];
@@ -145,7 +146,7 @@ template <typename T, typename Op, int N_READS>
   }
 
   // Read the appropriate value from local data and perform one simd reduction
-  uint simd_groups = ceildiv(lsize, simd_size);
+  uint simd_groups = ceildiv(lsize.x, simd_size);
   if (simd_lane_id < simd_groups) {
     best = local_data[simd_lane_id];
   }
@@ -155,33 +156,17 @@ template <typename T, typename Op, int N_READS>
   }
 
   // Finally write the output
-  if (lid == 0) {
+  if (lid.x == 0) {
     out[out_idx] = best.index;
   }
 }
 
-#define instantiate_arg_reduce_helper(name, itype, op) \
-  template [[host_name(name)]] [[kernel]] void         \
-  arg_reduce_general<itype, op<itype>, 4>(             \
-      const device itype* in [[buffer(0)]],            \
-      device uint32_t* out [[buffer(1)]],              \
-      const device int* shape [[buffer(2)]],           \
-      const device size_t* in_strides [[buffer(3)]],   \
-      const device size_t* out_strides [[buffer(4)]],  \
-      const device size_t& ndim [[buffer(5)]],         \
-      const device size_t& axis_stride [[buffer(6)]],  \
-      const device size_t& axis_size [[buffer(7)]],    \
-      uint gid [[thread_position_in_grid]],            \
-      uint lid [[thread_position_in_threadgroup]],     \
-      uint lsize [[threads_per_threadgroup]],          \
-      uint simd_size [[threads_per_simdgroup]],        \
-      uint simd_lane_id [[thread_index_in_simdgroup]], \
-      uint simd_group_id [[simdgroup_index_in_threadgroup]]);
-
 // clang-format off
 #define instantiate_arg_reduce(name, itype)                      \
-  instantiate_arg_reduce_helper("argmin_" #name , itype, ArgMin) \
-  instantiate_arg_reduce_helper("argmax_" #name , itype, ArgMax)
+  instantiate_kernel(                                            \
+      "argmin_" #name, arg_reduce_general, itype, ArgMin<itype>) \
+  instantiate_kernel(                                            \
+      "argmax_" #name, arg_reduce_general, itype, ArgMax<itype>)
 
 instantiate_arg_reduce(bool_, bool)
 instantiate_arg_reduce(uint8, uint8_t)

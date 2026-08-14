@@ -4,19 +4,20 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/variant.h>
 
 #include "mlx/stream.h"
 #include "mlx/utils.h"
 
+namespace mx = mlx::core;
 namespace nb = nanobind;
 using namespace nb::literals;
-using namespace mlx::core;
 
 // Create the StreamContext on enter and delete on exit.
 class PyStreamContext {
  public:
-  PyStreamContext(StreamOrDevice s) : _inner(nullptr) {
+  PyStreamContext(mx::StreamOrDevice s) : _inner(nullptr) {
     if (std::holds_alternative<std::monostate>(s)) {
       throw std::runtime_error(
           "[StreamContext] Invalid argument, please specify a stream or device.");
@@ -25,7 +26,7 @@ class PyStreamContext {
   }
 
   void enter() {
-    _inner = new StreamContext(_s);
+    _inner = new mx::StreamContext(_s);
   }
 
   void exit() {
@@ -36,40 +37,62 @@ class PyStreamContext {
   }
 
  private:
-  StreamOrDevice _s;
-  StreamContext* _inner;
+  mx::StreamOrDevice _s;
+  mx::StreamContext* _inner;
 };
 
 void init_stream(nb::module_& m) {
-  nb::class_<Stream>(
+  nb::class_<mx::Stream>(
       m,
       "Stream",
       R"pbdoc(
       A stream for running operations on a given device.
       )pbdoc")
-      .def(nb::init<int, Device>(), "index"_a, "device"_a)
-      .def_ro("device", &Stream::device)
+      .def_ro("device", &mx::Stream::device)
       .def(
           "__repr__",
-          [](const Stream& s) {
+          [](const mx::Stream& s) {
             std::ostringstream os;
             os << s;
             return os.str();
           })
-      .def("__eq__", [](const Stream& s1, const Stream& s2) {
-        return s1 == s2;
+      .def("__eq__", [](const mx::Stream& s, const nb::object& other) {
+        return nb::isinstance<mx::Stream>(other) &&
+            s == nb::cast<mx::Stream>(other);
       });
 
-  nb::implicitly_convertible<Device::DeviceType, Device>();
+  nb::class_<mx::ThreadLocalStream>(
+      m,
+      "ThreadLocalStream",
+      R"pbdoc(
+      A stream that will be unique per thread and can be used to run operations on a given device.
+      )pbdoc")
+      .def_ro("device", &mx::ThreadLocalStream::device)
+      .def(
+          "__repr__",
+          [](const mx::ThreadLocalStream& s) {
+            std::ostringstream os;
+            os << "ThreadLocalStream(" << s.device << ", " << s.index << ")";
+            return os.str();
+          })
+      .def(
+          "__eq__",
+          [](const mx::ThreadLocalStream& s, const nb::object& other) {
+            return nb::isinstance<mx::ThreadLocalStream>(other) &&
+                s == nb::cast<mx::ThreadLocalStream>(other);
+          });
+
+  nb::implicitly_convertible<mx::Device::DeviceType, mx::Device>();
 
   m.def(
       "default_stream",
-      &default_stream,
+      &mx::default_stream,
       "device"_a,
+      nb::sig("def default_stream(device: Device | DeviceType) -> Stream"),
       R"pbdoc(Get the device's default stream.)pbdoc");
   m.def(
       "set_default_stream",
-      &set_default_stream,
+      &mx::set_default_stream,
       "stream"_a,
       R"pbdoc(
         Set the default stream.
@@ -82,9 +105,40 @@ void init_stream(nb::module_& m) {
       )pbdoc");
   m.def(
       "new_stream",
-      &new_stream,
+      &mx::new_stream,
       "device"_a,
-      R"pbdoc(Make a new stream on the given device.)pbdoc");
+      nb::sig("def new_stream(device: Device | DeviceType) -> Stream"),
+      R"pbdoc(
+        Make a new stream on the given device.
+
+        The stream can only be used on the thread where it was created on, using
+        it in any other thread would result in errors.
+      )pbdoc");
+  m.def(
+      "new_thread_unsafe_stream",
+      &mx::new_thread_unsafe_stream,
+      "device"_a,
+      nb::sig(
+          "def new_thread_unsafe_stream(device: Device | DeviceType) -> Stream"),
+      R"pbdoc(
+        Make a new stream that can be used in any thread.
+
+        Unlike :func:`new_stream` which can only work on the thread of creation,
+        streams created by this API can be passed to and evaluated anywhere, but
+        note that currently all nodes in a graph must be evaluated in sequence
+        and it is user's responsibilty to ensure there is no race condition.
+      )pbdoc");
+  m.def(
+      "new_thread_local_stream",
+      &mx::new_thread_local_stream,
+      "device"_a,
+      nb::sig(
+          "def new_thread_local_stream(device: Device | DeviceType) -> ThreadLocalStream"),
+      R"pbdoc(Make a new stream that will be unique per thread.)pbdoc");
+  m.def(
+      "clear_streams",
+      &mx::clear_streams,
+      R"pbdoc(Destroy all streams created in current thread.)pbdoc");
 
   nb::class_<PyStreamContext>(m, "StreamContext", R"pbdoc(
         A context manager for setting the current device and stream.
@@ -94,7 +148,7 @@ void init_stream(nb::module_& m) {
         Args:
             s: The stream or device to set as the default.
   )pbdoc")
-      .def(nb::init<StreamOrDevice>(), "s"_a)
+      .def(nb::init<mx::StreamOrDevice>(), "s"_a)
       .def("__enter__", [](PyStreamContext& scm) { scm.enter(); })
       .def(
           "__exit__",
@@ -107,7 +161,7 @@ void init_stream(nb::module_& m) {
           "traceback"_a = nb::none());
   m.def(
       "stream",
-      [](StreamOrDevice s) { return PyStreamContext(s); },
+      [](mx::StreamOrDevice s) { return PyStreamContext(s); },
       "s"_a,
       R"pbdoc(
         Create a context manager to set the default device and stream.
@@ -131,15 +185,20 @@ void init_stream(nb::module_& m) {
       )pbdoc");
   m.def(
       "synchronize",
-      [](const std::optional<Stream>& s) {
-        s ? synchronize(s.value()) : synchronize();
+      [](mx::StreamOrDevice s) {
+        if (std::holds_alternative<std::monostate>(s)) {
+          mx::synchronize();
+        } else {
+          mx::synchronize(mx::to_stream(s));
+        }
       },
       "stream"_a = nb::none(),
       R"pbdoc(
       Synchronize with the given stream.
 
       Args:
-        stream (Stream, optional): The stream to synchronize with. If ``None``
+        stream (Stream, optional): Stream to synchronize. If device is
+           provided the default stream for that device is used. If ``None``
            then the default stream of the default device is used.
            Default: ``None``.
       )pbdoc");

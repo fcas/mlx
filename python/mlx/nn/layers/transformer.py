@@ -82,29 +82,21 @@ class MultiHeadAttention(Module):
         values = self.value_proj(values)
 
         num_heads = self.num_heads
-        B, L, D = queries.shape
-        _, S, _ = keys.shape
-        queries = queries.reshape(B, L, num_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, S, num_heads, -1).transpose(0, 2, 3, 1)
-        values = values.reshape(B, S, num_heads, -1).transpose(0, 2, 1, 3)
-
-        # Dimensions are [batch x num heads x sequence x hidden dim]
+        queries = mx.unflatten(queries, -1, (num_heads, -1)).transpose(0, 2, 1, 3)
+        keys = mx.unflatten(keys, -1, (num_heads, -1)).transpose(0, 2, 1, 3)
+        values = mx.unflatten(values, -1, (num_heads, -1)).transpose(0, 2, 1, 3)
         scale = math.sqrt(1 / queries.shape[-1])
-        scores = (queries * scale) @ keys
-        if mask is not None:
-            scores = scores + mask.astype(scores.dtype)
-        scores = mx.softmax(scores, axis=-1)
-        values_hat = (scores @ values).transpose(0, 2, 1, 3).reshape(B, L, -1)
-
-        return self.out_proj(values_hat)
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=scale, mask=mask
+        )
+        output = output.transpose(0, 2, 1, 3).flatten(-2, -1)
+        return self.out_proj(output)
 
     @staticmethod
     def create_additive_causal_mask(N: int, dtype: mx.Dtype = mx.float32):
         indices = mx.arange(N)
         mask = indices[:, None] < indices[None]
-        # usually inf but 1e9 is as good and softmax(full(1e9)) != nan
-        # TODO: Should replace this with finfo(dtype).min
-        mask = mask.astype(dtype) * -1e9
+        mask = mask.astype(dtype) * mx.finfo(dtype).min
         return mask
 
 
@@ -147,9 +139,9 @@ class TransformerEncoderLayer(Module):
         else:
             y = self.attention(x, x, x, mask)
             y = self.dropout1(y)
-            y = self.ln1(x + y)
+            x = self.ln1(x + y)
 
-            y = self.linear1(y)
+            y = self.linear1(x)
             y = self.activation(y)
             y = self.dropout2(y)
             y = self.linear2(y)
@@ -236,9 +228,9 @@ class TransformerDecoderLayer(Module):
             y = self.dropout1(y)
             x = self.ln1(x + y)
 
-            y = self.cross_attention(y, memory, memory, memory_mask)
+            y = self.cross_attention(x, memory, memory, memory_mask)
             y = self.dropout2(y)
-            x = self.ln1(x + y)
+            x = self.ln2(x + y)
 
             y = self.linear1(x)
             y = self.activation(y)
@@ -314,7 +306,7 @@ class Transformer(Module):
         norm_first (bool, optional): if ``True``, encoder and decoder layers
             will perform layer normalization before attention and MLP
             operations, otherwise after. Default: ``True``.
-        chekpoint (bool, optional): if ``True`` perform gradient checkpointing
+        checkpoint (bool, optional): if ``True`` perform gradient checkpointing
             to reduce the memory usage at the expense of more computation.
             Default: ``False``.
     """
@@ -335,27 +327,33 @@ class Transformer(Module):
     ):
         super().__init__()
 
-        self.encoder = custom_encoder or TransformerEncoder(
-            num_encoder_layers,
-            dims,
-            num_heads,
-            mlp_dims,
-            dropout,
-            activation,
-            norm_first,
-            checkpoint,
-        )
+        if custom_encoder is not None:
+            self.encoder = custom_encoder
+        else:
+            self.encoder = TransformerEncoder(
+                num_encoder_layers,
+                dims,
+                num_heads,
+                mlp_dims,
+                dropout,
+                activation,
+                norm_first,
+                checkpoint,
+            )
 
-        self.decoder = custom_decoder or TransformerDecoder(
-            num_decoder_layers,
-            dims,
-            num_heads,
-            mlp_dims,
-            dropout,
-            activation,
-            norm_first,
-            checkpoint,
-        )
+        if custom_decoder is not None:
+            self.decoder = custom_decoder
+        else:
+            self.decoder = TransformerDecoder(
+                num_decoder_layers,
+                dims,
+                num_heads,
+                mlp_dims,
+                dropout,
+                activation,
+                norm_first,
+                checkpoint,
+            )
 
     def __call__(self, src, tgt, src_mask, tgt_mask, memory_mask):
         memory = self.encoder(src, src_mask)

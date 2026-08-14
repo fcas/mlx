@@ -1,5 +1,4 @@
 // Copyright © 2023-2024 Apple Inc.
-
 #include <cassert>
 #include <numeric>
 
@@ -7,6 +6,7 @@
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
 #include "mlx/transforms.h"
+#include "mlx/transforms_impl.h"
 
 namespace mlx::core::fast {
 
@@ -18,7 +18,7 @@ std::vector<array> Custom::vjp(
   auto [_, vjps] = mlx::core::vjp(fallback_, primals, cotangents);
   std::vector<array> vjp_outs;
   for (int i = 0, j = 0; i < vjps.size(); ++i) {
-    if (i < argnums.size() && i == argnums[j]) {
+    if (j < argnums.size() && i == argnums[j]) {
       vjp_outs.push_back(vjps[i]);
       j++;
     }
@@ -30,15 +30,16 @@ std::vector<array> Custom::jvp(
     const std::vector<array>& primals,
     const std::vector<array>& tangents,
     const std::vector<int>& argnums) {
-  auto [_, jvps] = mlx::core::jvp(fallback_, primals, tangents);
-  std::vector<array> jvp_outs;
-  for (int i = 0, j = 0; i < jvps.size(); ++i) {
-    if (i < argnums.size() && i == argnums[j]) {
-      jvp_outs.push_back(jvps[i]);
-      j++;
+  std::vector<array> all_tangents;
+  for (int i = 0, j = 0; i < primals.size(); i++) {
+    if (j < argnums.size() && i == argnums[j]) {
+      all_tangents.emplace_back(tangents[j++]);
+    } else {
+      all_tangents.emplace_back(zeros_like(primals[i]));
     }
   }
-  return jvp_outs;
+  auto [_, jvps] = mlx::core::jvp(fallback_, primals, all_tangents);
+  return jvps;
 }
 
 std::pair<std::vector<array>, std::vector<int>> Custom::vmap(
@@ -51,22 +52,34 @@ std::pair<std::vector<array>, std::vector<int>> Custom::vmap(
 
 array rms_norm(
     const array& x,
-    const array& weight,
+    const std::optional<array>& weight,
     float eps,
     StreamOrDevice s_ /* = {} */) {
+  bool has_weight = weight.has_value();
+
   if (x.ndim() == 0) {
     std::ostringstream msg;
     msg << "[rms_norm] Input must have at least 1 dimension but got input with "
            "0 dimensions.";
     throw std::invalid_argument(msg.str());
   }
-  if (weight.ndim() != 1) {
-    std::ostringstream msg;
-    msg << "[rms_norm] weight must have 1 dimension but has " << weight.ndim()
-        << " dimensions.";
-    throw std::invalid_argument(msg.str());
+  if (has_weight) {
+    if ((*weight).ndim() != 1) {
+      std::ostringstream msg;
+      msg << "[rms_norm] (*weight) must have 1 dimension but has "
+          << (*weight).ndim() << " dimensions.";
+      throw std::invalid_argument(msg.str());
+    }
+    if ((*weight).size() != x.shape(-1)) {
+      std::ostringstream msg;
+      msg << "[rms_norm] (*weight) must have the same size as the last dimension of"
+             " x but has "
+          << (*weight).size() << " elements.";
+      throw std::invalid_argument(msg.str());
+    }
   }
-  auto out_type = result_type(x, weight);
+
+  auto out_type = (weight.has_value()) ? result_type(x, (*weight)) : x.dtype();
   if (!issubdtype(out_type, floating)) {
     std::ostringstream msg;
     msg << "[rms_norm] Received unsupported type " << out_type << ".";
@@ -74,27 +87,37 @@ array rms_norm(
   }
 
   auto s = to_stream(s_);
-  auto fallback = [eps, out_type, s](const std::vector<array>& inputs) {
-    auto x = astype(inputs[0], float32, s);
-    x = multiply(
-        x,
-        rsqrt(
-            add(mean(square(x, s), -1, /* keepdims */ true, s),
-                array(eps, float32),
+  auto fallback =
+      [has_weight, eps, out_type, s](const std::vector<array>& inputs) {
+        auto x = astype(inputs[0], float32, s);
+        x = multiply(
+            x,
+            rsqrt(
+                add(mean(square(x, s), -1, /* keepdims */ true, s),
+                    array(eps, float32),
+                    s),
                 s),
-            s),
-        s);
-    x = astype(x, out_type, s);
-    return std::vector<array>{multiply(inputs[1], x, s)};
-  };
-  if (s.device == Device::gpu) {
+            s);
+        x = astype(x, out_type, s);
+
+        if (has_weight) {
+          x = multiply(x, inputs[1], s);
+        }
+
+        return std::vector<array>{x};
+      };
+
+  auto passed_weight =
+      (has_weight) ? astype(*weight, out_type, s) : array(1, out_type);
+
+  if (!RMSNorm::use_fallback(s)) {
     return array(
         x.shape(),
         out_type,
         std::make_shared<RMSNorm>(s, fallback, eps),
-        {astype(x, out_type, s), astype(weight, out_type, s)});
+        {astype(x, out_type, s), passed_weight});
   }
-  return fallback({x, weight})[0];
+  return fallback({x, passed_weight})[0];
 }
 
 std::vector<array> RMSNorm::vjp(
@@ -130,8 +153,12 @@ std::vector<array> RMSNorm::vjp(
     // df/dw
     std::vector<int> axes(g.ndim() - 1);
     std::iota(axes.begin(), axes.end(), 0);
-    vjps.push_back(
-        sum(multiply(g, multiply(x, n, s), s), axes, /* keepdims= */ false, s));
+    if (w.ndim() == 0) {
+      vjps.push_back(zeros_like(w, s));
+    } else {
+      vjps.push_back(sum(
+          multiply(g, multiply(x, n, s), s), axes, /* keepdims= */ false, s));
+    }
 
     return vjps;
   };
@@ -166,28 +193,48 @@ array layer_norm(
     const std::optional<array>& bias,
     float eps,
     StreamOrDevice s_ /* = {} */) {
+  bool has_weight = weight.has_value();
+  bool has_bias = bias.has_value();
+
   if (x.ndim() == 0) {
     std::ostringstream msg;
     msg << "[layer_norm] Input must have at least 1 dimension but got input with "
            "0 dimensions.";
     throw std::invalid_argument(msg.str());
   }
-  if (weight.has_value() && (*weight).ndim() != 1) {
-    std::ostringstream msg;
-    msg << "[layer_norm] weight must have 1 dimension but has "
-        << (*weight).ndim() << " dimensions.";
-    throw std::invalid_argument(msg.str());
+  if (has_weight) {
+    if ((*weight).ndim() != 1) {
+      std::ostringstream msg;
+      msg << "[layer_norm] weight must have 1 dimension but has "
+          << (*weight).ndim() << " dimensions.";
+      throw std::invalid_argument(msg.str());
+    }
+    if ((*weight).size() != x.shape(-1)) {
+      std::ostringstream msg;
+      msg << "[layer_norm] weight must have the same size as the last dimension of"
+             " x but has "
+          << (*weight).size() << " elements.";
+      throw std::invalid_argument(msg.str());
+    }
   }
-  if (bias.has_value() && (*bias).ndim() != 1) {
-    std::ostringstream msg;
-    msg << "[layer_norm] bias must have 1 dimension but has " << (*bias).ndim()
-        << " dimensions.";
-    throw std::invalid_argument(msg.str());
+  if (has_bias) {
+    if ((*bias).ndim() != 1) {
+      std::ostringstream msg;
+      msg << "[layer_norm] bias must have 1 dimension but has "
+          << (*bias).ndim() << " dimensions.";
+      throw std::invalid_argument(msg.str());
+    }
+    if ((*bias).size() != x.shape(-1)) {
+      std::ostringstream msg;
+      msg << "[layer_norm] bias must have the same size as the last dimension of"
+             " x but has "
+          << (*bias).size() << " elements.";
+      throw std::invalid_argument(msg.str());
+    }
   }
 
-  auto out_type = (weight.has_value())
-      ? ((bias.has_value()) ? result_type(x, *weight, *bias)
-                            : result_type(x, *weight))
+  auto out_type = (has_weight)
+      ? ((has_bias) ? result_type(x, *weight, *bias) : result_type(x, *weight))
       : x.dtype();
   if (!issubdtype(out_type, floating)) {
     std::ostringstream msg;
@@ -196,19 +243,15 @@ array layer_norm(
   }
 
   auto s = to_stream(s_);
-  bool has_weight = weight.has_value();
-  bool has_bias = bias.has_value();
   auto fallback = [has_weight, has_bias, eps, out_type, s](
                       const std::vector<array>& inputs) {
     auto x = astype(inputs[0], float32, s);
 
-    // Should I not be smart here and leave the double mean to simplify()?
     auto mu = mean(x, /* axis= */ -1, /* keepdims= */ true, s);
-    auto mu2 = square(mu, s);
-    auto x2 = mean(square(x, s), /* axis= */ -1, /* keepdims= */ true, s);
-    auto v = subtract(x2, mu2, s);
+    auto xc = subtract(x, mu, s);
+    auto v = mean(square(xc, s), /* axis= */ -1, /* keepdims= */ true, s);
 
-    x = multiply(subtract(x, mu, s), rsqrt(add(v, array(eps, float32), s), s));
+    x = multiply(xc, rsqrt(add(v, array(eps, float32), s), s));
     x = astype(x, out_type, s);
 
     // If the LN is affine then transform x according to the weight and bias
@@ -223,11 +266,11 @@ array layer_norm(
   };
 
   auto passed_weight =
-      astype((weight.has_value()) ? *weight : array(1, out_type), out_type);
+      (has_weight) ? astype(*weight, out_type, s) : array(1, out_type);
   auto passed_bias =
-      astype((bias.has_value()) ? *bias : array(0, out_type), out_type);
+      (has_bias) ? astype(*bias, out_type, s) : array(0, out_type);
 
-  if (s.device == Device::gpu) {
+  if (!LayerNorm::use_fallback(s)) {
     return array(
         x.shape(),
         out_type,
@@ -289,7 +332,7 @@ std::vector<array> LayerNorm::vjp(
 
     // df/db
     if (b.ndim() == 0) {
-      vjps.push_back(zeros_like(w, s));
+      vjps.push_back(zeros_like(b, s));
     } else {
       vjps.push_back(sum(g, axes, /* keepdims= */ false, s));
     }
@@ -322,37 +365,111 @@ bool LayerNormVJP::is_equivalent(const Primitive& other) const {
 }
 
 array rope(
-    const array& x,
+    std::vector<array> inputs,
     int dims,
     bool traditional,
     float base,
     float scale,
-    int offset,
     bool forward,
     StreamOrDevice s) {
+  auto& x = inputs[0];
+  auto& offset = inputs[1];
   if (x.ndim() < 3) {
     std::ostringstream msg;
     msg << "[rope] Input must have at least 3 dimensions but got input with "
         << x.ndim() << " dimensions.";
     throw std::invalid_argument(msg.str());
   }
+  if (!issubdtype(x.dtype(), floating)) {
+    std::ostringstream msg;
+    msg << "[rope] Input must be a floating type but got " << x.dtype() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (offset.ndim() > 1) {
+    std::ostringstream msg;
+    msg << "[rope] offset must have at most one dimension but has shape "
+        << offset.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (offset.size() != 1 && offset.size() != x.shape(0)) {
+    std::ostringstream msg;
+    msg << "[rope] offset must be a scalar or vector with " << x.shape(0)
+        << " elements but has shape " << offset.shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (!issubdtype(offset.dtype(), integer)) {
+    std::ostringstream msg;
+    msg << "[rope] offset must be an integer but got type " << offset.dtype()
+        << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (offset.dtype().size() != 4) {
+    inputs[1] = astype(offset, int32, s);
+  }
+  if (dims <= 0) {
+    std::ostringstream msg;
+    msg << "[rope] dims must be positive but got " << dims << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (dims % 2 != 0) {
+    std::ostringstream msg;
+    msg << "[rope] dims must be even but got " << dims << ".";
+    throw std::invalid_argument(msg.str());
+  }
+  if (dims > x.shape(-1)) {
+    std::ostringstream msg;
+    msg << "[rope] dims must not exceed the input's last dimension ("
+        << x.shape(-1) << ") but got " << dims << ".";
+    throw std::invalid_argument(msg.str());
+  }
 
-  auto fallback = [dims, traditional, base, scale, offset, forward, s](
-                      const std::vector<array>& inputs) {
-    auto& shape = inputs[0].shape();
-    int ndim = shape.size();
-    auto x = reshape(inputs[0], {-1, shape[ndim - 2], shape[ndim - 1]}, s);
+  if (inputs.size() == 3 &&
+      (inputs[2].ndim() != 1 || inputs[2].shape(0) != dims / 2)) {
+    std::ostringstream msg;
+    msg << "[rope] freqs must be one dimensional with size " << dims / 2
+        << " but got shape " << inputs[2].shape() << ".";
+    throw std::invalid_argument(msg.str());
+  }
+
+  auto fallback = [dims, traditional, base, scale, forward, s](
+                      std::vector<array> inputs) {
+    auto x = inputs[0];
+    auto shape = x.shape();
+    if (x.ndim() == 3) {
+      x = expand_dims(x, 1, s);
+    } else if (x.ndim() > 4) {
+      x = flatten(x, 1, 1 + (x.ndim() - 4), s);
+    }
+
+    auto B = x.shape(0);
+    auto N = x.shape(1);
+    auto T = x.shape(2);
     auto t = x.dtype();
-    auto N = x.shape(1) + offset;
     // Compute sines and cosines
     auto half_dims = dims / 2;
-    auto positions = multiply(arange(offset, N, t, s), array(scale, t), s);
-    auto freqs = negative(arange(0, half_dims, t, s), s);
-    freqs = exp(multiply(freqs, array(std::log(base) / half_dims, t), s), s);
-    auto theta =
-        multiply(expand_dims(positions, 1, s), expand_dims(freqs, 0, s), s);
-    auto coss = cos(theta, s);
-    auto sins = sin(theta, s);
+    auto offset = inputs[1];
+    if (offset.size() > 1) {
+      offset = expand_dims(offset, {-1, -2}, s);
+    }
+    auto positions = multiply(
+        add(arange(x.shape(2), float32, s), offset, s),
+        array(scale, float32),
+        s);
+
+    auto default_inv_freqs = [&s, base, half_dims]() {
+      return exp(
+          multiply(
+              arange(0, -half_dims, -1, float32, s),
+              array(std::log(base) / half_dims, float32),
+              s),
+          s);
+    };
+
+    auto inv_freqs =
+        inputs.size() == 3 ? reciprocal(inputs[2], s) : default_inv_freqs();
+    auto theta = multiply(expand_dims(positions, -1, s), inv_freqs, s);
+    auto coss = astype(cos(theta, s), t, s);
+    auto sins = astype(sin(theta, s), t, s);
 
     auto apply_rope = [forward, s](
                           const array& x1,
@@ -373,55 +490,84 @@ array rope(
     };
 
     if (traditional) {
-      auto x1 =
-          slice(x, {0, 0, 0}, {x.shape(0), x.shape(1), dims}, {1, 1, 2}, s);
-      auto x2 =
-          slice(x, {0, 0, 1}, {x.shape(0), x.shape(1), dims}, {1, 1, 2}, s);
+      auto x1 = slice(x, {0, 0, 0, 0}, {B, N, T, dims}, {1, 1, 1, 2}, s);
+      auto x2 = slice(x, {0, 0, 0, 1}, {B, N, T, dims}, {1, 1, 1, 2}, s);
       auto outs = apply_rope(x1, x2, coss, sins);
       for (auto& o : outs) {
-        o = expand_dims(o, 3, s);
+        o = expand_dims(o, -1, s);
       }
-      auto out = concatenate(outs, 3, s);
+      auto out = reshape(concatenate(outs, -1, s), {B, N, T, dims}, s);
       if (dims < x.shape(-1)) {
-        out = reshape(out, {x.shape(0), x.shape(1), dims});
-        out = concatenate({out, slice(x, {0, 0, dims}, x.shape(), s)}, 2, s);
+        out =
+            concatenate({out, slice(x, {0, 0, 0, dims}, x.shape(), s)}, -1, s);
       }
       return std::vector<array>{reshape(out, shape, s)};
     } else {
       auto out_s = x.shape();
       out_s.back() = half_dims;
-      auto x1 = slice(x, {0, 0, 0}, out_s, s);
+      auto x1 = slice(x, {0, 0, 0, 0}, out_s, s);
       out_s.back() = dims;
-      auto x2 = slice(x, {0, 0, half_dims}, out_s, s);
+      auto x2 = slice(x, {0, 0, 0, half_dims}, out_s, s);
 
       auto outs = apply_rope(x1, x2, coss, sins);
       if (dims < x.shape(-1)) {
-        outs.push_back(slice(x, {0, 0, dims}, x.shape(), s));
+        outs.push_back(slice(x, {0, 0, 0, dims}, x.shape(), s));
       }
-      return std::vector<array>{reshape(concatenate(outs, 2, s), shape, s)};
+      return std::vector<array>{reshape(concatenate(outs, -1, s), shape, s)};
     }
   };
   auto stream = to_stream(s);
-  if (stream.device == Device::gpu) {
+  if (!RoPE::use_fallback(stream)) {
     return array(
         x.shape(),
         x.dtype(),
         std::make_shared<RoPE>(
-            stream, fallback, dims, traditional, base, scale, offset, forward),
-        {x});
+            stream, fallback, dims, traditional, base, scale, forward),
+        std::move(inputs));
   }
-  return fallback({x})[0];
+  return fallback(std::move(inputs))[0];
 }
 
 array rope(
     const array& x,
     int dims,
     bool traditional,
-    float base,
+    std::optional<float> base,
+    float scale,
+    const array& offset,
+    const std::optional<array>& freqs /* = std::nullopt */,
+    StreamOrDevice s /* = {} */) {
+  std::vector<array> inputs = {x, offset};
+  if (freqs) {
+    inputs.push_back(astype(*freqs, float32, s));
+    if (base) {
+      throw std::invalid_argument(
+          "[rope] Only one of base or freqs can have a value.");
+    }
+  } else if (!base) {
+    throw std::invalid_argument("[rope] Neither base nor freqs has a value.");
+  }
+  return rope(
+      std::move(inputs),
+      dims,
+      traditional,
+      base.has_value() ? *base : 1.0,
+      scale,
+      true,
+      s);
+}
+
+array rope(
+    const array& x,
+    int dims,
+    bool traditional,
+    std::optional<float> base,
     float scale,
     int offset,
+    const std::optional<array>& freqs /* = std::nullopt */,
     StreamOrDevice s /* = {} */) {
-  return rope(x, dims, traditional, base, scale, offset, true, s);
+  return rope(
+      x, dims, traditional, base, scale, array(offset, int32), freqs, s);
 }
 
 std::vector<array> RoPE::vjp(
@@ -434,19 +580,25 @@ std::vector<array> RoPE::vjp(
                    traditional = traditional_,
                    base = base_,
                    scale = scale_,
-                   offset = offset_,
                    forward = forward_,
                    s](std::vector<array> inputs) {
     return std::vector<array>{
-        rope(inputs[0], dims, traditional, base, scale, offset, !forward, s)};
+        rope(std::move(inputs), dims, traditional, base, scale, !forward, s)};
   };
-
+  if (argnums.size() > 1 || argnums[0] != 0) {
+    throw std::invalid_argument(
+        "[RoPE::vjp] vjp for offset or frequencies not supported");
+  }
+  auto inputs = std::vector<array>{cotangents[0], primals[1]};
+  if (primals.size() == 3) {
+    inputs.push_back(primals[2]);
+  }
   return {array(
       cotangents[0].shape(),
       cotangents[0].dtype(),
       std::make_shared<RoPE>(
-          s, fallback, dims_, traditional_, base_, scale_, offset_, !forward_),
-      cotangents)};
+          s, fallback, dims_, traditional_, base_, scale_, !forward_),
+      std::move(inputs))};
 }
 
 bool RoPE::is_equivalent(const Primitive& other) const {
@@ -454,7 +606,7 @@ bool RoPE::is_equivalent(const Primitive& other) const {
   return (
       dims_ == a_other.dims_ && base_ == a_other.base_ &&
       scale_ == a_other.scale_ && traditional_ == a_other.traditional_ &&
-      offset_ == a_other.offset_ && forward_ == a_other.forward_);
+      forward_ == a_other.forward_);
 }
 
 /** Computes: O = softmax(Q @ K.T) @ V **/
@@ -463,8 +615,10 @@ array scaled_dot_product_attention(
     const array& keys,
     const array& values,
     const float scale,
-    const std::optional<array>& mask,
-    StreamOrDevice s) {
+    const std::string& mask_mode /* = "" */,
+    std::optional<array> mask_arr /* = {} */,
+    const std::optional<array>& sinks /* = {} */,
+    StreamOrDevice s /* = {}*/) {
   for (const auto& tensor : {queries, keys, values}) {
     if (tensor.ndim() != 4) {
       std::ostringstream msg;
@@ -472,6 +626,41 @@ array scaled_dot_product_attention(
           << tensor.shape() << " expected to be rank 4";
       throw std::invalid_argument(msg.str());
     }
+  }
+  // Check valid mask
+  if (mask_mode != "" && mask_mode != "causal" && mask_mode != "array") {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention] Invalid mask_mode " << mask_mode
+        << ". mask_mode must be 'causal', 'array' or ''.";
+    throw std::invalid_argument(msg.str());
+  }
+
+  bool do_causal = false;
+  bool has_mask = false;
+  bool has_arr_mask = false;
+  bool has_bool_mask = false;
+
+  if (mask_mode == "causal") {
+    has_mask = true;
+    do_causal = true;
+
+    if (mask_arr) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] Invalid mask_arr for mask_mode "
+          << "'casusal'. No array mask should be passed.";
+      throw std::invalid_argument(msg.str());
+    }
+  } else if (mask_arr) {
+    has_mask = true;
+    has_arr_mask = true;
+    has_bool_mask = mask_arr->dtype() == bool_;
+  }
+
+  if (has_arr_mask && mask_arr->ndim() > 4) {
+    std::ostringstream msg;
+    msg << "[scaled_dot_product_attention] the mask with shape "
+        << mask_arr->shape() << " expected to have at most rank 4.";
+    throw std::invalid_argument(msg.str());
   }
 
   const size_t batch_dim = queries.shape(0);
@@ -519,78 +708,251 @@ array scaled_dot_product_attention(
         << final_type << ".";
     throw std::invalid_argument(msg.str());
   }
+  bool has_sinks = sinks.has_value();
 
   auto q = astype(queries, final_type, s);
   auto k = astype(keys, final_type, s);
   auto v = astype(values, final_type, s);
 
-  /* generic implementation for use cases that Metal implementation does not
-   * support. For non-supported cases listed below, use MLX primitives:
-   * * CPU implementation
-   * * batch size > 1
-   * * query sequence length > 1
-   * * non-null mask
-   * * dtype is not fp32 or fp16
-   */
-  bool needs_mask = mask.has_value();
-  auto fallback = [scale, needs_mask, final_type, n_q_heads, n_kv_heads, &s](
-                      const std::vector<array>& inputs) {
+  auto fallback = [scale,
+                   n_q_heads,
+                   n_kv_heads,
+                   do_causal,
+                   has_sinks,
+                   has_arr_mask,
+                   s](const std::vector<array>& inputs) {
     auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
     int n_repeats = n_q_heads / n_kv_heads;
-    int B = q.shape(0);
-    int L = q.shape(2);
     auto k = inputs[1];
     auto v = inputs[2];
     if (n_repeats > 1) {
-      q = reshape(q, {B, n_kv_heads, n_repeats, L, -1}, s);
+      q = unflatten(q, 1, {n_kv_heads, n_repeats}, s);
       k = expand_dims(k, 2, s);
       v = expand_dims(v, 2, s);
     }
     auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
-    if (needs_mask) {
-      scores = add(scores, inputs[3], s);
+    if (has_arr_mask || do_causal) {
+      // Mask must be broadcast-compatible with [B, n_q_heads, L_q, L_kv]
+      auto make_or_fetch_mask = [&]() {
+        if (do_causal) {
+          int kL = k.shape(-2);
+          int qL = q.shape(-2);
+          int offset = kL - qL;
+          auto q_idx = arange(offset, qL + offset, s);
+          auto k_idx = arange(0, kL, s);
+          q_idx = expand_dims(q_idx, 1, s);
+          k_idx = expand_dims(k_idx, 0, s);
+          return greater_equal(q_idx, k_idx, s);
+        }
+        return inputs[3];
+      };
+      auto mask = make_or_fetch_mask();
+
+      if (n_repeats > 1 && mask.ndim() >= 3) {
+        if (mask.shape(-3) == 1) {
+          mask = expand_dims(mask, -3, s);
+        } else {
+          mask = unflatten(mask, -3, {n_kv_heads, n_repeats}, s);
+        }
+      }
+      if (mask.dtype() == bool_) {
+        scores = where(
+            mask, scores, array(finfo(scores.dtype()).min, scores.dtype()), s);
+      } else {
+        scores = add(scores, mask, s);
+      }
+    }
+    if (has_sinks) {
+      auto sinks = inputs.back();
+      // scores has shape B N_q N_k L_q L_k
+      sinks = expand_dims(sinks, {0, 2, 3}, s);
+      if (scores.ndim() == 5) {
+        sinks = unflatten(sinks, 1, {n_kv_heads, n_repeats}, s);
+      }
+      auto bsx_shape = scores.shape();
+      bsx_shape.back() = 1;
+      scores = concatenate({broadcast_to(sinks, bsx_shape, s), scores}, -1, s);
     }
     scores = softmax(scores, std::vector<int>{-1}, true, s);
+    if (has_sinks) {
+      // Slice off scores
+      auto start = Shape(scores.ndim(), 0);
+      start.back() = 1;
+      auto stop = scores.shape();
+      scores = slice(scores, std::move(start), std::move(stop), s);
+    }
     auto out = matmul(scores, v, s);
     if (n_repeats > 1) {
-      out = reshape(out, {B, n_q_heads, L, -1}, s);
+      out = flatten(out, 1, 2, s);
     }
     return std::vector<array>{out};
   };
 
   auto stream = to_stream(s);
-  constexpr const int supported_head_dim = 128;
-  const size_t query_head_dim = q.shape(-1);
-  const size_t query_sequence_length = q.shape(2);
-  bool implementation_supports_use_case = batch_dim == 1 &&
-      query_sequence_length == 1 && !mask.has_value() &&
-      query_head_dim == supported_head_dim && final_type != bfloat16 &&
-      stream.device == Device::gpu;
-  // TODO, update routing conditions post further tuning
-  implementation_supports_use_case &= false;
-  if (implementation_supports_use_case) {
-    auto out_shape =
-        std::vector<int>({q.shape(0), q.shape(1), q.shape(2), v.shape(-1)});
-    auto out = array(
-        std::move(out_shape),
-        final_type,
-        std::make_shared<ScaledDotProductAttention>(
-            stream, fallback, scale, false),
-        {q, k, v});
-    return out;
+  std::vector<array> inputs = {q, k, v};
+  if (has_arr_mask) {
+    // Check type
+    has_bool_mask = mask_arr->dtype() == bool_;
+    if (promote_types(mask_arr->dtype(), final_type) != final_type) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] Mask type must promote to output type "
+          << final_type << ".";
+      throw std::invalid_argument(msg.str());
+    } else if (!has_bool_mask) {
+      mask_arr = astype(*mask_arr, final_type, stream);
+    }
+    // Broadcast mask
+    auto mask_shape = queries.shape();
+    mask_shape.back() = keys.shape(-2);
+    inputs.push_back(broadcast_to(*mask_arr, mask_shape, stream));
+  }
+  if (has_sinks) {
+    if (promote_types(sinks->dtype(), final_type) != final_type) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] Type of sinks must promote to output type "
+          << final_type << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    if (sinks->ndim() != 1 || sinks->shape(0) != n_q_heads) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] Received invalid shape for sinks "
+          << sinks->shape() << ".";
+      throw std::invalid_argument(msg.str());
+    }
+    inputs.push_back(astype(*sinks, final_type, stream));
   }
 
-  if (mask.has_value()) {
-    return fallback({q, k, v, mask.value()})[0];
-  } else {
-    return fallback({q, k, v})[0];
+  bool is_training = detail::in_grad_tracing();
+  bool has_fast_vjp = !ScaledDotProductAttentionVJP::use_fallback(q, stream);
+  bool output_logsumexp = is_training && has_fast_vjp;
+  if (!ScaledDotProductAttention::use_fallback(
+          q,
+          k,
+          v,
+          has_mask,
+          has_arr_mask,
+          do_causal,
+          is_training,
+          output_logsumexp,
+          stream)) {
+    if (has_bool_mask && !ScaledDotProductAttention::supports_bool_mask()) {
+      // Convert bool mask to additive mask.
+      float inf = std::numeric_limits<float>::infinity();
+      array& mask = inputs[3];
+      mask = where(
+          mask,
+          full_like(mask, 0, final_type, s),
+          full_like(mask, -inf, final_type, s));
+    }
+    Shape out_shape{q.shape(0), q.shape(1), q.shape(2), v.shape(-1)};
+    auto primitive = std::make_shared<ScaledDotProductAttention>(
+        stream, fallback, scale, do_causal, has_sinks, output_logsumexp);
+    if (output_logsumexp) {
+      return array::make_arrays(
+          {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
+          {final_type, float32},
+          primitive,
+          std::move(inputs))[0];
+    } else {
+      return array(
+          std::move(out_shape), final_type, primitive, std::move(inputs));
+    }
   }
+  return fallback(std::move(inputs))[0];
+}
+
+std::vector<array> ScaledDotProductAttention::vjp(
+    const std::vector<array>& primals,
+    const std::vector<array>& cotangents,
+    const std::vector<int>& argnums,
+    const std::vector<array>& outputs) {
+  assert(primals.size() >= 3);
+  assert(cotangents.size() == outputs.size());
+
+  auto s = stream();
+  if (ScaledDotProductAttentionVJP::use_fallback(primals[0], s)) {
+    assert(outputs.size() == 1);
+    return Custom::vjp(primals, cotangents, argnums, outputs);
+  }
+
+  auto fallback = [sdpa = fallback_, s](const std::vector<array>& inputs) {
+    std::vector<array> primals(inputs.begin(), std::prev(inputs.end()));
+    auto [_, vjps] = mlx::core::vjp(sdpa, primals, {inputs.back()});
+    return vjps;
+  };
+
+  std::vector<Shape> shapes;
+  std::vector<Dtype> dtypes;
+  for (int i = 0; i < /* outputs size */ 3; ++i) {
+    shapes.push_back(primals[i].shape());
+    dtypes.push_back(primals[i].dtype());
+  }
+  auto primitive = std::make_shared<ScaledDotProductAttentionVJP>(
+      s, fallback, scale_, do_causal_, has_sinks_);
+  std::vector<array> inputs = primals;
+  inputs.push_back(outputs[0]);
+  inputs.push_back(outputs[1]);
+  inputs.push_back(cotangents[0]);
+  auto vjps = array::make_arrays(std::move(shapes), dtypes, primitive, inputs);
+
+  std::vector<array> returned_vjps;
+  for (int arg : argnums) {
+    if (arg >= 3) {
+      throw std::invalid_argument(
+          "[scale_dot_product_attention] Does not support VJP with respect "
+          " to mask or attention sinks.");
+    }
+    returned_vjps.push_back(std::move(vjps[arg]));
+  }
+  return returned_vjps;
 }
 
 bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {
   const ScaledDotProductAttention& a_other =
       static_cast<const ScaledDotProductAttention&>(other);
-  return needs_mask_ == a_other.needs_mask_ && scale_ == a_other.scale_;
+  return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
+      has_sinks_ == a_other.has_sinks_ &&
+      output_logsumexp_ == a_other.output_logsumexp_;
+}
+
+bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
+  const ScaledDotProductAttentionVJP& a_other =
+      static_cast<const ScaledDotProductAttentionVJP&>(other);
+  return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
+      has_sinks_ == a_other.has_sinks_;
+}
+
+bool Quantize::is_equivalent(const Primitive& other) const {
+  const Quantize& p_other = static_cast<const Quantize&>(other);
+  return (
+      p_other.group_size_ == group_size_ && p_other.bits_ == bits_ &&
+      p_other.mode_ == mode_ && p_other.dequantize_ == dequantize_);
+}
+
+std::vector<Shape> Quantize::output_shapes(const std::vector<array>& inputs) {
+  auto& w = inputs[0];
+  if (dequantize_) {
+    auto out_size = w.shape(-1) * 32 / bits_;
+    auto out_shape = w.shape();
+    out_shape.back() = out_size;
+    return {std::move(out_shape)};
+  } else {
+    auto wq_shape = w.shape();
+    wq_shape.back() = w.shape(-1) * bits_ / 32;
+    auto sshape = w.shape();
+    sshape.back() = w.shape(-1) / group_size_;
+    if (inputs.size() == 2) {
+      return {std::move(wq_shape), std::move(sshape)};
+    } else {
+      auto bshape = sshape;
+      return {std::move(wq_shape), std::move(sshape), std::move(bshape)};
+    }
+  }
+}
+
+bool ConvertFP8::is_equivalent(const Primitive& other) const {
+  const ConvertFP8& a_other = static_cast<const ConvertFP8&>(other);
+  return to_fp8_ == a_other.to_fp8_;
 }
 
 } // namespace mlx::core::fast

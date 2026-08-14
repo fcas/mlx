@@ -85,6 +85,19 @@ class _Pool(Module):
     def __init__(self, pooling_function, kernel_size, stride, padding, padding_value):
         super().__init__()
 
+        class_name = type(self).__name__
+        for name, values in (("kernel_size", kernel_size), ("stride", stride)):
+            if any(v <= 0 for v in values):
+                raise ValueError(
+                    f"[{class_name}] '{name}' must be positive but got "
+                    f"{tuple(values)}."
+                )
+        if any(p[0] < 0 for p in padding):
+            raise ValueError(
+                f"[{class_name}] 'padding' must be non-negative but got "
+                f"{tuple(p[0] for p in padding)}."
+            )
+
         self._pooling_function = pooling_function
         self._kernel_size = kernel_size
         self._stride = stride
@@ -101,7 +114,11 @@ class _Pool(Module):
 
     def __call__(self, x):
         if any(p[0] > 0 for p in self._padding):
-            x = mx.pad(x, [(0, 0)] + self._padding + [(0, 0)], self._padding_value)
+            x = mx.pad(
+                x,
+                [(0, 0)] + self._padding + [(0, 0)],
+                constant_values=self._padding_value,
+            )
         x = _sliding_windows(x, self._kernel_size, self._stride)
         return self._pooling_function(x, self._axes)
 
@@ -154,19 +171,35 @@ class _Pool2d(_Pool):
         super().__init__(pooling_function, kernel_size, stride, padding, padding_value)
 
 
+class _Pool3d(_Pool):
+    def __init__(
+        self,
+        pooling_function,
+        padding_value,
+        kernel_size: Union[int, Tuple[int, int, int]],
+        stride: Optional[Union[int, Tuple[int, int, int]]] = None,
+        padding: Optional[Union[int, Tuple[int, int, int]]] = 0,
+    ):
+        class_name = type(self).__name__
+        msg = "[{}] '{}' must be an integer or a tuple containing 3 integers"
+        kernel_size = _value_or_list(
+            kernel_size, 3, msg.format(class_name, "kernel_size")
+        )
+        if stride is not None:
+            stride = _value_or_list(stride, 3, msg.format(class_name, "stride"))
+        else:
+            stride = kernel_size
+        padding = _value_or_list(padding, 3, msg.format(class_name, "padding"))
+        padding = [(p, p) for p in padding]
+
+        super().__init__(pooling_function, kernel_size, stride, padding, padding_value)
+
+
 class MaxPool1d(_Pool1d):
     r"""Applies 1-dimensional max pooling.
 
-    Assuming an input of shape :math:`(N, L, C)` and ``kernel_size`` is
-    :math:`k`, the output is a tensor of shape :math:`(N, L_{out}, C)`, given
-    by:
-
-        .. math::
-            \text{out}(N_i, t, C_j) = \max_{m=0, \ldots, k - 1}
-                    \text{input}(N_i, \text{stride} \times t + m, C_j),
-
-    where :math:`L_{out} = \left\lfloor \frac{L + 2 \times \text{padding} -
-    \text{kernel\_size}}{\text{stride}}\right\rfloor + 1`.
+    Spatially downsamples the input by taking the maximum of a sliding window
+    of size ``kernel_size`` and sliding stride ``stride``.
 
     Args:
         kernel_size (int or tuple(int)): The size of the pooling window kernel.
@@ -186,9 +219,9 @@ class MaxPool1d(_Pool1d):
 
     def __init__(
         self,
-        kernel_size: Union[int, Tuple[int, int]],
-        stride: Optional[Union[int, Tuple[int, int]]] = None,
-        padding: Optional[Union[int, Tuple[int, int]]] = 0,
+        kernel_size: Union[int, Tuple[int]],
+        stride: Optional[Union[int, Tuple[int]]] = None,
+        padding: Union[int, Tuple[int]] = 0,
     ):
         super().__init__(mx.max, -float("inf"), kernel_size, stride, padding)
 
@@ -196,16 +229,8 @@ class MaxPool1d(_Pool1d):
 class AvgPool1d(_Pool1d):
     r"""Applies 1-dimensional average pooling.
 
-    Assuming an input of shape :math:`(N, L, C)` and ``kernel_size`` is
-    :math:`k`, the output is a tensor of shape :math:`(N, L_{out}, C)`, given
-    by:
-
-        .. math::
-            \text{out}(N_i, t, C_j) = \frac{1}{k} \sum_{m=0, \ldots, k - 1}
-                    \text{input}(N_i, \text{stride} \times t + m, C_j),
-
-    where :math:`L_{out} = \left\lfloor \frac{L + 2 \times \text{padding} -
-    \text{kernel\_size}}{\text{stride}}\right\rfloor + 1`.
+    Spatially downsamples the input by taking the average of a sliding window
+    of size ``kernel_size`` and sliding stride ``stride``.
 
     Args:
         kernel_size (int or tuple(int)): The size of the pooling window kernel.
@@ -225,9 +250,9 @@ class AvgPool1d(_Pool1d):
 
     def __init__(
         self,
-        kernel_size: Union[int, Tuple[int, int]],
-        stride: Optional[Union[int, Tuple[int, int]]] = None,
-        padding: Optional[Union[int, Tuple[int, int]]] = 0,
+        kernel_size: Union[int, Tuple[int]],
+        stride: Optional[Union[int, Tuple[int]]] = None,
+        padding: Union[int, Tuple[int]] = 0,
     ):
         super().__init__(mx.mean, 0, kernel_size, stride, padding)
 
@@ -235,26 +260,15 @@ class AvgPool1d(_Pool1d):
 class MaxPool2d(_Pool2d):
     r"""Applies 2-dimensional max pooling.
 
-    Assuming an input of shape :math:`(N, H, W, C)` and ``kernel_size`` is
-    :math:`(k_H, k_W)`, the output is a tensor of shape :math:`(N, H_{out},
-    W_{out}, C)`, given by:
+    Spatially downsamples the input by taking the maximum of a sliding window
+    of size ``kernel_size`` and sliding stride ``stride``.
 
-    .. math::
-        \begin{aligned}
-            \text{out}(N_i, h, w, C_j) = & \max_{m=0, \ldots, k_H-1} \max_{n=0, \ldots, k_W-1} \\
-                                    & \text{input}(N_i, \text{stride[0]} \times h + m,
-                                                \text{stride[1]} \times w + n, C_j),
-        \end{aligned}
+    The parameters ``kernel_size``, ``stride``, and ``padding`` can either be:
 
-    where :math:`H_{out} = \left\lfloor\frac{H + 2 * \text{padding[0]} - \text{kernel\_size[0]}}{\text{stride[0]}}\right\rfloor + 1`,
-    :math:`W_{out} = \left\lfloor\frac{W + 2 * \text{padding[1]} - \text{kernel\_size[1]}}{\text{stride[1]}}\right\rfloor + 1`.
-
-    The parameters ``kernel_size``, ``stride``, ``padding``, can either be:
-
-        - a single ``int`` -- in which case the same value is used for both the
-          height and width axis;
-        - a ``tuple`` of two ``int`` s -- in which case, the first ``int`` is
-          used for the height axis, the second ``int`` for the width axis.
+    * a single ``int`` -- in which case the same value is used for both the
+      height and width axis.
+    * a ``tuple`` of two ``int`` s -- in which case, the first ``int`` is
+      used for the height axis, the second ``int`` for the width axis.
 
     Args:
         kernel_size (int or tuple(int, int)): The size of the pooling window.
@@ -284,26 +298,15 @@ class MaxPool2d(_Pool2d):
 class AvgPool2d(_Pool2d):
     r"""Applies 2-dimensional average pooling.
 
-    Assuming an input of shape :math:`(N, H, W, C)` and ``kernel_size`` is
-    :math:`(k_H, k_W)`, the output is a tensor of shape :math:`(N, H_{out},
-    W_{out}, C)`, given by:
+    Spatially downsamples the input by taking the average of a sliding window
+    of size ``kernel_size`` and sliding stride ``stride``.
 
-    .. math::
-        \begin{aligned}
-            \text{out}(N_i, h, w, C_j) = & \frac{1}{k_H k_W} \sum_{m=0, \ldots, k_H-1} \sum_{n=0, \ldots, k_W-1} \\
-                                    & \text{input}(N_i, \text{stride[0]} \times h + m,
-                                                \text{stride[1]} \times w + n, C_j),
-        \end{aligned}
+    The parameters ``kernel_size``, ``stride``, and ``padding`` can either be:
 
-    where :math:`H_{out} = \left\lfloor\frac{H + 2 * \text{padding[0]} - \text{kernel\_size[0]}}{\text{stride[0]}}\right\rfloor + 1`,
-    :math:`W_{out} = \left\lfloor\frac{W + 2 * \text{padding[1]} - \text{kernel\_size[1]}}{\text{stride[1]}}\right\rfloor + 1`.
-
-    The parameters ``kernel_size``, ``stride``, ``padding``, can either be:
-
-        - a single ``int`` -- in which case the same value is used for both the
-          height and width axis;
-        - a ``tuple`` of two ``int`` s -- in which case, the first ``int`` is
-          used for the height axis, the second ``int`` for the width axis.
+    * a single ``int`` -- in which case the same value is used for both the
+      height and width axis.
+    * a ``tuple`` of two ``int`` s -- in which case, the first ``int`` is
+      used for the height axis, the second ``int`` for the width axis.
 
     Args:
         kernel_size (int or tuple(int, int)): The size of the pooling window.
@@ -326,5 +329,83 @@ class AvgPool2d(_Pool2d):
         kernel_size: Union[int, Tuple[int, int]],
         stride: Optional[Union[int, Tuple[int, int]]] = None,
         padding: Optional[Union[int, Tuple[int, int]]] = 0,
+    ):
+        super().__init__(mx.mean, 0, kernel_size, stride, padding)
+
+
+class MaxPool3d(_Pool3d):
+    r"""Applies 3-dimensional max pooling.
+
+    Spatially downsamples the input by taking the maximum of a sliding window
+    of size ``kernel_size`` and sliding stride ``stride``.
+
+    The parameters ``kernel_size``, ``stride``, and ``padding`` can either be:
+
+    * a single ``int`` -- in which case the same value is used for the depth,
+      height, and width axis.
+    * a ``tuple`` of three ``int`` s -- in which case, the first ``int`` is used
+      for the depth axis, the second ``int`` for the height axis, and the third
+      ``int`` for the width axis.
+
+    Args:
+        kernel_size (int or tuple(int, int, int)): The size of the pooling window.
+        stride (int or tuple(int, int, int), optional): The stride of the pooling
+            window. Default: ``kernel_size``.
+        padding (int or tuple(int, int, int), optional): How much negative infinity
+            padding to apply to the input. The padding is applied on both sides
+            of the depth, height and width axis. Default: ``0``.
+
+    Examples:
+        >>> import mlx.core as mx
+        >>> import mlx.nn.layers as nn
+        >>> x = mx.random.normal(shape=(8, 16, 32, 32, 4))
+        >>> pool = nn.MaxPool3d(kernel_size=2, stride=2)
+        >>> pool(x)
+    """
+
+    def __init__(
+        self,
+        kernel_size: Union[int, Tuple[int, int, int]],
+        stride: Optional[Union[int, Tuple[int, int, int]]] = None,
+        padding: Optional[Union[int, Tuple[int, int, int]]] = 0,
+    ):
+        super().__init__(mx.max, -float("inf"), kernel_size, stride, padding)
+
+
+class AvgPool3d(_Pool3d):
+    r"""Applies 3-dimensional average pooling.
+
+    Spatially downsamples the input by taking the average of a sliding window
+    of size ``kernel_size`` and sliding stride ``stride``.
+
+    The parameters ``kernel_size``, ``stride``, and ``padding`` can either be:
+
+    * a single ``int`` -- in which case the same value is used for the depth,
+      height, and width axis.
+    * a ``tuple`` of three ``int`` s -- in which case, the first ``int`` is used
+      for the depth axis, the second ``int`` for the height axis, and the third
+      ``int`` for the width axis.
+
+    Args:
+        kernel_size (int or tuple(int, int, int)): The size of the pooling window.
+        stride (int or tuple(int, int, int), optional): The stride of the pooling
+            window. Default: ``kernel_size``.
+        padding (int or tuple(int, int, int), optional): How much zero
+            padding to apply to the input. The padding is applied on both sides
+            of the depth, height and width axis. Default: ``0``.
+
+    Examples:
+        >>> import mlx.core as mx
+        >>> import mlx.nn.layers as nn
+        >>> x = mx.random.normal(shape=(8, 16, 32, 32, 4))
+        >>> pool = nn.AvgPool3d(kernel_size=2, stride=2)
+        >>> pool(x)
+    """
+
+    def __init__(
+        self,
+        kernel_size: Union[int, Tuple[int, int, int]],
+        stride: Optional[Union[int, Tuple[int, int, int]]] = None,
+        padding: Optional[Union[int, Tuple[int, int, int]]] = 0,
     ):
         super().__init__(mx.mean, 0, kernel_size, stride, padding)

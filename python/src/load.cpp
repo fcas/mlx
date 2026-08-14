@@ -12,15 +12,24 @@
 #include "mlx/ops.h"
 #include "mlx/utils.h"
 #include "python/src/load.h"
+#include "python/src/small_vector.h"
 #include "python/src/utils.h"
 
+namespace mx = mlx::core;
 namespace nb = nanobind;
 using namespace nb::literals;
-using namespace mlx::core;
 
 ///////////////////////////////////////////////////////////////////////////////
 // Helpers
 ///////////////////////////////////////////////////////////////////////////////
+
+bool is_str_or_path(nb::object obj) {
+  if (nb::isinstance<nb::str>(obj)) {
+    return true;
+  }
+  nb::object path_type = nb::module_::import_("pathlib").attr("Path");
+  return nb::isinstance(obj, path_type);
+}
 
 bool is_istream_object(const nb::object& file) {
   return nb::hasattr(file, "readinto") && nb::hasattr(file, "seek") &&
@@ -86,7 +95,7 @@ class ZipFileWrapper {
 // Loading
 ///////////////////////////////////////////////////////////////////////////////
 
-class PyFileReader : public io::Reader {
+class PyFileReader : public mx::io::Reader {
  public:
   PyFileReader(nb::object file)
       : pyistream_(file),
@@ -138,12 +147,13 @@ class PyFileReader : public io::Reader {
 
   void read(char* data, size_t n) override {
     nb::gil_scoped_acquire gil;
-    auto memview = PyMemoryView_FromMemory(data, n, PyBUF_WRITE);
-    nb::object bytes_read = readinto_func_(nb::handle(memview));
+    _read(data, n);
+  }
 
-    if (bytes_read.is_none() || nb::cast<size_t>(bytes_read) < n) {
-      throw std::runtime_error("[load] Failed to read from python stream");
-    }
+  void read(char* data, size_t n, size_t offset) override {
+    nb::gil_scoped_acquire gil;
+    seek_func_(offset, (int)std::ios_base::beg);
+    _read(data, n);
   }
 
   std::string label() const override {
@@ -151,6 +161,19 @@ class PyFileReader : public io::Reader {
   }
 
  private:
+  void _read(char* data, size_t n) {
+    nb::object memview =
+        nb::steal<nb::object>(PyMemoryView_FromMemory(data, n, PyBUF_WRITE));
+    if (!memview.is_valid()) {
+      throw std::runtime_error("[load] Failed to create memoryview for read");
+    }
+    nb::object bytes_read = readinto_func_(memview);
+
+    if (bytes_read.is_none() || nb::cast<size_t>(bytes_read) < n) {
+      throw std::runtime_error("[load] Failed to read from python stream");
+    }
+  }
+
   nb::object pyistream_;
   nb::object readinto_func_;
   nb::object seek_func_;
@@ -158,14 +181,15 @@ class PyFileReader : public io::Reader {
 };
 
 std::pair<
-    std::unordered_map<std::string, array>,
+    std::unordered_map<std::string, mx::array>,
     std::unordered_map<std::string, std::string>>
-mlx_load_safetensor_helper(nb::object file, StreamOrDevice s) {
-  if (nb::isinstance<nb::str>(file)) { // Assume .safetensors file path string
-    return load_safetensors(nb::cast<std::string>(file), s);
+mlx_load_safetensor_helper(nb::object file, mx::StreamOrDevice s) {
+  if (is_str_or_path(file)) { // Assume .safetensors file path string
+    auto file_str = nb::cast<std::string>(nb::str(file));
+    return mx::load_safetensors(file_str, s);
   } else if (is_istream_object(file)) {
     // If we don't own the stream and it was passed to us, eval immediately
-    auto res = load_safetensors(std::make_shared<PyFileReader>(file), s);
+    auto res = mx::load_safetensors(std::make_shared<PyFileReader>(file), s);
     {
       nb::gil_scoped_release gil;
       for (auto& [key, arr] : std::get<0>(res)) {
@@ -179,18 +203,19 @@ mlx_load_safetensor_helper(nb::object file, StreamOrDevice s) {
       "[load_safetensors] Input must be a file-like object, or string");
 }
 
-GGUFLoad mlx_load_gguf_helper(nb::object file, StreamOrDevice s) {
-  if (nb::isinstance<nb::str>(file)) { // Assume .gguf file path string
-    return load_gguf(nb::cast<std::string>(file), s);
+mx::GGUFLoad mlx_load_gguf_helper(nb::object file, mx::StreamOrDevice s) {
+  if (is_str_or_path(file)) { // Assume .gguf file path string
+    auto file_str = nb::cast<std::string>(nb::str(file));
+    return mx::load_gguf(file_str, s);
   }
 
   throw std::invalid_argument("[load_gguf] Input must be a string");
 }
 
-std::unordered_map<std::string, array> mlx_load_npz_helper(
+std::unordered_map<std::string, mx::array> mlx_load_npz_helper(
     nb::object file,
-    StreamOrDevice s) {
-  bool own_file = nb::isinstance<nb::str>(file);
+    mx::StreamOrDevice s) {
+  bool own_file = is_str_or_path(file);
 
   nb::module_ zipfile = nb::module_::import_("zipfile");
   if (!is_zip_file(zipfile, file)) {
@@ -199,7 +224,7 @@ std::unordered_map<std::string, array> mlx_load_npz_helper(
         "opened with zipfile.ZipFile");
   }
   // Output dictionary filename in zip -> loaded array
-  std::unordered_map<std::string, array> array_dict;
+  std::unordered_map<std::string, mx::array> array_dict;
 
   // Create python ZipFile object
   ZipFileWrapper zipfile_object(zipfile, file);
@@ -208,7 +233,7 @@ std::unordered_map<std::string, array> mlx_load_npz_helper(
     nb::object sub_file = zipfile_object.open(st);
 
     // Create array from python file stream
-    auto arr = load(std::make_shared<PyFileReader>(sub_file), s);
+    auto arr = mx::load(std::make_shared<PyFileReader>(sub_file), s);
 
     // Remove .npy from file if it is there
     auto key = st;
@@ -230,12 +255,13 @@ std::unordered_map<std::string, array> mlx_load_npz_helper(
   return array_dict;
 }
 
-array mlx_load_npy_helper(nb::object file, StreamOrDevice s) {
-  if (nb::isinstance<nb::str>(file)) { // Assume .npy file path string
-    return load(nb::cast<std::string>(file), s);
+mx::array mlx_load_npy_helper(nb::object file, mx::StreamOrDevice s) {
+  if (is_str_or_path(file)) { // Assume .npy file path string
+    auto file_str = nb::cast<std::string>(nb::str(file));
+    return mx::load(file_str, s);
   } else if (is_istream_object(file)) {
     // If we don't own the stream and it was passed to us, eval immediately
-    auto arr = load(std::make_shared<PyFileReader>(file), s);
+    auto arr = mx::load(std::make_shared<PyFileReader>(file), s);
     {
       nb::gil_scoped_release gil;
       arr.eval();
@@ -250,11 +276,11 @@ LoadOutputTypes mlx_load_helper(
     nb::object file,
     std::optional<std::string> format,
     bool return_metadata,
-    StreamOrDevice s) {
+    mx::StreamOrDevice s) {
   if (!format.has_value()) {
     std::string fname;
-    if (nb::isinstance<nb::str>(file)) {
-      fname = nb::cast<std::string>(file);
+    if (is_str_or_path(file)) {
+      fname = nb::cast<std::string>(nb::str(file));
     } else if (is_istream_object(file)) {
       fname = nb::cast<std::string>(file.attr("name"));
     } else {
@@ -299,7 +325,7 @@ LoadOutputTypes mlx_load_helper(
 // Saving
 ///////////////////////////////////////////////////////////////////////////////
 
-class PyFileWriter : public io::Writer {
+class PyFileWriter : public mx::io::Writer {
  public:
   PyFileWriter(nb::object file)
       : pyostream_(file),
@@ -352,9 +378,12 @@ class PyFileWriter : public io::Writer {
   void write(const char* data, size_t n) override {
     nb::gil_scoped_acquire gil;
 
-    auto memview =
-        PyMemoryView_FromMemory(const_cast<char*>(data), n, PyBUF_READ);
-    nb::object bytes_written = write_func_(nb::handle(memview));
+    nb::object memview = nb::steal<nb::object>(
+        PyMemoryView_FromMemory(const_cast<char*>(data), n, PyBUF_READ));
+    if (!memview.is_valid()) {
+      throw std::runtime_error("[load] Failed to create memoryview for write");
+    }
+    nb::object bytes_written = write_func_(memview);
 
     if (bytes_written.is_none() || nb::cast<size_t>(bytes_written) < n) {
       throw std::runtime_error("[load] Failed to write to python stream");
@@ -372,15 +401,16 @@ class PyFileWriter : public io::Writer {
   nb::object tell_func_;
 };
 
-void mlx_save_helper(nb::object file, array a) {
-  if (nb::isinstance<nb::str>(file)) {
-    save(nb::cast<std::string>(file), a);
+void mlx_save_helper(nb::object file, mx::array a) {
+  if (is_str_or_path(file)) {
+    auto file_str = nb::cast<std::string>(nb::str(file));
+    mx::save(file_str, a);
     return;
   } else if (is_ostream_object(file)) {
     auto writer = std::make_shared<PyFileWriter>(file);
     {
       nb::gil_scoped_release gil;
-      save(writer, a);
+      mx::save(writer, a);
     }
 
     return;
@@ -398,8 +428,8 @@ void mlx_savez_helper(
   // Add .npz to the end of the filename if not already there
   nb::object file = file_;
 
-  if (nb::isinstance<nb::str>(file_)) {
-    std::string fname = nb::cast<std::string>(file_);
+  if (is_str_or_path(file)) {
+    std::string fname = nb::cast<std::string>(nb::str(file_));
 
     // Add .npz to file name if it is not there
     if (fname.length() < 4 || fname.substr(fname.length() - 4, 4) != ".npz")
@@ -409,8 +439,9 @@ void mlx_savez_helper(
   }
 
   // Collect args and kwargs
-  auto arrays_dict = nb::cast<std::unordered_map<std::string, array>>(kwargs);
-  auto arrays_list = nb::cast<std::vector<array>>(args);
+  auto arrays_dict =
+      nb::cast<std::unordered_map<std::string, mx::array>>(kwargs);
+  auto arrays_list = nb::cast<std::vector<mx::array>>(args);
 
   for (int i = 0; i < arrays_list.size(); i++) {
     std::string arr_name = "arr_" + std::to_string(i);
@@ -437,7 +468,7 @@ void mlx_savez_helper(
     auto writer = std::make_shared<PyFileWriter>(py_ostream);
     {
       nb::gil_scoped_release nogil;
-      save(writer, a);
+      mx::save(writer, a);
     }
   }
 
@@ -460,17 +491,18 @@ void mlx_save_safetensor_helper(
   } else {
     metadata_map = std::unordered_map<std::string, std::string>();
   }
-  auto arrays_map = nb::cast<std::unordered_map<std::string, array>>(d);
-  if (nb::isinstance<nb::str>(file)) {
+  auto arrays_map = nb::cast<std::unordered_map<std::string, mx::array>>(d);
+  if (is_str_or_path(file)) {
     {
+      auto file_str = nb::cast<std::string>(nb::str(file));
       nb::gil_scoped_release nogil;
-      save_safetensors(nb::cast<std::string>(file), arrays_map, metadata_map);
+      mx::save_safetensors(file_str, arrays_map, metadata_map);
     }
   } else if (is_ostream_object(file)) {
     auto writer = std::make_shared<PyFileWriter>(file);
     {
       nb::gil_scoped_release nogil;
-      save_safetensors(writer, arrays_map, metadata_map);
+      mx::save_safetensors(writer, arrays_map, metadata_map);
     }
   } else {
     throw std::invalid_argument(
@@ -482,19 +514,22 @@ void mlx_save_gguf_helper(
     nb::object file,
     nb::dict a,
     std::optional<nb::dict> m) {
-  auto arrays_map = nb::cast<std::unordered_map<std::string, array>>(a);
-  if (nb::isinstance<nb::str>(file)) {
+  auto arrays_map = nb::cast<std::unordered_map<std::string, mx::array>>(a);
+  if (is_str_or_path(file)) {
     if (m) {
       auto metadata_map =
-          nb::cast<std::unordered_map<std::string, GGUFMetaData>>(m.value());
+          nb::cast<std::unordered_map<std::string, mx::GGUFMetaData>>(
+              m.value());
       {
+        auto file_str = nb::cast<std::string>(nb::str(file));
         nb::gil_scoped_release nogil;
-        save_gguf(nb::cast<std::string>(file), arrays_map, metadata_map);
+        mx::save_gguf(file_str, arrays_map, metadata_map);
       }
     } else {
       {
+        auto file_str = nb::cast<std::string>(nb::str(file));
         nb::gil_scoped_release nogil;
-        save_gguf(nb::cast<std::string>(file), arrays_map);
+        mx::save_gguf(file_str, arrays_map);
       }
     }
   } else {

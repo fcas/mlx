@@ -1,8 +1,11 @@
 # Copyright © 2023 Apple Inc.
 
 import os
+import platform
+import struct
 import tempfile
 import unittest
+from pathlib import Path
 
 import mlx.core as mx
 import mlx_tests
@@ -28,15 +31,14 @@ class TestLoad(mlx_tests.MLXTestCase):
     def setUpClass(cls):
         cls.test_dir_fid = tempfile.TemporaryDirectory()
         cls.test_dir = cls.test_dir_fid.name
+        if not os.path.isdir(cls.test_dir):
+            os.mkdir(cls.test_dir)
 
     @classmethod
     def tearDownClass(cls):
         cls.test_dir_fid.cleanup()
 
     def test_save_and_load(self):
-        if not os.path.isdir(self.test_dir):
-            os.mkdir(self.test_dir)
-
         for dt in self.dtypes:
             with self.subTest(dtype=dt):
                 for i, shape in enumerate([(1,), (23,), (1024, 1024), (4, 6, 3, 1, 2)]):
@@ -63,20 +65,43 @@ class TestLoad(mlx_tests.MLXTestCase):
                         load_arr_mlx_npy = np.load(save_file_mlx)
                         self.assertTrue(np.array_equal(load_arr_mlx_npy, save_arr_npy))
 
-    def test_save_and_load_safetensors(self):
-        if not os.path.isdir(self.test_dir):
-            os.mkdir(self.test_dir)
+        save_file = os.path.join(self.test_dir, f"mlx_path.npy")
+        save_arr = mx.ones((32,))
+        mx.save(Path(save_file), save_arr)
 
+        # Load array saved by mlx as mlx array
+        load_arr = mx.load(Path(save_file))
+        self.assertTrue(mx.array_equal(load_arr, save_arr))
+
+    def test_load_npy_dtype(self):
+        save_file = os.path.join(self.test_dir, "mlx_path.npy")
+        a = np.random.randn(8).astype(np.float64)
+        np.save(save_file, a)
+        out = mx.load(save_file, stream=mx.cpu)
+        self.assertEqual(out.dtype, mx.float64)
+        self.assertTrue(np.array_equal(np.array(out), a))
+
+        a = np.random.randn(8).astype(np.float64)
+        b = np.random.randn(8).astype(np.float64)
+        c = a + 0j * b
+        np.save(save_file, c)
+        with self.assertRaises(Exception):
+            out = mx.load(save_file, stream=mx.cpu)
+
+    def test_save_and_load_safetensors(self):
         test_file = os.path.join(self.test_dir, "test.safetensors")
         with self.assertRaises(Exception):
             mx.save_safetensors(test_file, {"a": mx.ones((4, 4))}, {"testing": 0})
 
-        mx.save_safetensors(
-            test_file, {"test": mx.ones((2, 2))}, {"testing": "test", "format": "mlx"}
-        )
-        res = mx.load(test_file, return_metadata=True)
-        self.assertEqual(len(res), 2)
-        self.assertEqual(res[1], {"testing": "test", "format": "mlx"})
+        for obj in [str, Path]:
+            mx.save_safetensors(
+                obj(test_file),
+                {"test": mx.ones((2, 2))},
+                {"testing": "test", "format": "mlx"},
+            )
+            res = mx.load(obj(test_file), return_metadata=True)
+            self.assertEqual(len(res), 2)
+            self.assertEqual(res[1], {"testing": "test", "format": "mlx"})
 
         for dt in self.dtypes + ["bfloat16"]:
             with self.subTest(dtype=dt):
@@ -103,6 +128,7 @@ class TestLoad(mlx_tests.MLXTestCase):
                             mx.array_equal(load_dict["test"], save_dict["test"])
                         )
 
+    @unittest.skipIf(platform.system() == "Windows", "GGUF is disabled on Windows")
     def test_save_and_load_gguf(self):
         if not os.path.isdir(self.test_dir):
             os.mkdir(self.test_dir)
@@ -132,6 +158,119 @@ class TestLoad(mlx_tests.MLXTestCase):
                             mx.array_equal(load_dict["test"], save_dict["test"])
                         )
 
+        save_file_mlx = os.path.join(self.test_dir, f"mlx_path_test_fs.gguf")
+        save_dict = {"test": mx.ones(shape)}
+        mx.save_gguf(Path(save_file_mlx), save_dict)
+        load_dict = mx.load(Path(save_file_mlx))
+        self.assertTrue("test" in load_dict)
+        self.assertTrue(mx.array_equal(load_dict["test"], save_dict["test"]))
+
+    @unittest.skipIf(platform.system() == "Windows", "GGUF is disabled on Windows")
+    def test_load_gguf_quantized(self):
+        # Write a minimal GGUF v3 file with one quantized tensor and check
+        # that the loaded (weight, scales, biases) triplet dequantizes to the
+        # values prescribed by the GGML block formats.
+        rows, cols = 2, 64
+        n_blocks = rows * cols // 32
+        np.random.seed(7)
+
+        def write_gguf(path, ggml_type_id, blocks):
+            with open(path, "wb") as f:
+                f.write(b"GGUF")
+                # version, tensor count, metadata kv count
+                f.write(struct.pack("<IQQ", 3, 1, 0))
+                name = b"tensor.weight"
+                f.write(struct.pack("<Q", len(name)) + name)
+                # dims are stored in GGML order: ne[0] = cols, ne[1] = rows
+                f.write(struct.pack("<IQQIQ", 2, cols, rows, ggml_type_id, 0))
+                f.write(b"\x00" * (-f.tell() % 32))  # default alignment
+                f.write(blocks.tobytes())
+
+        def packed_nibbles(q):
+            # GGML nibble order: byte j = element j | element j + 16 << 4
+            return (q[:, :16] | (q[:, 16:] << 4)).astype(np.uint8)
+
+        d = np.full((n_blocks, 1), 0.5, dtype=np.float16)
+        m = np.full((n_blocks, 1), -1.25, dtype=np.float16)
+        q4 = np.random.randint(0, 16, size=(n_blocks, 32)).astype(np.uint8)
+        q8 = np.random.randint(-128, 128, size=(n_blocks, 32)).astype(np.int8)
+        d32 = d.astype(np.float32)
+        m32 = m.astype(np.float32)
+
+        # (name, ggml type id, bits, block bytes, expected dequantized values)
+        cases = [
+            (
+                "Q4_0",
+                2,
+                4,
+                np.concatenate([d.view(np.uint8), packed_nibbles(q4)], axis=1),
+                d32 * (q4.astype(np.float32) - 8),
+            ),
+            (
+                "Q4_1",
+                3,
+                4,
+                np.concatenate(
+                    [d.view(np.uint8), m.view(np.uint8), packed_nibbles(q4)],
+                    axis=1,
+                ),
+                d32 * q4.astype(np.float32) + m32,
+            ),
+            (
+                "Q8_0",
+                8,
+                8,
+                np.concatenate([d.view(np.uint8), q8.view(np.uint8)], axis=1),
+                d32 * q8.astype(np.float32),
+            ),
+        ]
+        for name, type_id, bits, blocks, expected in cases:
+            with self.subTest(qtype=name):
+                save_file = os.path.join(self.test_dir, f"quant_{name}.gguf")
+                write_gguf(save_file, type_id, blocks)
+                load_dict = mx.load(save_file)
+                self.assertEqual(load_dict["tensor.weight"].dtype, mx.uint32)
+                self.assertEqual(load_dict["tensor.scales"].shape, (rows, cols // 32))
+                self.assertEqual(load_dict["tensor.biases"].shape, (rows, cols // 32))
+                dequantized = mx.dequantize(
+                    load_dict["tensor.weight"],
+                    load_dict["tensor.scales"],
+                    load_dict["tensor.biases"],
+                    group_size=32,
+                    bits=bits,
+                )
+                self.assertTrue(
+                    np.array_equal(
+                        np.array(dequantized, copy=False).astype(np.float32),
+                        expected.reshape(rows, cols),
+                    )
+                )
+
+    def test_load_f8_e4m3(self):
+        if not os.path.isdir(self.test_dir):
+            os.mkdir(self.test_dir)
+
+        expected = [
+            0,
+            448,
+            -448,
+            -0.875,
+            0.4375,
+            -0.005859,
+            -1.25,
+            -1.25,
+            -1.5,
+            -0.0039,
+        ]
+        expected = mx.array(expected, dtype=mx.bfloat16)
+        contents = b'H\x00\x00\x00\x00\x00\x00\x00{"tensor":{"dtype":"F8_E4M3","shape":[10],"data_offsets":[0,10]}}       \x00~\xfe\xb6.\x83\xba\xba\xbc\x82'
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
+            f.write(contents)
+            f.seek(0)
+            out = mx.load(f)["tensor"]
+        self.assertTrue(mx.allclose(mx.from_fp8(out), expected))
+
+    @unittest.skipIf(platform.system() == "Windows", "GGUF is disabled on Windows")
     def test_save_and_load_gguf_metadata_basic(self):
         if not os.path.isdir(self.test_dir):
             os.mkdir(self.test_dir)
@@ -164,6 +303,7 @@ class TestLoad(mlx_tests.MLXTestCase):
         self.assertTrue("meta" in meta_load_dict)
         self.assertEqual(meta_load_dict["meta"], "data")
 
+    @unittest.skipIf(platform.system() == "Windows", "GGUF is disabled on Windows")
     def test_save_and_load_gguf_metadata_arrays(self):
         if not os.path.isdir(self.test_dir):
             os.mkdir(self.test_dir)
@@ -199,6 +339,7 @@ class TestLoad(mlx_tests.MLXTestCase):
                 metadata = {"meta": arr}
                 mx.save_gguf(save_file_mlx, save_dict, metadata)
 
+    @unittest.skipIf(platform.system() == "Windows", "GGUF is disabled on Windows")
     def test_save_and_load_gguf_metadata_mixed(self):
         if not os.path.isdir(self.test_dir):
             os.mkdir(self.test_dir)
@@ -330,9 +471,6 @@ class TestLoad(mlx_tests.MLXTestCase):
                         self.assertTrue(np.array_equal(save_arrs_npy[k], v))
 
     def test_non_contiguous(self):
-        if not os.path.isdir(self.test_dir):
-            os.mkdir(self.test_dir)
-
         a = mx.broadcast_to(mx.array([1, 2]), [4, 2])
 
         save_file = os.path.join(self.test_dir, "a.npy")
@@ -344,6 +482,9 @@ class TestLoad(mlx_tests.MLXTestCase):
         mx.save_safetensors(save_file, {"a": a})
         aload = mx.load(save_file)["a"]
         self.assertTrue(mx.array_equal(a, aload))
+
+        if platform.system() == "Windows":
+            return
 
         save_file = os.path.join(self.test_dir, "a.gguf")
         mx.save_gguf(save_file, {"a": a})
@@ -363,6 +504,54 @@ class TestLoad(mlx_tests.MLXTestCase):
         aload = mx.load(save_file)["a"]
         self.assertTrue(mx.array_equal(a, aload))
 
+    def test_load_donation(self):
+        x = mx.random.normal((1024,))
+        mx.eval(x)
+        save_file = os.path.join(self.test_dir, "donation.npy")
+        mx.save(save_file, x)
+        mx.synchronize()
+
+        mx.reset_peak_memory()
+        scale = mx.array(2.0)
+        y = mx.load(save_file)
+        mx.eval(y)
+        mx.synchronize()
+        load_only = mx.get_peak_memory()
+        y = mx.load(save_file) * scale
+        mx.eval(y)
+        mx.synchronize()
+        load_with_binary = mx.get_peak_memory()
+
+        self.assertEqual(load_only, load_with_binary)
+
+    def test_save_and_load_empty(self):
+        for i, shape in enumerate([(0,), (0, 3), (3, 0), (2, 0, 4)]):
+            with self.subTest(shape=shape):
+                save_arr = mx.zeros(shape)
+
+                npy_file = os.path.join(self.test_dir, f"empty_{i}.npy")
+                mx.save(npy_file, save_arr)
+                self.assertEqual(mx.load(npy_file).shape, shape)
+                # numpy can read what we wrote
+                self.assertEqual(np.load(npy_file).shape, shape)
+
+                st_file = os.path.join(self.test_dir, f"empty_{i}.safetensors")
+                mx.save_safetensors(st_file, {"x": save_arr})
+                self.assertEqual(mx.load(st_file)["x"].shape, shape)
+
+        # An empty array alongside a normal one round trips both
+        npz_file = os.path.join(self.test_dir, "empty.npz")
+        mx.savez(npz_file, x=mx.zeros((0, 3)), y=mx.ones((2, 2)))
+        loaded = mx.load(npz_file)
+        self.assertEqual(loaded["x"].shape, (0, 3))
+        self.assertTrue(mx.array_equal(loaded["y"], mx.ones((2, 2))))
+
+        st_file = os.path.join(self.test_dir, "empty_mixed.safetensors")
+        mx.save_safetensors(st_file, {"x": mx.zeros((0, 3)), "y": mx.ones((2, 2))})
+        loaded = mx.load(st_file)
+        self.assertEqual(loaded["x"].shape, (0, 3))
+        self.assertTrue(mx.array_equal(loaded["y"], mx.ones((2, 2))))
+
 
 if __name__ == "__main__":
-    unittest.main()
+    mlx_tests.MLXTestRunner()

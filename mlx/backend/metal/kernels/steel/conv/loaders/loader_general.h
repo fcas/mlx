@@ -2,9 +2,7 @@
 
 #pragma once
 
-#include "mlx/backend/metal/kernels/steel/utils.h"
-
-#include "mlx/backend/metal/kernels/steel/conv/params.h"
+#include "mlx/backend/metal/kernels/steel/defines.h"
 
 ///////////////////////////////////////////////////////////////////////////////
 // Loading helper
@@ -69,10 +67,10 @@ struct Conv2DInputBlockLoaderGeneral {
       const short base_wh_,
       const short base_ww_,
       uint simd_group_id [[simdgroup_index_in_threadgroup]],
-      uint simd_lane_id [[thread_index_in_simdgroup]])
+      uint simd_lane_id [[thread_index_in_simdgroup]]) thread
       : thread_idx(simd_group_id * 32 + simd_lane_id),
         bi(thread_idx / TCOLS),
-        bj(vec_size * (thread_idx % TCOLS)),
+        bj(vec_size*(thread_idx % TCOLS)),
         dst(dst_ + bi * dst_ld + bj),
         params(params_),
         jump_params(jump_params_),
@@ -103,7 +101,7 @@ struct Conv2DInputBlockLoaderGeneral {
   }
 
   /* Load from device memory into threadgroup memory - without bound checking */
-  METAL_FUNC void load_unsafe() const {
+  METAL_FUNC void load_unsafe() const thread {
     STEEL_PRAGMA_UNROLL
     for (short i = 0, is = 0; i < n_rows; ++i, is += TROWS) {
       // Find bounds
@@ -139,8 +137,54 @@ struct Conv2DInputBlockLoaderGeneral {
     }
   }
 
+  METAL_FUNC void load_safe(const short remaining_k) const thread {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0, is = 0; i < n_rows; ++i, is += TROWS) {
+      // Find bounds
+      int n = read_n[i];
+
+      int h_flip = params->flip ? params->wS[0] - weight_h - 1 : weight_h;
+      int w_flip = params->flip ? params->wS[1] - weight_w - 1 : weight_w;
+
+      int ih_dil = read_ih[i] + h_flip * params->kdil[0];
+      int iw_dil = read_iw[i] + w_flip * params->kdil[1];
+
+      int ih = ih_dil / params->idil[0];
+      int iw = iw_dil / params->idil[1];
+
+      size_t offset = ih * params->in_strides[1] + iw * params->in_strides[2];
+
+      // Read from input if in bounds
+      if ((n < params->N) && (ih_dil >= 0 && ih < params->iS[0]) &&
+          (iw_dil >= 0 && iw < params->iS[1])) {
+        if (bj + vec_size <= remaining_k) {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < vec_size; ++j) {
+            dst[is * dst_ld + j] = (src[i])[offset + j];
+          }
+        } else {
+          for (short j = 0; j < vec_size; ++j) {
+            if (bj + j < remaining_k) {
+              dst[is * dst_ld + j] = (src[i])[offset + j];
+            } else {
+              dst[is * dst_ld + j] = T(0);
+            }
+          }
+        }
+      }
+
+      // Zero pad otherwise
+      else {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < vec_size; ++j) {
+          dst[is * dst_ld + j] = T(0);
+        }
+      }
+    }
+  }
+
   /* Iteration helper */
-  METAL_FUNC void next() {
+  METAL_FUNC void next() thread {
     weight_w += jump_params->f_wgt_jump_w;
     if (weight_w < params->wS[1]) {
       return;
@@ -219,11 +263,11 @@ struct Conv2DWeightBlockLoaderGeneral {
       const short base_wh_,
       const short base_ww_,
       uint simd_group_id [[simdgroup_index_in_threadgroup]],
-      uint simd_lane_id [[thread_index_in_simdgroup]])
-      : src_ld(params_ -> wt_strides[0]),
+      uint simd_lane_id [[thread_index_in_simdgroup]]) thread
+      : src_ld(params_->wt_strides[0]),
         thread_idx(simd_group_id * 32 + simd_lane_id),
         bi(thread_idx / TCOLS),
-        bj(vec_size * (thread_idx % TCOLS)),
+        bj(vec_size*(thread_idx % TCOLS)),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * src_ld + bj),
         params(params_),
@@ -235,7 +279,7 @@ struct Conv2DWeightBlockLoaderGeneral {
         start_row(offsets.y + bi) {}
 
   /* Load from device memory into threadgroup memory - without bound checking */
-  METAL_FUNC void load_unsafe() const {
+  METAL_FUNC void load_unsafe() const thread {
     const device T* curr_src = src + weight_h * params->wt_strides[1] +
         weight_w * params->wt_strides[2];
 
@@ -264,8 +308,57 @@ struct Conv2DWeightBlockLoaderGeneral {
     }
   }
 
+  METAL_FUNC void load_safe(const short remaining_k) const thread {
+    const device T* curr_src = src + weight_h * params->wt_strides[1] +
+        weight_w * params->wt_strides[2];
+
+    if ((start_row + BN <= params->O)) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < BN; i += TROWS) {
+        if (bj + vec_size <= remaining_k) {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < vec_size; j++) {
+            dst[i * dst_ld + j] = curr_src[i * src_ld + j];
+          }
+        } else {
+          for (short j = 0; j < vec_size; j++) {
+            if (bj + j < remaining_k) {
+              dst[i * dst_ld + j] = curr_src[i * src_ld + j];
+            } else {
+              dst[i * dst_ld + j] = T(0);
+            }
+          }
+        }
+      }
+    } else {
+      for (short i = 0; i < BN; i += TROWS) {
+        if ((start_row + i) < params->O) {
+          if (bj + vec_size <= remaining_k) {
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < vec_size; j++) {
+              dst[i * dst_ld + j] = curr_src[i * src_ld + j];
+            }
+          } else {
+            for (short j = 0; j < vec_size; j++) {
+              if (bj + j < remaining_k) {
+                dst[i * dst_ld + j] = curr_src[i * src_ld + j];
+              } else {
+                dst[i * dst_ld + j] = T(0);
+              }
+            }
+          }
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < vec_size; j++) {
+            dst[i * dst_ld + j] = T(0);
+          }
+        }
+      }
+    }
+  }
+
   /* Iteration helper */
-  METAL_FUNC void next() {
+  METAL_FUNC void next() thread {
     weight_w += jump_params->f_wgt_jump_w;
     if (weight_w < params->wS[1]) {
       return;

@@ -64,43 +64,53 @@ class TestRandom(mlx_tests.MLXTestCase):
 
         self.assertEqual(mx.random.uniform().dtype, mx.random.uniform(dtype=None).dtype)
 
-    def test_normal(self):
-        key = mx.random.key(0)
-        a = mx.random.normal(key=key)
-        self.assertEqual(a.shape, ())
-        self.assertEqual(a.dtype, mx.float32)
+        with self.assertRaises(ValueError):
+            mx.random.uniform(shape=(2, -3))
 
-        b = mx.random.normal(key=key)
-        self.assertEqual(a.item(), b.item())
+    def test_normal_and_laplace(self):
+        # Same tests for normal and laplace.
+        for distribution_sampler in [mx.random.normal, mx.random.laplace]:
+            key = mx.random.key(0)
+            a = distribution_sampler(key=key)
+            self.assertEqual(a.shape, ())
+            self.assertEqual(a.dtype, mx.float32)
 
-        a = mx.random.normal(shape=(2, 3))
-        self.assertEqual(a.shape, (2, 3))
+            b = distribution_sampler(key=key)
+            self.assertEqual(a.item(), b.item())
 
-        ## Generate in float16 or bfloat16
-        for t in [mx.float16, mx.bfloat16]:
-            a = mx.random.normal(dtype=t)
-            self.assertEqual(a.dtype, t)
+            a = distribution_sampler(shape=(2, 3))
+            self.assertEqual(a.shape, (2, 3))
 
-        # Generate with a given mean and standard deviation
-        loc = 1.0
-        scale = 2.0
+            ## Generate in float16 or bfloat16
+            for t in [mx.float16, mx.bfloat16]:
+                a = distribution_sampler(dtype=t)
+                self.assertEqual(a.dtype, t)
 
-        a = mx.random.normal(shape=(3, 2), loc=loc, scale=scale, key=key)
-        b = scale * mx.random.normal(shape=(3, 2), key=key) + loc
-        self.assertTrue(mx.allclose(a, b))
+            # Generate with a given mean and standard deviation
+            loc = 1.0
+            scale = 2.0
 
-        a = mx.random.normal(
-            shape=(3, 2), loc=loc, scale=scale, dtype=mx.float16, key=key
-        )
-        b = scale * mx.random.normal(shape=(3, 2), dtype=mx.float16, key=key) + loc
-        self.assertTrue(mx.allclose(a, b))
+            a = distribution_sampler(shape=(3, 2), loc=loc, scale=scale, key=key)
+            b = scale * distribution_sampler(shape=(3, 2), key=key) + loc
+            self.assertTrue(mx.allclose(a, b))
 
-        self.assertEqual(mx.random.normal().dtype, mx.random.normal(dtype=None).dtype)
+            a = distribution_sampler(
+                shape=(3, 2), loc=loc, scale=scale, dtype=mx.float16, key=key
+            )
+            b = (
+                scale * distribution_sampler(shape=(3, 2), dtype=mx.float16, key=key)
+                + loc
+            )
+            self.assertTrue(mx.allclose(a, b))
 
-        # Test not getting -inf or inf with half precison
-        for hp in [mx.float16, mx.bfloat16]:
-            a = abs(mx.random.normal(shape=(10000,), loc=0, scale=1, dtype=hp))
-            self.assertTrue(mx.all(a < mx.inf))
+            self.assertEqual(
+                distribution_sampler().dtype, distribution_sampler(dtype=None).dtype
+            )
+
+            # Test not getting -inf or inf with half precison
+            for hp in [mx.float16, mx.bfloat16]:
+                a = abs(distribution_sampler(shape=(10000,), loc=0, scale=1, dtype=hp))
+                self.assertTrue(mx.all(a < mx.inf))
 
     def test_multivariate_normal(self):
         key = mx.random.key(0)
@@ -223,6 +233,26 @@ class TestRandom(mlx_tests.MLXTestCase):
         a = mx.random.randint(10, -10, [1000, 1000])
         self.assertTrue(mx.all(a == 10).item())
 
+        # Bounds hold when the interval is not exactly representable in float32
+        for dtype, low, high in [
+            (mx.int32, 2**24, 2**24 + 2),
+            (mx.uint32, 2**24, 2**24 + 2),
+            (mx.int64, 2**40, 2**40 + 1024),
+        ]:
+            a = mx.random.randint(low, high, [10000], dtype=dtype, key=key)
+            self.assertTrue(mx.all(a >= low).item())
+            self.assertTrue(mx.all(a < high).item())
+
+        # The lower bound is reachable when the interval spans negative values
+        a = mx.random.randint(-5, 5, [20000], key=key)
+        self.assertEqual(sorted(set(a.tolist())), list(range(-5, 5)))
+
+        # Booleans use the whole interval
+        a = mx.random.randint(0, 2, [1000], dtype=mx.bool_, key=key)
+        self.assertEqual(sorted(set(a.tolist())), [False, True])
+        a = mx.random.randint(0, 1, [1000], dtype=mx.bool_, key=key)
+        self.assertFalse(mx.any(a).item())
+
         self.assertEqual(
             mx.random.randint(0, 1).dtype, mx.random.randint(0, 1, dtype=None).dtype
         )
@@ -318,6 +348,83 @@ class TestRandom(mlx_tests.MLXTestCase):
         with self.assertRaises(ValueError):
             mx.random.categorical(logits, shape=[10, 5], num_samples=5)
 
+        # Single distribution.
+        logits = mx.zeros((20,))
+
+        out = mx.random.categorical(logits, num_samples=7)
+        self.assertEqual(out.shape, (7,))
+        self.assertEqual(out.dtype, mx.uint32)
+        self.assertTrue(mx.max(out).item() < 20)
+
+        out = mx.random.categorical(logits, 0, [5, 3])
+        self.assertEqual(out.shape, (5, 3))
+        self.assertTrue(mx.max(out).item() < 20)
+
+        self.assertEqual(mx.random.categorical(logits, num_samples=1).shape, (1,))
+        self.assertEqual(mx.random.categorical(logits, num_samples=0).shape, (0,))
+
+    def test_permutation(self):
+        x = sorted(mx.random.permutation(4).tolist())
+        self.assertEqual([0, 1, 2, 3], x)
+
+        x = mx.array([0, 1, 2, 3])
+        x = sorted(mx.random.permutation(x).tolist())
+        self.assertEqual([0, 1, 2, 3], x)
+
+        x = mx.array([0, 1, 2, 3])
+        x = sorted(mx.random.permutation(x).tolist())
+
+        # 2-D
+        x = mx.arange(16).reshape(4, 4)
+        out = mx.sort(mx.random.permutation(x, axis=0), axis=0)
+        self.assertTrue(mx.array_equal(x, out))
+        out = mx.sort(mx.random.permutation(x, axis=1), axis=1)
+        self.assertTrue(mx.array_equal(x, out))
+
+        # Basically 0 probability this should fail.
+        sorted_x = mx.arange(16384)
+        x = mx.random.permutation(16384)
+        self.assertFalse(mx.array_equal(sorted_x, x))
+
+        # Preserves shape / doesn't cast input to int
+        x = mx.random.permutation(mx.array([[1]]))
+        self.assertEqual(x.shape, (1, 1))
+
+    def test_complex_normal(self):
+        sample = mx.random.normal(tuple(), dtype=mx.complex64)
+        self.assertEqual(sample.shape, tuple())
+        self.assertEqual(sample.dtype, mx.complex64)
+
+        sample = mx.random.normal((1, 2, 3, 4), dtype=mx.complex64)
+        self.assertEqual(sample.shape, (1, 2, 3, 4))
+        self.assertEqual(sample.dtype, mx.complex64)
+
+        sample = mx.random.normal((1, 2, 3, 4), dtype=mx.complex64, scale=2.0, loc=3.0)
+        self.assertEqual(sample.shape, (1, 2, 3, 4))
+        self.assertEqual(sample.dtype, mx.complex64)
+
+        sample = mx.random.normal(
+            (1, 2, 3, 4), dtype=mx.complex64, scale=2.0, loc=3.0 + 1j
+        )
+        self.assertEqual(sample.shape, (1, 2, 3, 4))
+        self.assertEqual(sample.dtype, mx.complex64)
+
+    def test_broadcastable_scale_loc(self):
+        b = mx.random.normal((10, 2))
+        sample = mx.random.normal((2, 10, 2), loc=b, scale=b)
+        mx.eval(sample)
+        self.assertEqual(sample.shape, (2, 10, 2))
+
+        with self.assertRaises(ValueError):
+            b = mx.random.normal((10,))
+            sample = mx.random.normal((2, 10, 2), loc=b, scale=b)
+
+        b = mx.random.normal((3, 1, 2))
+        sample = mx.random.normal((3, 4, 2), dtype=mx.float16, loc=b, scale=b)
+        mx.eval(sample)
+        self.assertEqual(sample.shape, (3, 4, 2))
+        self.assertEqual(sample.dtype, mx.float16)
+
 
 if __name__ == "__main__":
-    unittest.main()
+    mlx_tests.MLXTestRunner()

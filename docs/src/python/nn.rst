@@ -174,6 +174,7 @@ In detail:
 
    value_and_grad
    quantize
+   average_gradients
 
 .. toctree::
 
@@ -182,3 +183,4 @@ In detail:
    nn/functions
    nn/losses
    nn/init
+   nn/distributed

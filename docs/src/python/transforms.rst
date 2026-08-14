@@ -9,7 +9,10 @@ Transforms
   :toctree: _autosummary
 
    eval
+   async_eval
    compile
+   checkpoint
+   custom_function
    disable_compile
    enable_compile
    grad

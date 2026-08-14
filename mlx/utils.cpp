@@ -1,9 +1,15 @@
 // Copyright © 2023 Apple Inc.
 
+#include <cstdlib>
+#include <iomanip>
+#include <iostream>
 #include <sstream>
+#include <thread>
 #include <vector>
 
-#include "utils.h"
+#include "mlx/dtype_utils.h"
+#include "mlx/types/limits.h"
+#include "mlx/utils.h"
 
 namespace mlx::core {
 
@@ -12,6 +18,24 @@ Stream to_stream(StreamOrDevice s) {
     return default_stream(default_device());
   } else if (std::holds_alternative<Device>(s)) {
     return default_stream(std::get<Device>(s));
+  } else if (std::holds_alternative<Device::DeviceType>(s)) {
+    return default_stream(std::get<Device::DeviceType>(s));
+  } else if (std::holds_alternative<ThreadLocalStream>(s)) {
+    return stream_from_thread_local_stream(std::get<ThreadLocalStream>(s));
+  } else {
+    return std::get<Stream>(s);
+  }
+}
+
+Stream to_stream(StreamOrDevice s, Device default_) {
+  if (std::holds_alternative<std::monostate>(s)) {
+    return default_stream(default_);
+  } else if (std::holds_alternative<Device>(s)) {
+    return default_stream(std::get<Device>(s));
+  } else if (std::holds_alternative<Device::DeviceType>(s)) {
+    return default_stream(std::get<Device::DeviceType>(s));
+  } else if (std::holds_alternative<ThreadLocalStream>(s)) {
+    return stream_from_thread_local_stream(std::get<ThreadLocalStream>(s));
   } else {
     return std::get<Stream>(s);
   }
@@ -43,31 +67,78 @@ inline void PrintFormatter::print(std::ostream& os, uint64_t val) {
   os << val;
 }
 inline void PrintFormatter::print(std::ostream& os, float16_t val) {
-  os << val;
+  if (format_options.precision == -1) {
+    os << val;
+  } else {
+    os << std::fixed << std::setprecision(format_options.precision) << val;
+  }
 }
 inline void PrintFormatter::print(std::ostream& os, bfloat16_t val) {
-  os << val;
+  if (format_options.precision == -1) {
+    os << val;
+  } else {
+    os << std::fixed << std::setprecision(format_options.precision) << val;
+  }
 }
 inline void PrintFormatter::print(std::ostream& os, float val) {
-  os << val;
+  if (format_options.precision == -1) {
+    os << val;
+  } else {
+    os << std::fixed << std::setprecision(format_options.precision) << val;
+  }
+}
+inline void PrintFormatter::print(std::ostream& os, double val) {
+  if (format_options.precision == -1) {
+    os << val;
+  } else {
+    os << std::fixed << std::setprecision(format_options.precision) << val;
+  }
 }
 inline void PrintFormatter::print(std::ostream& os, complex64_t val) {
-  os << val;
+  if (format_options.precision == -1) {
+    os << val.real();
+    if (val.imag() >= 0 || std::isnan(val.imag())) {
+      os << "+" << val.imag() << "j";
+    } else {
+      os << "-" << -val.imag() << "j";
+    }
+  } else {
+    os << std::fixed << std::setprecision(format_options.precision)
+       << val.real();
+    if (val.imag() >= 0 || std::isnan(val.imag())) {
+      os << "+" << std::fixed << std::setprecision(format_options.precision)
+         << val.imag() << "j";
+    } else {
+      os << "-" << std::fixed << std::setprecision(format_options.precision)
+         << -val.imag() << "j";
+    }
+  }
 }
 
-PrintFormatter global_formatter;
+PrintFormatter& get_global_formatter() {
+  static PrintFormatter formatter;
+  return formatter;
+}
+
+void set_printoptions(PrintOptions options) {
+  auto& formatter = get_global_formatter();
+  formatter.format_options = options;
+}
+
+bool is_main_thread() {
+  static auto main_thread_id = std::this_thread::get_id();
+  return main_thread_id == std::this_thread::get_id();
+}
 
 Dtype result_type(const std::vector<array>& arrays) {
-  std::vector<Dtype> dtypes(1, bool_);
+  Dtype t = bool_;
   for (auto& arr : arrays) {
-    dtypes.push_back(promote_types(dtypes.back(), arr.dtype()));
+    t = promote_types(t, arr.dtype());
   }
-  return dtypes.back();
+  return t;
 }
 
-std::vector<int> broadcast_shapes(
-    const std::vector<int>& s1,
-    const std::vector<int>& s2) {
+Shape broadcast_shapes(const Shape& s1, const Shape& s2) {
   // Use the same broadcasting rules as numpy
   // https://numpy.org/doc/1.20/user/theory.broadcasting.html
   // "The size of the trailing axes for both arrays in an operation must
@@ -78,10 +149,10 @@ std::vector<int> broadcast_shapes(
   int diff = std::abs(ndim1 - ndim2);
   const auto& big = ndim1 > ndim2 ? s1 : s2;
   const auto& small = ndim1 > ndim2 ? s2 : s1;
-  std::vector<int> out_shape(ndim);
+  Shape out_shape(ndim);
   for (int i = ndim - 1; i >= diff; --i) {
-    int a = big[i];
-    int b = small[i - diff];
+    auto a = big[i];
+    auto b = small[i - diff];
     if (b == a) {
       out_shape[i] = a;
     } else if (a == 1 || b == 1) {
@@ -89,7 +160,8 @@ std::vector<int> broadcast_shapes(
       out_shape[i] = a * b;
     } else {
       std::ostringstream msg;
-      msg << "Shapes " << s1 << " and " << s2 << " cannot be broadcast.";
+      msg << "[broadcast_shapes] Shapes " << s1 << " and " << s2
+          << " cannot be broadcast.";
       throw std::invalid_argument(msg.str());
     }
   }
@@ -99,29 +171,17 @@ std::vector<int> broadcast_shapes(
   return out_shape;
 }
 
-bool is_same_shape(const std::vector<array>& arrays) {
-  if (arrays.empty()) {
-    return true;
-  }
-  return std::all_of(arrays.begin() + 1, arrays.end(), [&](const array& a) {
-    return (a.shape() == arrays[0].shape());
-  });
-}
-
-int normalize_axis(int axis, int ndim) {
-  if (ndim <= 0) {
-    throw std::invalid_argument("Number of dimensions must be positive.");
-  }
+int normalize_axis_index(
+    int axis,
+    int ndim,
+    const std::string& msg_prefix /* = "" */) {
   if (axis < -ndim || axis >= ndim) {
     std::ostringstream msg;
-    msg << "Axis " << axis << " is out of bounds for array with " << ndim
-        << " dimensions.";
+    msg << msg_prefix << "Axis " << axis << " is out of bounds for array with "
+        << ndim << " dimensions.";
     throw std::invalid_argument(msg.str());
   }
-  if (axis < 0) {
-    axis += ndim;
-  }
-  return axis;
+  return axis < 0 ? axis + ndim : axis;
 }
 
 std::ostream& operator<<(std::ostream& os, const Device& d) {
@@ -151,24 +211,11 @@ std::ostream& operator<<(std::ostream& os, int8_t x) {
 }
 
 std::ostream& operator<<(std::ostream& os, uint8_t x) {
-  os << static_cast<uint>(x);
+  os << static_cast<unsigned int>(x);
   return os;
 }
 
 namespace {
-
-inline size_t elem_to_loc(
-    int elem,
-    const std::vector<int>& shape,
-    const std::vector<size_t>& strides) {
-  size_t loc = 0;
-  for (int i = shape.size() - 1; i >= 0; --i) {
-    auto q_and_r = ldiv(elem, shape[i]);
-    loc += q_and_r.rem * strides[i];
-    elem = q_and_r.quot;
-  }
-  return loc;
-}
 
 template <typename T>
 void print_subarray(std::ostream& os, const array& a, size_t index, int dim) {
@@ -186,7 +233,7 @@ void print_subarray(std::ostream& os, const array& a, size_t index, int dim) {
       i = n - num_print - 1;
       index += s * (n - 2 * num_print - 1);
     } else if (is_last) {
-      global_formatter.print(os, a.data<T>()[index]);
+      get_global_formatter().print(os, a.data<T>()[index]);
     } else {
       print_subarray<T>(os, a, index, dim + 1);
     }
@@ -198,12 +245,11 @@ void print_subarray(std::ostream& os, const array& a, size_t index, int dim) {
 
 template <typename T>
 void print_array(std::ostream& os, const array& a) {
-  std::vector<int> indices(a.ndim(), 0);
   os << std::boolalpha;
   os << "array(";
   if (a.ndim() == 0) {
     auto data = a.data<T>();
-    global_formatter.print(os, data[0]);
+    get_global_formatter().print(os, data[0]);
   } else {
     print_subarray<T>(os, a, 0, 0);
   }
@@ -214,35 +260,7 @@ void print_array(std::ostream& os, const array& a) {
 } // namespace
 
 std::ostream& operator<<(std::ostream& os, const Dtype& dtype) {
-  switch (dtype) {
-    case bool_:
-      return os << "bool";
-    case uint8:
-      return os << "uint8";
-    case uint16:
-      return os << "uint16";
-    case uint32:
-      return os << "uint32";
-    case uint64:
-      return os << "uint64";
-    case int8:
-      return os << "int8";
-    case int16:
-      return os << "int16";
-    case int32:
-      return os << "int32";
-    case int64:
-      return os << "int64";
-    case float16:
-      return os << "float16";
-    case float32:
-      return os << "float32";
-    case bfloat16:
-      return os << "bfloat16";
-    case complex64:
-      return os << "complex64";
-  }
-  return os;
+  return os << dtype_to_string(dtype);
 }
 
 std::ostream& operator<<(std::ostream& os, const Dtype::Kind& k) {
@@ -265,75 +283,76 @@ std::ostream& operator<<(std::ostream& os, const Dtype::Kind& k) {
 
 std::ostream& operator<<(std::ostream& os, array a) {
   a.eval();
-  switch (a.dtype()) {
-    case bool_:
-      print_array<bool>(os, a);
-      break;
-    case uint8:
-      print_array<uint8_t>(os, a);
-      break;
-    case uint16:
-      print_array<uint16_t>(os, a);
-      break;
-    case uint32:
-      print_array<uint32_t>(os, a);
-      break;
-    case uint64:
-      print_array<uint64_t>(os, a);
-      break;
-    case int8:
-      print_array<int8_t>(os, a);
-      break;
-    case int16:
-      print_array<int16_t>(os, a);
-      break;
-    case int32:
-      print_array<int32_t>(os, a);
-      break;
-    case int64:
-      print_array<int64_t>(os, a);
-      break;
-    case float16:
-      print_array<float16_t>(os, a);
-      break;
-    case bfloat16:
-      print_array<bfloat16_t>(os, a);
-      break;
-    case float32:
-      print_array<float>(os, a);
-      break;
-    case complex64:
-      print_array<complex64_t>(os, a);
-      break;
-  }
+  dispatch_all_types(a.dtype(), [&](auto type_tag) {
+    print_array<MLX_GET_TYPE(type_tag)>(os, a);
+  });
   return os;
 }
 
-std::ostream& operator<<(std::ostream& os, const std::vector<int>& v) {
-  os << "(";
-  for (int i = 0; i < v.size(); ++i) {
-    os << v[i] << ((i == v.size() - 1) ? "" : ",");
+namespace env {
+
+int get_var(const char* name, int default_value) {
+  if (const char* buff_str = std::getenv(name)) {
+    return atoi(buff_str);
+  } else {
+    return default_value;
   }
-  os << ")";
-  return os;
 }
 
-std::ostream& operator<<(std::ostream& os, const std::vector<size_t>& v) {
-  os << "(";
-  for (int i = 0; i < v.size(); ++i) {
-    os << v[i] << ((i == v.size() - 1) ? "" : ",");
+std::string get_var(const char* name, const char* default_value) {
+  if (const char* buff_str = std::getenv(name)) {
+    return buff_str;
+  } else {
+    return default_value;
   }
-  os << ")";
-  return os;
 }
 
-std::ostream& operator<<(std::ostream& os, const std::vector<int64_t>& v) {
-  os << "(";
-  for (int i = 0; i < v.size(); ++i) {
-    os << v[i] << ((i == v.size() - 1) ? "" : ",");
+} // namespace env
+
+template <typename T>
+void set_finfo_limits(
+    int& bits,
+    double& min,
+    double& max,
+    double& eps,
+    double& smallest_normal) {
+  bits = 8 * sizeof(T);
+  min = numeric_limits<T>::lowest();
+  max = numeric_limits<T>::max();
+  eps = numeric_limits<T>::epsilon();
+  smallest_normal = numeric_limits<T>::min();
+}
+
+finfo::finfo(Dtype dtype) : dtype(dtype) {
+  if (!issubdtype(dtype, inexact)) {
+    std::ostringstream msg;
+    msg << "[finfo] dtype " << dtype << " is not inexact.";
+    throw std::invalid_argument(msg.str());
   }
-  os << ")";
-  return os;
+  if (dtype == float32) {
+    set_finfo_limits<float>(bits, min, max, eps, smallest_normal);
+  } else if (dtype == float16) {
+    set_finfo_limits<float16_t>(bits, min, max, eps, smallest_normal);
+  } else if (dtype == bfloat16) {
+    set_finfo_limits<bfloat16_t>(bits, min, max, eps, smallest_normal);
+  } else if (dtype == float64) {
+    set_finfo_limits<double>(bits, min, max, eps, smallest_normal);
+  } else if (dtype == complex64) {
+    this->dtype = float32;
+    set_finfo_limits<float>(bits, min, max, eps, smallest_normal);
+  }
+}
+
+template <typename T>
+void set_iinfo_limits(int64_t& min, uint64_t& max) {
+  min = std::numeric_limits<T>::min();
+  max = std::numeric_limits<T>::max();
+}
+
+iinfo::iinfo(Dtype dtype) : dtype(dtype) {
+  dispatch_int_types(dtype, "[iinfo]", [&](auto type_tag) {
+    set_iinfo_limits<MLX_GET_TYPE(type_tag)>(min, max);
+  });
 }
 
 } // namespace mlx::core

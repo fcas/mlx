@@ -27,24 +27,37 @@ Operations
    argpartition
    argsort
    array_equal
+   asarray
    as_strided
+   astype
    atleast_1d
    atleast_2d
    atleast_3d
+   bartlett
    bitwise_and
+   bitwise_invert
    bitwise_or
    bitwise_xor
+   blackman
    block_masked_mm
-   block_sparse_mm
+   broadcast_arrays
+   broadcast_shapes
    broadcast_to
+   can_cast
    ceil
    clip
+   concat
    concatenate
+   contiguous
    conj
    conjugate
    convolve
    conv1d
    conv2d
+   conv3d
+   conv_transpose1d
+   conv_transpose2d
+   conv_transpose3d
    conv_general
    cos
    cosh
@@ -52,12 +65,17 @@ Operations
    cummin
    cumprod
    cumsum
+   count_nonzero
    degrees
+   depends
    dequantize
    diag
    diagonal
+   diff
    divide
    divmod
+   einsum
+   einsum_path
    equal
    erf
    erfinv
@@ -66,19 +84,32 @@ Operations
    expand_dims
    eye
    flatten
+   flip
    floor
    floor_divide
    full
+   from_dlpack
+   full_like
+   from_fp8
+   gather_mm
+   gather_qmm
    greater
    greater_equal
+   hadamard_transform
+   hamming
+   hanning
    identity
+   imag
    inner
+   isdtype
+   isfinite
    isclose
    isinf
    isnan
    isneginf
    isposinf
    issubdtype
+   kron
    left_shift
    less
    less_equal
@@ -89,19 +120,23 @@ Operations
    log10
    log1p
    logaddexp
+   logcumsumexp
    logical_not
    logical_and
    logical_or
+   logical_xor
    logsumexp
    matmul
    max
    maximum
    mean
+   median
    meshgrid
    min
    minimum
    moveaxis
    multiply
+   nan_to_num
    negative
    not_equal
    ones
@@ -109,16 +144,23 @@ Operations
    outer
    partition
    pad
+   permute_dims
+   positive
    power
    prod
+   put_along_axis
    quantize
    quantized_matmul
+   qqmm
    radians
+   real
    reciprocal
    remainder
    repeat
    reshape
+   result_type
    right_shift
+   roll
    round
    rsqrt
    save
@@ -126,10 +168,14 @@ Operations
    savez_compressed
    save_gguf
    save_safetensors
+   searchsorted
    sigmoid
    sign
    sin
    sinh
+   slice
+   slice_update
+   segmented_mm
    softmax
    sort
    split
@@ -149,11 +195,18 @@ Operations
    tensordot
    tile
    topk
+   to_fp8
+   trace
    transpose
    tri
    tril
    triu
+   trunc
+   unflatten
+   unstack
+   vecdot
    var
+   view
    where
    zeros
    zeros_like

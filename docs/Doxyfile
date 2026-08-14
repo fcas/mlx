@@ -13,7 +13,7 @@ EXCLUDE_PATTERNS       = */private/*
 CREATE_SUBDIRS         = NO
 FULL_PATH_NAMES        = YES
 RECURSIVE              = YES
-GENERATE_HTML          = YES
+GENERATE_HTML          = NO
 GENERATE_LATEX         = NO
 GENERATE_XML           = YES
 XML_PROGRAMLISTING     = YES
@@ -26,6 +26,7 @@ ENABLE_PREPROCESSING   = YES
 MACRO_EXPANSION        = YES
 EXPAND_ONLY_PREDEF     = NO
 SKIP_FUNCTION_MACROS   = NO
+PREDEFINED             = MLX_API=
 
 ################################################################################
 # Compound extraction control.                                                 #

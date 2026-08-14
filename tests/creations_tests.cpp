@@ -139,14 +139,6 @@ TEST_CASE("test astype") {
     y = astype(x, int32);
     CHECK_EQ(y.dtype(), int32);
     CHECK_EQ(y.item<int>(), -3);
-
-    y = astype(x, uint32);
-    CHECK_EQ(y.dtype(), uint32);
-
-    // Use std::copy since the result is platform dependent
-    uint32_t v;
-    std::copy(x.data<float>(), x.data<float>() + 1, &v);
-    CHECK_EQ(y.item<uint32_t>(), v);
   }
 }
 
@@ -208,14 +200,14 @@ TEST_CASE("test full") {
   // Check zeros and ones
   {
     auto x = zeros({2, 2}, float32);
-    CHECK_EQ(x.shape(), std::vector<int>{2, 2});
+    CHECK_EQ(x.shape(), Shape{2, 2});
     CHECK_EQ(x.ndim(), 2);
     CHECK_EQ(x.dtype(), float32);
     auto y = array({0.0, 0.0, 0.0, 0.0}, {2, 2});
     CHECK(array_equal(x, y).item<bool>());
 
     x = ones({2, 2}, float32);
-    CHECK_EQ(x.shape(), std::vector<int>{2, 2});
+    CHECK_EQ(x.shape(), Shape{2, 2});
     CHECK_EQ(x.ndim(), 2);
     CHECK_EQ(x.dtype(), float32);
     y = array({1.0, 1.0, 1.0, 1.0}, {2, 2});
@@ -226,20 +218,28 @@ TEST_CASE("test full") {
     CHECK_EQ(y.dtype(), int32);
     CHECK(array_equal(x, y).item<bool>());
 
+    auto z = zeros_like(x, float16);
+    CHECK_EQ(z.dtype(), float16);
+    CHECK(array_equal(z, zeros({2, 2}, float16)).item<bool>());
+
     x = ones({2, 2}, int32);
     y = ones_like(x);
     CHECK_EQ(y.dtype(), int32);
     CHECK(array_equal(x, y).item<bool>());
+
+    z = ones_like(x, float16);
+    CHECK_EQ(z.dtype(), float16);
+    CHECK(array_equal(z, ones({2, 2}, float16)).item<bool>());
   }
 
   // Works for empty shape and empty array
   {
     array x = ones({}, int32);
-    CHECK_EQ(x.shape(), std::vector<int>{});
+    CHECK_EQ(x.shape(), Shape{});
     CHECK_EQ(x.item<int>(), 1);
 
     x = full({0}, array({}));
-    CHECK_EQ(x.shape(), std::vector<int>{0});
+    CHECK_EQ(x.shape(), Shape{0});
     CHECK_EQ(x.size(), 0);
 
     CHECK_THROWS_AS(full({}, array({})), std::invalid_argument);

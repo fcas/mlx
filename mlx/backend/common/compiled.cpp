@@ -1,44 +1,31 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include "mlx/backend/common/compiled.h"
-#include "mlx/graph_utils.h"
-#include "mlx/primitives.h"
+#include "mlx/backend/common/utils.h"
+#include "mlx/dtype_utils.h"
 #include "mlx/utils.h"
 
 namespace mlx::core {
 
 void print_constant(std::ostream& os, const array& x) {
-  switch (x.dtype()) {
-    case float32:
-      return print_float_constant<float>(os, x);
-    case float16:
-      return print_float_constant<float16_t>(os, x);
-    case bfloat16:
-      return print_float_constant<bfloat16_t>(os, x);
-    case complex64:
-      return print_complex_constant<complex64_t>(os, x);
-    case int8:
-      return print_int_constant<int8_t>(os, x);
-    case int16:
-      return print_int_constant<int16_t>(os, x);
-    case int32:
-      return print_int_constant<int32_t>(os, x);
-    case int64:
-      return print_int_constant<int64_t>(os, x);
-    case uint8:
-      return print_int_constant<uint8_t>(os, x);
-    case uint16:
-      return print_int_constant<uint16_t>(os, x);
-    case uint32:
-      return print_int_constant<uint32_t>(os, x);
-    case uint64:
-      return print_int_constant<uint64_t>(os, x);
-    case bool_:
+  dispatch_all_types(x.dtype(), [&](auto type_tag) {
+    using T = MLX_GET_TYPE(type_tag);
+    if constexpr (std::is_same_v<T, bool>) {
       os << std::boolalpha << x.item<bool>();
-      return;
-    default:
+    } else if constexpr (std::is_same_v<T, int8_t>) {
+      os << static_cast<int32_t>(x.item<int8_t>());
+    } else if constexpr (std::is_same_v<T, uint8_t>) {
+      os << static_cast<uint32_t>(x.item<uint8_t>());
+    } else if constexpr (is_complex<T>) {
+      print_complex_constant<T>(os, x);
+    } else if constexpr (is_floating_point_v<T>) {
+      print_float_constant<T>(os, x);
+    } else if constexpr (std::is_integral_v<T>) {
+      print_int_constant<T>(os, x);
+    } else {
       throw std::runtime_error("Unsupported constant type");
-  }
+    }
+  });
 }
 
 std::string get_type_string(Dtype d) {
@@ -49,6 +36,8 @@ std::string get_type_string(Dtype d) {
       return "float16_t";
     case bfloat16:
       return "bfloat16_t";
+    case float64:
+      return "double";
     case complex64:
       return "complex64_t";
     case bool_:
@@ -77,63 +66,24 @@ std::string get_type_string(Dtype d) {
   }
 }
 
-std::string build_lib_name(
-    const std::vector<array>& inputs,
-    const std::vector<array>& outputs,
-    const std::vector<array>& tape,
-    const std::unordered_set<uintptr_t>& constant_ids) {
-  NodeNamer namer;
-  std::ostringstream os;
-  std::ostringstream constant_hasher;
-
-  // Fill the input names. This is not really necessary, I just like having A,
-  // B, C, ... as the inputs.
-  for (auto& x : inputs) {
-    namer.get_name(x);
-  }
-
-  // The primitives describing the tape. For unary and binary primitives this
-  // must be enough to describe the full computation.
-  for (auto& a : tape) {
-    // name and type of output
-    os << namer.get_name(a) << kindof(a.dtype()) << a.itemsize();
-    // computation performed
-    a.primitive().print(os);
-    // name of inputs to the function
-    for (auto& inp : a.inputs()) {
-      os << namer.get_name(inp);
+bool has_negative_strides(const array& x) {
+  for (auto s : x.strides()) {
+    if (s < 0) {
+      return true;
     }
   }
-  os << "_";
-
-  for (auto& x : inputs) {
-    if (constant_ids.find(x.id()) != constant_ids.end()) {
-      os << "C";
-      print_constant(constant_hasher, x);
-    } else {
-      os << (is_scalar(x) ? "S" : "V");
-    }
-  }
-  os << "_";
-  for (auto& x : inputs) {
-    if (constant_ids.find(x.id()) != constant_ids.end()) {
-      continue;
-    }
-    os << kindof(x.dtype()) << x.itemsize();
-  }
-  os << "_" << std::hash<std::string>{}(constant_hasher.str());
-
-  return os.str();
+  return false;
 }
 
-bool compiled_check_contiguity(
+std::pair<bool, bool> compiled_check_contiguity(
     const std::vector<array>& inputs,
-    const std::vector<int>& shape) {
+    const Shape& shape) {
   bool contiguous = true;
   bool all_contig = true;
   bool all_row_contig = true;
   bool all_col_contig = true;
   int non_scalar_inputs = 0;
+  bool negative_strides = false;
   for (const auto& x : inputs) {
     if (is_scalar(x)) {
       continue;
@@ -143,6 +93,7 @@ bool compiled_check_contiguity(
     all_contig &= (x.flags().contiguous && shape_eq);
     all_row_contig &= (x.flags().row_contiguous && shape_eq);
     all_col_contig &= (x.flags().col_contiguous && shape_eq);
+    negative_strides |= has_negative_strides(x);
   }
   if (non_scalar_inputs > 1 && !all_row_contig && !all_col_contig) {
     contiguous = false;
@@ -151,19 +102,19 @@ bool compiled_check_contiguity(
   } else if (non_scalar_inputs == 0 && !shape.empty()) {
     contiguous = false;
   }
-  return contiguous;
+  return {contiguous, negative_strides};
 }
 
 void compiled_allocate_outputs(
     const std::vector<array>& inputs,
     std::vector<array>& outputs,
-    const std::vector<array>& inputs_,
-    const std::unordered_set<uintptr_t>& constant_ids_,
+    const std::function<bool(size_t)>& is_constant,
     bool contiguous,
-    bool move_buffers /* = false */) {
+    const std::function<allocator::Buffer(size_t)>&
+        mallocfn /* = allocator::malloc */) {
   if (contiguous) {
     int o = 0;
-    std::vector<size_t> strides;
+    Strides strides;
     size_t data_size;
     array::Flags flags;
     for (int i = 0; i < inputs.size() && o < outputs.size(); ++i) {
@@ -174,13 +125,8 @@ void compiled_allocate_outputs(
       // - Donatable
       // - Not a constant
       if (in.itemsize() == outputs[o].itemsize() && !is_scalar(in) &&
-          in.is_donatable() &&
-          constant_ids_.find(inputs_[i].id()) == constant_ids_.end()) {
-        if (move_buffers) {
-          outputs[o++].move_shared_buffer(in);
-        } else {
-          outputs[o++].copy_shared_buffer(in);
-        }
+          in.is_donatable() && !is_constant(i)) {
+        outputs[o++].copy_shared_buffer(in);
       }
       // Get representative input flags to properly set non-donated outputs
       if (strides.empty() && in.size() == outputs[0].size()) {
@@ -191,7 +137,7 @@ void compiled_allocate_outputs(
     }
     for (; o < outputs.size(); ++o) {
       outputs[o].set_data(
-          allocator::malloc_or_wait(data_size * outputs[o].itemsize()),
+          mallocfn(data_size * outputs[o].itemsize()),
           data_size,
           strides,
           flags);
@@ -205,22 +151,93 @@ void compiled_allocate_outputs(
       // - Donatable
       // - Correct size
       // - Not a constant
-      if (in.flags().row_contiguous && in.nbytes() == outputs[o].nbytes() &&
-          in.is_donatable() &&
-          constant_ids_.find(inputs_[i].id()) == constant_ids_.end()) {
-        if (move_buffers) {
-          outputs[o].move_shared_buffer(
-              in, outputs[o].strides(), in.flags(), in.data_size());
-        } else {
-          outputs[o].copy_shared_buffer(
-              in, outputs[o].strides(), in.flags(), in.data_size());
-        }
+      if (in.flags().row_contiguous && in.size() == outputs[o].size() &&
+          in.itemsize() == outputs[o].itemsize() && in.is_donatable() &&
+          !is_constant(i)) {
+        outputs[o].copy_shared_buffer(
+            in, outputs[o].strides(), in.flags(), in.data_size());
         o++;
       }
     }
     for (; o < outputs.size(); ++o) {
-      outputs[o].set_data(allocator::malloc_or_wait(outputs[o].nbytes()));
+      outputs[o].set_data(mallocfn(outputs[o].nbytes()));
     }
+  }
+}
+
+std::tuple<bool, bool, Shape, std::vector<Strides>>
+compiled_collapse_contiguous_dims(
+    const std::vector<array>& inputs,
+    const array& out,
+    const std::function<bool(size_t)>& is_constant) {
+  const Shape& shape = out.shape();
+  auto [contiguous, negative_strides] =
+      compiled_check_contiguity(inputs, shape);
+  if (contiguous && !negative_strides) {
+    return {true, false, shape, {}};
+  }
+
+  std::vector<Strides> strides_vec{out.strides()};
+  for (size_t i = 0; i < inputs.size(); ++i) {
+    // Skip constants.
+    if (is_constant(i)) {
+      continue;
+    }
+
+    // Skip scalar inputs.
+    const auto& x = inputs[i];
+    if (is_scalar(x)) {
+      continue;
+    }
+
+    // Broadcast the inputs to the output shape.
+    Strides xstrides;
+    size_t j = 0;
+    for (; j < shape.size() - x.ndim(); ++j) {
+      if (shape[j] == 1) {
+        xstrides.push_back(out.strides()[j]);
+      } else {
+        xstrides.push_back(0);
+      }
+    }
+    for (size_t i = 0; i < x.ndim(); ++i, ++j) {
+      if (x.shape(i) == 1) {
+        if (shape[j] == 1) {
+          xstrides.push_back(out.strides()[j]);
+        } else {
+          xstrides.push_back(0);
+        }
+      } else {
+        xstrides.push_back(x.strides()[i]);
+      }
+    }
+    strides_vec.push_back(std::move(xstrides));
+  }
+
+  auto tup = collapse_contiguous_dims(shape, strides_vec, INT32_MAX);
+  return {
+      false,
+      negative_strides,
+      std::move(std::get<0>(tup)),
+      std::move(std::get<1>(tup))};
+}
+
+bool compiled_use_large_index(
+    const std::vector<array>& inputs,
+    const std::vector<array>& outputs,
+    bool contiguous) {
+  if (contiguous) {
+    size_t max_size = 0;
+    for (const auto& in : inputs) {
+      max_size = std::max(max_size, in.data_size());
+    }
+    return max_size > UINT32_MAX;
+  } else {
+    size_t max_size = 0;
+    for (const auto& o : outputs) {
+      max_size = std::max(max_size, o.size());
+    }
+    return max_size > UINT32_MAX;
   }
 }
 

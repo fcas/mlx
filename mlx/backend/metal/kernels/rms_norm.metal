@@ -3,11 +3,11 @@
 #include <metal_common>
 #include <metal_simdgroup>
 
-#include "mlx/backend/metal/kernels/bf16.h"
-#include "mlx/backend/metal/kernels/defines.h"
 #include "mlx/backend/metal/kernels/utils.h"
 
 using namespace metal;
+
+constant bool has_w [[function_constant(20)]];
 
 template <typename T, int N_READS = RMS_N_READS>
 [[kernel]] void rms_single_row(
@@ -17,26 +17,28 @@ template <typename T, int N_READS = RMS_N_READS>
     constant float& eps,
     constant uint& axis_size,
     constant uint& w_stride,
-    threadgroup float* local_inv_mean [[threadgroup(0)]],
-    threadgroup float* local_sums [[threadgroup(1)]],
     uint gid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
+  constexpr int SIMD_SIZE = 32;
+
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[SIMD_SIZE];
+
   float acc = 0;
-  x += gid * axis_size + lid * N_READS;
+  float thread_x[N_READS];
+  x += gid * size_t(axis_size) + lid * N_READS;
   w += w_stride * lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      float xi = x[i];
-      acc += xi * xi;
+      thread_x[i] = x[i];
+      acc += thread_x[i] * thread_x[i];
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
-      if ((lid * N_READS + i) < axis_size) {
-        float xi = x[i];
-        acc += xi * xi;
-      }
+      thread_x[i] = (lid * N_READS + i < axis_size) ? (float)x[i] : 0;
+      acc += thread_x[i] * thread_x[i];
     }
   }
   acc = simd_sum(acc);
@@ -61,16 +63,18 @@ template <typename T, int N_READS = RMS_N_READS>
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  // Write the outputs
-  out += gid * axis_size + lid * N_READS;
+  // Write the outputs using cached x values
+  out += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
-      out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
+      out[i] =
+          w[w_stride * i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
       if ((lid * N_READS + i) < axis_size) {
-        out[i] = w[w_stride * i] * static_cast<T>(x[i] * local_inv_mean[0]);
+        out[i] =
+            w[w_stride * i] * static_cast<T>(thread_x[i] * local_inv_mean[0]);
       }
     }
   }
@@ -84,15 +88,17 @@ template <typename T, int N_READS = RMS_N_READS>
     constant float& eps,
     constant uint& axis_size,
     constant uint& w_stride,
-    threadgroup float* local_inv_mean [[threadgroup(0)]],
-    threadgroup float* local_sums [[threadgroup(1)]],
     uint gid [[threadgroup_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]],
     uint lsize [[threads_per_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
+  constexpr int SIMD_SIZE = 32;
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[SIMD_SIZE];
+
   float acc = 0;
-  x += gid * axis_size + lid * N_READS;
+  x += gid * size_t(axis_size) + lid * N_READS;
   w += w_stride * lid * N_READS;
   for (uint r = 0; r < axis_size; r += lsize * N_READS) {
     if (r + lid * N_READS + N_READS <= axis_size) {
@@ -132,7 +138,7 @@ template <typename T, int N_READS = RMS_N_READS>
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // Write the outputs
-  out += gid * axis_size + lid * N_READS;
+  out += gid * size_t(axis_size) + lid * N_READS;
   for (uint r = 0; r < axis_size; r += lsize * N_READS) {
     if (r + lid * N_READS + N_READS <= axis_size) {
       for (int i = 0; i < N_READS; i++) {
@@ -165,8 +171,8 @@ template <typename T, int N_READS = RMS_N_READS>
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
   // Advance the input pointers
-  x += gid * axis_size + lid * N_READS;
-  g += gid * axis_size + lid * N_READS;
+  x += gid * size_t(axis_size) + lid * N_READS;
+  g += gid * size_t(axis_size) + lid * N_READS;
   w += w_stride * lid * N_READS;
 
   // Allocate registers for the computation and accumulators
@@ -233,14 +239,16 @@ template <typename T, int N_READS = RMS_N_READS>
   float normalizer3 = normalizer * normalizer * normalizer;
 
   // Write the outputs
-  gx += gid * axis_size + lid * N_READS;
-  gw += gid * axis_size + lid * N_READS;
+  gx += gid * size_t(axis_size) + lid * N_READS;
+  gw += gid * size_t(axis_size) + lid * N_READS;
   if (lid * N_READS + N_READS <= axis_size) {
     for (int i = 0; i < N_READS; i++) {
       gx[i] = static_cast<T>(
           thread_g[i] * thread_w[i] * normalizer -
           thread_x[i] * meangwx * normalizer3);
-      gw[i] = static_cast<T>(thread_g[i] * thread_x[i] * normalizer);
+      if (has_w) {
+        gw[i] = static_cast<T>(thread_g[i] * thread_x[i] * normalizer);
+      }
     }
   } else {
     for (int i = 0; i < N_READS; i++) {
@@ -248,7 +256,9 @@ template <typename T, int N_READS = RMS_N_READS>
         gx[i] = static_cast<T>(
             thread_g[i] * thread_w[i] * normalizer -
             thread_x[i] * meangwx * normalizer3);
-        gw[i] = static_cast<T>(thread_g[i] * thread_x[i] * normalizer);
+        if (has_w) {
+          gw[i] = static_cast<T>(thread_g[i] * thread_x[i] * normalizer);
+        }
       }
     }
   }
@@ -270,8 +280,8 @@ template <typename T, int N_READS = RMS_N_READS>
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
   // Advance the input pointers
-  x += gid * axis_size + lid * N_READS;
-  g += gid * axis_size + lid * N_READS;
+  x += gid * size_t(axis_size) + lid * N_READS;
+  g += gid * size_t(axis_size) + lid * N_READS;
   w += w_stride * lid * N_READS;
 
   // Allocate registers for the accumulators
@@ -337,8 +347,8 @@ template <typename T, int N_READS = RMS_N_READS>
   float normalizer3 = normalizer * normalizer * normalizer;
 
   // Write the outputs
-  gx += gid * axis_size + lid * N_READS;
-  gw += gid * axis_size + lid * N_READS;
+  gx += gid * size_t(axis_size) + lid * N_READS;
+  gw += gid * size_t(axis_size) + lid * N_READS;
   for (uint r = 0; r < axis_size; r += lsize * N_READS) {
     if (r + lid * N_READS + N_READS <= axis_size) {
       for (int i = 0; i < N_READS; i++) {
@@ -348,7 +358,9 @@ template <typename T, int N_READS = RMS_N_READS>
 
         gx[i + r] =
             static_cast<T>(gi * wi * normalizer - xi * meangwx * normalizer3);
-        gw[i + r] = static_cast<T>(gi * xi * normalizer);
+        if (has_w) {
+          gw[i + r] = static_cast<T>(gi * xi * normalizer);
+        }
       }
     } else {
       for (int i = 0; i < N_READS; i++) {
@@ -359,7 +371,9 @@ template <typename T, int N_READS = RMS_N_READS>
 
           gx[i + r] =
               static_cast<T>(gi * wi * normalizer - xi * meangwx * normalizer3);
-          gw[i + r] = static_cast<T>(gi * xi * normalizer);
+          if (has_w) {
+            gw[i + r] = static_cast<T>(gi * xi * normalizer);
+          }
         }
       }
     }
@@ -367,73 +381,11 @@ template <typename T, int N_READS = RMS_N_READS>
 }
 
 // clang-format off
-#define instantiate_rms_single_row(name, itype)               \
-  template [[host_name("rms" #name)]] [[kernel]] void         \
-  rms_single_row<itype>(                                      \
-      const device itype* x,                                  \
-      const device itype* w,                                  \
-      device itype* out,                                      \
-      constant float& eps,                                    \
-      constant uint& axis_size,                               \
-      constant uint& w_stride,                                \
-      threadgroup float* local_inv_mean [[threadgroup(0)]],   \
-      threadgroup float* local_sums [[threadgroup(1)]],       \
-      uint gid [[thread_position_in_grid]],                   \
-      uint lid [[thread_position_in_threadgroup]],            \
-      uint simd_lane_id [[thread_index_in_simdgroup]],        \
-      uint simd_group_id [[simdgroup_index_in_threadgroup]]); \
-                                                              \
-  template [[host_name("vjp_rms" #name)]] [[kernel]] void     \
-  vjp_rms_single_row<itype>(                                  \
-      const device itype* x,                                  \
-      const device itype* w,                                  \
-      const device itype* g,                                  \
-      device itype* gx,                                       \
-      device itype* gw,                                       \
-      constant float& eps,                                    \
-      constant uint& axis_size,                               \
-      constant uint& w_stride,                                \
-      uint gid [[thread_position_in_grid]],                   \
-      uint lid [[thread_position_in_threadgroup]],            \
-      uint simd_lane_id [[thread_index_in_simdgroup]],        \
-      uint simd_group_id [[simdgroup_index_in_threadgroup]]);
-
-#define instantiate_rms_looped(name, itype)                      \
-  template [[host_name("rms_looped" #name)]] [[kernel]] void     \
-  rms_looped<itype>(                                             \
-      const device itype* x,                                     \
-      const device itype* w,                                     \
-      device itype* out,                                         \
-      constant float& eps,                                       \
-      constant uint& axis_size,                                  \
-      constant uint& w_stride,                                   \
-      threadgroup float* local_inv_mean [[threadgroup(0)]],      \
-      threadgroup float* local_sums [[threadgroup(1)]],          \
-      uint gid [[thread_position_in_grid]],                      \
-      uint lid [[thread_position_in_threadgroup]],               \
-      uint lsize [[threads_per_threadgroup]],                    \
-      uint simd_lane_id [[thread_index_in_simdgroup]],           \
-      uint simd_group_id [[simdgroup_index_in_threadgroup]]);    \
-                                                                 \
-  template [[host_name("vjp_rms_looped" #name)]] [[kernel]] void \
-  vjp_rms_looped<itype>(                                         \
-      const device itype* x,                                     \
-      const device itype* w,                                     \
-      const device itype* g,                                     \
-      device itype* gx,                                          \
-      device itype* gw,                                          \
-      constant float& eps,                                       \
-      constant uint& axis_size,                                  \
-      constant uint& w_stride,                                   \
-      uint gid [[thread_position_in_grid]],                      \
-      uint lid [[thread_position_in_threadgroup]],               \
-      uint lsize [[threads_per_threadgroup]],                    \
-      uint simd_lane_id [[thread_index_in_simdgroup]],           \
-      uint simd_group_id [[simdgroup_index_in_threadgroup]]);
-
-#define instantiate_rms(name, itype)      \
-  instantiate_rms_single_row(name, itype) \
-  instantiate_rms_looped(name, itype)
+#define instantiate_rms(name, itype)                                \
+  instantiate_kernel("rms" #name, rms_single_row, itype)            \
+  instantiate_kernel("vjp_rms" #name, vjp_rms_single_row, itype)    \
+  instantiate_kernel("rms_looped" #name, rms_looped, itype)         \
+  instantiate_kernel("vjp_rms_looped" #name, vjp_rms_looped, itype)
 
 instantiate_rms(float32, float)
 instantiate_rms(float16, half)

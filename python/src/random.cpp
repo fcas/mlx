@@ -7,54 +7,84 @@
 
 #include <chrono>
 
-#include "python/src/utils.h"
-
 #include "mlx/ops.h"
 #include "mlx/random.h"
+#include "python/src/random.h"
+#include "python/src/small_vector.h"
+#include "python/src/utils.h"
 
+namespace mx = mlx::core;
 namespace nb = nanobind;
 using namespace nb::literals;
-using namespace mlx::core;
-using namespace mlx::core::random;
 
 class PyKeySequence {
  public:
-  explicit PyKeySequence(uint64_t seed) {
-    state_.append(key(seed));
+  ~PyKeySequence() {
+    if (state_.has_value()) {
+      nb::gil_scoped_acquire gil;
+      state_.reset();
+    }
+  }
+
+  void reset() {
+    state_.reset();
   }
 
   void seed(uint64_t seed) {
-    state_[0] = key(seed);
+    state()[0] = mx::random::key(seed);
   }
 
-  array next() {
-    auto out = split(nb::cast<array>(state_[0]));
-    state_[0] = out.first;
+  mx::array next() {
+    auto out = mx::random::split(nb::cast<mx::array>(state()[0]));
+    state()[0] = out.first;
     return out.second;
   }
 
-  nb::list state() {
-    return state_;
-  }
-
-  void release() {
-    nb::gil_scoped_acquire gil;
-    state_.release().dec_ref();
+  nb::list& state() {
+    if (!state_) {
+      static auto time_seed = []() {
+        auto now = std::chrono::system_clock::now();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   now.time_since_epoch())
+            .count();
+      }();
+      state_ = nb::list();
+      state_->append(mx::random::key(time_seed));
+    }
+    return *state_;
   }
 
  private:
-  nb::list state_;
+  std::optional<nb::list> state_;
 };
 
 PyKeySequence& default_key() {
-  auto get_current_time_seed = []() {
-    auto now = std::chrono::system_clock::now();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               now.time_since_epoch())
-        .count();
-  };
-  static PyKeySequence ks(get_current_time_seed());
+  // Each thread has its own random key to avoid race condition.
+  static thread_local PyKeySequence ks;
   return ks;
+}
+
+// A process-global sentinel for `mx.random.state`. Since it is the same object
+// on every thread, capturing it (e.g. with `mx.compile`) is thread-independent;
+// the pytree traversal in trees.cpp resolves it to the calling thread's key.
+class RandomState {};
+
+nb::object random_state_sentinel() {
+  static nb::object sentinel = []() {
+    auto sentinel = nb::cast(RandomState{});
+    sentinel.inc_ref();
+    return sentinel;
+  }();
+
+  return sentinel;
+}
+
+mx::array random_state_key() {
+  return nb::cast<mx::array>(default_key().state()[0]);
+}
+
+void set_random_state_key(const mx::array& key) {
+  default_key().state()[0] = nb::cast(key);
 }
 
 void init_random(nb::module_& parent_module) {
@@ -62,7 +92,32 @@ void init_random(nb::module_& parent_module) {
       "random",
       "mlx.core.random: functionality related to random number generation");
 
-  m.attr("state") = default_key().state();
+  nb::class_<RandomState>(m, "_RandomState")
+      .def("__len__", [](const RandomState&) { return 1; })
+      .def(
+          "__getitem__",
+          [](const RandomState&, int i) -> nb::object {
+            if (i != 0 && i != -1) {
+              throw nb::index_error("random state index out of range");
+            }
+            return default_key().state()[0];
+          },
+          "index"_a)
+      .def("__iter__", [](const RandomState&) {
+        return nb::iter(default_key().state());
+      });
+
+  m.def("__getattr__", [&](nb::handle key) -> nb::object {
+    // Create random.state lazily to avoid initializing device during import.
+    if (nb::isinstance<nb::str>(key) && nb::cast<std::string>(key) == "state") {
+      default_key().state();
+      return random_state_sentinel();
+    }
+    return nb::steal(PyErr_Format(
+        PyExc_AttributeError,
+        "Module 'random' has no attribute %R",
+        key.ptr()));
+  });
   m.def(
       "seed",
       [](uint64_t seed) { default_key().seed(seed); },
@@ -75,7 +130,7 @@ void init_random(nb::module_& parent_module) {
       )pbdoc");
   m.def(
       "key",
-      &key,
+      &mx::random::key,
       "seed"_a,
       R"pbdoc(
         Get a PRNG key from a seed.
@@ -88,18 +143,19 @@ void init_random(nb::module_& parent_module) {
       )pbdoc");
   m.def(
       "split",
-      nb::overload_cast<const array&, int, StreamOrDevice>(&random::split),
+      nb::overload_cast<const mx::array&, int, mx::StreamOrDevice>(
+          &mx::random::split),
       "key"_a,
       "num"_a = 2,
       "stream"_a = nb::none(),
       nb::sig(
-          "def split(key: array, num: int = 2, stream: Union[None, Stream, Device] = None) -> array)"),
+          "def split(key: array, num: int = 2, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Split a PRNG key into sub keys.
 
         Args:
             key (array): Input key to split.
-            num (int, optional): Number of sub keys. Default is 2.
+            num (int, optional): Number of sub keys. Default: ``2``.
 
         Returns:
             array: The array of sub keys with ``num`` as its first dimension.
@@ -108,27 +164,27 @@ void init_random(nb::module_& parent_module) {
       "uniform",
       [](const ScalarOrArray& low,
          const ScalarOrArray& high,
-         const std::vector<int>& shape,
-         std::optional<Dtype> type,
-         const std::optional<array>& key_,
-         StreamOrDevice s) {
+         const mx::Shape& shape,
+         std::optional<mx::Dtype> type,
+         const std::optional<mx::array>& key_,
+         mx::StreamOrDevice s) {
         auto key = key_ ? key_.value() : default_key().next();
-        return uniform(
+        return mx::random::uniform(
             to_array(low),
             to_array(high),
             shape,
-            type.value_or(float32),
+            type.value_or(mx::float32),
             key,
             s);
       },
       "low"_a = 0,
       "high"_a = 1,
-      "shape"_a = std::vector<int>{},
-      "dtype"_a.none() = float32,
+      "shape"_a = mx::Shape{},
+      "dtype"_a.none() = mx::float32,
       "key"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def uniform(low: Union[scalar, array] = 0, high: Union[scalar, array] = 1, shape: Sequence[int] = [], dtype: Optional[Dtype] = float32, key: Optional[array] = None, stream: Union[None, Stream, Device] = None) -> array"),
+          "def uniform(low: scalar | array = 0, high: scalar | array = 1, shape: Sequence[int] = [], dtype: Dtype | None = float32, key: array | None = None, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Generate uniformly distributed random numbers.
 
@@ -137,67 +193,81 @@ void init_random(nb::module_& parent_module) {
         broadcastable to ``shape``.
 
         Args:
-            low (scalar or array, optional): Lower bound of the distribution. Default is ``0``.
-            high (scalar or array, optional): Upper bound of the distribution. Default is ``1``.
-            shape (list(int), optional): Shape of the output. Default is ``()``.
+            low (scalar or array, optional): Lower bound of the distribution.
+              Default: ``0``.
+            high (scalar or array, optional): Upper bound of the distribution.
+              Default: ``1``.
+            shape (list(int), optional): Shape of the output. Default:``()``.
+            dtype (Dtype, optional): Type of the output. Default: ``float32``.
             key (array, optional): A PRNG key. Default: ``None``.
-            dtype (Dtype, optional): Type of the output. Default is ``float32``.
 
         Returns:
             array: The output array random values.
       )pbdoc");
   m.def(
       "normal",
-      [](const std::vector<int>& shape,
-         std::optional<Dtype> type,
-         float loc,
-         float scale,
-         const std::optional<array>& key_,
-         StreamOrDevice s) {
+      [](const mx::Shape& shape,
+         std::optional<mx::Dtype> type,
+         const std::optional<ScalarOrArray>& loc_,
+         const std::optional<ScalarOrArray>& scale_,
+         const std::optional<mx::array>& key_,
+         mx::StreamOrDevice s) {
+        auto dtype = type.value_or(mx::float32);
         auto key = key_ ? key_.value() : default_key().next();
-        return normal(shape, type.value_or(float32), loc, scale, key, s);
+        auto loc =
+            loc_ ? std::make_optional(to_array(*loc_, dtype)) : std::nullopt;
+        auto scale = scale_ ? std::make_optional(to_array(*scale_, dtype))
+                            : std::nullopt;
+        return mx::random::normal(shape, dtype, loc, scale, key, s);
       },
-      "shape"_a = std::vector<int>{},
-      "dtype"_a.none() = float32,
-      "loc"_a = 0.0,
-      "scale"_a = 1.0,
+      "shape"_a = mx::Shape{},
+      "dtype"_a.none() = mx::float32,
+      "loc"_a = nb::none(),
+      "scale"_a = nb::none(),
       "key"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def normal(shape: Sequence[int] = [], dtype: Optional[Dtype] = float32, loc: float = 0.0, scale: float = 1.0, key: Optional[array] = None, stream: Union[None, Stream, Device] = None) -> array"),
+          "def normal(shape: Sequence[int] = [], dtype: Dtype | None = float32, loc: scalar | array | None = None, scale: scalar | array | None = None, key: array | None = None, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Generate normally distributed random numbers.
 
+        If ``loc`` and ``scale`` are not provided the "standard" normal
+        distribution is used. That means $x \sim \mathcal{N}(0, 1)$ for
+        real numbers and $\text{Re}(x),\text{Im}(x) \sim \mathcal{N}(0,
+        \frac{1}{2})$ for complex numbers.
+
         Args:
-            shape (list(int), optional): Shape of the output. Default is ``()``.
-            dtype (Dtype, optional): Type of the output. Default is ``float32``.
-            loc (float, optional): Mean of the distribution. Default is ``0.0``.
-            scale (float, optional): Standard deviation of the distribution. Default is ``1.0``.
-            key (array, optional): A PRNG key. Default: None.
+            shape (list(int), optional): Shape of the output. Default: ``()``.
+            dtype (Dtype, optional): Type of the output. Default: ``float32``.
+            loc (scalar or array, optional): Mean of the distribution.
+              Default: ``None``.
+            scale (scalar or array, optional): Standard deviation of the
+              distribution. Default: ``None``.
+            key (array, optional): A PRNG key. Default: ``None``.
 
         Returns:
             array: The output array of random values.
       )pbdoc");
   m.def(
       "multivariate_normal",
-      [](const array& mean,
-         const array& cov,
-         const std::vector<int>& shape,
-         std::optional<Dtype> type,
-         const std::optional<array>& key_,
-         StreamOrDevice s) {
+      [](const mx::array& mean,
+         const mx::array& cov,
+         const mx::Shape& shape,
+         std::optional<mx::Dtype> type,
+         const std::optional<mx::array>& key_,
+         mx::StreamOrDevice s) {
         auto key = key_ ? key_.value() : default_key().next();
-        return multivariate_normal(
-            mean, cov, shape, type.value_or(float32), key, s);
+        return mx::random::multivariate_normal(
+            mean, cov, shape, type.value_or(mx::float32), key, s);
       },
       "mean"_a,
       "cov"_a,
-      "shape"_a = std::vector<int>{},
-      "dtype"_a.none() = float32,
+      "shape"_a = mx::Shape{},
+      "dtype"_a.none() = mx::float32,
       "key"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def multivariate_normal(mean: array, cov: array, shape: Sequence[int] = [], dtype: Optional[Dtype] = float32, key: Optional[array] = None, stream: Union[None, Stream, Device] = None) -> array"),
+          "def multivariate_normal(mean: array, cov: array, shape: Sequence[int] = [], dtype: Dtype | None = float32, key: array | None = None, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Generate jointly-normal random samples given a mean and covariance.
 
@@ -224,35 +294,46 @@ void init_random(nb::module_& parent_module) {
       "randint",
       [](const ScalarOrArray& low,
          const ScalarOrArray& high,
-         const std::vector<int>& shape,
-         std::optional<Dtype> type,
-         const std::optional<array>& key_,
-         StreamOrDevice s) {
+         const mx::Shape& shape,
+         std::optional<mx::Dtype> type,
+         const std::optional<mx::array>& key_,
+         mx::StreamOrDevice s) {
         auto key = key_ ? key_.value() : default_key().next();
-        return randint(
-            to_array(low), to_array(high), shape, type.value_or(int32), key, s);
+        return mx::random::randint(
+            to_array(low),
+            to_array(high),
+            shape,
+            type.value_or(mx::int32),
+            key,
+            s);
       },
       "low"_a,
       "high"_a,
-      "shape"_a = std::vector<int>{},
-      "dtype"_a.none() = int32,
+      "shape"_a = mx::Shape{},
+      "dtype"_a.none() = mx::int32,
       "key"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def randint(low: Union[scalar, array], high: Union[scalar, array], shape: Sequence[int] = [], dtype: Optional[Dtype] = int32, key: Optional[array] = None, stream: Union[None, Stream, Device] = None) -> array"),
+          "def randint(low: scalar | array, high: scalar | array, shape: Sequence[int] = [], dtype: Dtype | None = int32, key: array | None = None, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Generate random integers from the given interval.
 
         The values are sampled with equal probability from the integers in
         half-open interval ``[low, high)``. The lower and upper bound can be
-        scalars or arrays and must be roadcastable to ``shape``.
+        scalars or arrays and must be broadcastable to ``shape``.
+
+        .. note::
+           The samples are drawn from a ``float32`` uniform and clamped to
+           ``[low, high - 1]``, so not every integer in the range is reachable
+           once the bounds or the width of the interval go beyond the
+           ``2**24`` integer resolution of ``float32``.
 
         Args:
             low (scalar or array): Lower bound of the interval.
             high (scalar or array): Upper bound of the interval.
-            shape (list(int), optional): Shape of the output. Defaults to ``()``.
-            dtype (Dtype, optional): Type of the output. Defaults to ``int32``.
-            key (array, optional): A PRNG key. Default: None.
+            shape (list(int), optional): Shape of the output. Default: ``()``.
+            dtype (Dtype, optional): Type of the output. Default: ``int32``.
+            key (array, optional): A PRNG key. Default: ``None``.
 
         Returns:
             array: The array of random integers.
@@ -260,15 +341,15 @@ void init_random(nb::module_& parent_module) {
   m.def(
       "bernoulli",
       [](const ScalarOrArray& p_,
-         const std::optional<std::vector<int>> shape,
-         const std::optional<array>& key_,
-         StreamOrDevice s) {
+         const std::optional<mx::Shape> shape,
+         const std::optional<mx::array>& key_,
+         mx::StreamOrDevice s) {
         auto key = key_ ? key_.value() : default_key().next();
         auto p = to_array(p_);
         if (shape.has_value()) {
-          return bernoulli(p, shape.value(), key, s);
+          return mx::random::bernoulli(p, shape.value(), key, s);
         } else {
-          return bernoulli(p, key, s);
+          return mx::random::bernoulli(p, key, s);
         }
       },
       "p"_a = 0.5,
@@ -276,7 +357,7 @@ void init_random(nb::module_& parent_module) {
       "key"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def bernoulli(p: Union[scalar, array] = 0.5, shape: Optional[Sequence[int]] = None, key: Optional[array] = None, stream: Union[None, Stream, Device] = None) -> array"),
+          "def bernoulli(p: scalar | array = 0.5, shape: Sequence[int] | None = None, key: array | None = None, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Generate Bernoulli random values.
 
@@ -286,10 +367,10 @@ void init_random(nb::module_& parent_module) {
 
         Args:
             p (float or array, optional): Parameter of the Bernoulli
-              distribution. Default is 0.5.
-            shape (list(int), optional): Shape of the output. The default
-              shape is ``p.shape``.
-            key (array, optional): A PRNG key. Default: None.
+              distribution. Default: ``0.5``.
+            shape (list(int), optional): Shape of the output.
+              Default: ``p.shape``.
+            key (array, optional): A PRNG key. Default: ``None``.
 
         Returns:
             array: The array of random integers.
@@ -298,28 +379,29 @@ void init_random(nb::module_& parent_module) {
       "truncated_normal",
       [](const ScalarOrArray& lower_,
          const ScalarOrArray& upper_,
-         const std::optional<std::vector<int>> shape_,
-         std::optional<Dtype> type,
-         const std::optional<array>& key_,
-         StreamOrDevice s) {
+         const std::optional<mx::Shape> shape_,
+         std::optional<mx::Dtype> type,
+         const std::optional<mx::array>& key_,
+         mx::StreamOrDevice s) {
         auto key = key_ ? key_.value() : default_key().next();
         auto lower = to_array(lower_);
         auto upper = to_array(upper_);
-        auto t = type.value_or(float32);
+        auto t = type.value_or(mx::float32);
         if (shape_.has_value()) {
-          return truncated_normal(lower, upper, shape_.value(), t, key, s);
+          return mx::random::truncated_normal(
+              lower, upper, shape_.value(), t, key, s);
         } else {
-          return truncated_normal(lower, upper, t, key, s);
+          return mx::random::truncated_normal(lower, upper, t, key, s);
         }
       },
       "lower"_a,
       "upper"_a,
       "shape"_a = nb::none(),
-      "dtype"_a.none() = float32,
+      "dtype"_a.none() = mx::float32,
       "key"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def truncated_normal(lower: Union[scalar, array], upper: Union[scalar, array], shape: Optional[Sequence[int]] = None, dtype: float32, key: Optional[array] = None, stream: Union[None, Stream, Device] = None) -> array"),
+          "def truncated_normal(lower: scalar | array, upper: scalar | array, shape: Sequence[int] | None = None, dtype: Dtype | None = float32, key: array | None = None, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Generate values from a truncated normal distribution.
 
@@ -331,29 +413,29 @@ void init_random(nb::module_& parent_module) {
             lower (scalar or array): Lower bound of the domain.
             upper (scalar or array): Upper bound of the domain.
             shape (list(int), optional): The shape of the output.
-              Default is ``()``.
+              Default:``()``.
             dtype (Dtype, optional): The data type of the output.
-              Default is ``float32``.
-            key (array, optional): A PRNG key. Default: None.
+              Default: ``float32``.
+            key (array, optional): A PRNG key. Default: ``None``.
 
         Returns:
             array: The output array of random values.
       )pbdoc");
   m.def(
       "gumbel",
-      [](const std::vector<int>& shape,
-         std::optional<Dtype> type,
-         const std::optional<array>& key_,
-         StreamOrDevice s) {
+      [](const mx::Shape& shape,
+         std::optional<mx::Dtype> type,
+         const std::optional<mx::array>& key_,
+         mx::StreamOrDevice s) {
         auto key = key_ ? key_.value() : default_key().next();
-        return gumbel(shape, type.value_or(float32), key, s);
+        return mx::random::gumbel(shape, type.value_or(mx::float32), key, s);
       },
-      "shape"_a = std::vector<int>{},
-      "dtype"_a.none() = float32,
-      "stream"_a = nb::none(),
+      "shape"_a = mx::Shape{},
+      "dtype"_a.none() = mx::float32,
       "key"_a = nb::none(),
+      "stream"_a = nb::none(),
       nb::sig(
-          "def gumbel(shape: Sequence[int] = [], dtype: Optional[Dtype] = float32, stream: Optional[array] = None, key: Union[None, Stream, Device] = None) -> array"),
+          "def gumbel(shape: Sequence[int] = [], dtype: Dtype | None = float32, key: array | None = None, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Sample from the standard Gumbel distribution.
 
@@ -362,30 +444,34 @@ void init_random(nb::module_& parent_module) {
 
         Args:
             shape (list(int)): The shape of the output.
-            key (array, optional): A PRNG key. Default: None.
+            dtype (Dtype, optional): The data type of the output.
+              Default: ``float32``.
+            key (array, optional): A PRNG key. Default: ``None``.
 
         Returns:
-            array: The :class:`array` with shape ``shape`` and
-                   distributed according to the Gumbel distribution
+            array:
+              The :class:`array` with shape ``shape`` and distributed according
+              to the Gumbel distribution.
       )pbdoc");
   m.def(
       "categorical",
-      [](const array& logits,
+      [](const mx::array& logits,
          int axis,
-         const std::optional<std::vector<int>> shape,
+         const std::optional<mx::Shape> shape,
          const std::optional<int> num_samples,
-         const std::optional<array>& key_,
-         StreamOrDevice s) {
+         const std::optional<mx::array>& key_,
+         mx::StreamOrDevice s) {
         auto key = key_ ? key_.value() : default_key().next();
         if (shape.has_value() && num_samples.has_value()) {
           throw std::invalid_argument(
               "[categorical] At most one of shape or num_samples can be specified.");
         } else if (shape.has_value()) {
-          return categorical(logits, axis, shape.value(), key, s);
+          return mx::random::categorical(logits, axis, shape.value(), key, s);
         } else if (num_samples.has_value()) {
-          return categorical(logits, axis, num_samples.value(), key, s);
+          return mx::random::categorical(
+              logits, axis, num_samples.value(), key, s);
         } else {
-          return categorical(logits, axis, key, s);
+          return mx::random::categorical(logits, axis, key, s);
         }
       },
       "logits"_a,
@@ -395,7 +481,7 @@ void init_random(nb::module_& parent_module) {
       "key"_a = nb::none(),
       "stream"_a = nb::none(),
       nb::sig(
-          "def categorical(logits: array, axis: int = -1, shape: Optional[Sequence[int]] = None, num_samples: Optional[int] = None, key: Optional[array] = None, stream: Union[None, Stream, Device] = None) -> array"),
+          "def categorical(logits: array, axis: int = -1, shape: Sequence[int] | None = None, num_samples: int | None = None, key: array | None = None, stream: StreamOrDevice = None) -> array"),
       R"pbdoc(
         Sample from a categorical distribution.
 
@@ -407,19 +493,89 @@ void init_random(nb::module_& parent_module) {
         Args:
             logits (array): The *unnormalized* categorical distribution(s).
             axis (int, optional): The axis which specifies the distribution.
-               Default is ``-1``.
+               Default: ``-1``.
             shape (list(int), optional): The shape of the output. This must
-               be broadcast compatable with ``logits.shape`` with the ``axis``
+               be broadcast compatible with ``logits.shape`` with the ``axis``
                dimension removed. Default: ``None``
             num_samples (int, optional): The number of samples to draw from each
               of the categorical distributions in ``logits``. The output will have
               ``num_samples`` in the last dimension. Default: ``None``.
-            key (array, optional): A PRNG key. Default: None.
+            key (array, optional): A PRNG key. Default: ``None``.
 
         Returns:
             array: The ``shape``-sized output array with type ``uint32``.
       )pbdoc");
-  // Register static Python object cleanup before the interpreter exits
+  m.def(
+      "laplace",
+      [](const mx::Shape& shape,
+         std::optional<mx::Dtype> type,
+         float loc,
+         float scale,
+         const std::optional<mx::array>& key_,
+         mx::StreamOrDevice s) {
+        auto key = key_ ? key_.value() : default_key().next();
+        return mx::random::laplace(
+            shape, type.value_or(mx::float32), loc, scale, key, s);
+      },
+      "shape"_a = mx::Shape{},
+      "dtype"_a.none() = mx::float32,
+      "loc"_a = 0.0,
+      "scale"_a = 1.0,
+      "key"_a = nb::none(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def laplace(shape: Sequence[int] = [], dtype: Dtype | None = float32, loc: float = 0.0, scale: float = 1.0, key: array | None = None, stream: StreamOrDevice = None) -> array"),
+      R"pbdoc(
+        Sample numbers from a Laplace distribution.
+
+        Args:
+            shape (list(int), optional): Shape of the output. Default: ``()``.
+            dtype (Dtype, optional): Type of the output. Default: ``float32``.
+            loc (float, optional): Mean of the distribution. Default: ``0.0``.
+            scale (float, optional): The scale "b" of the Laplace distribution.
+              Default:``1.0``.
+            key (array, optional): A PRNG key. Default: ``None``.
+
+        Returns:
+            array: The output array of random values.
+      )pbdoc");
+  m.def(
+      "permutation",
+      [](const std::variant<nb::int_, mx::array>& x,
+         int axis,
+         const std::optional<mx::array>& key_,
+         mx::StreamOrDevice s) {
+        auto key = key_ ? key_.value() : default_key().next();
+        if (auto pv = std::get_if<nb::int_>(&x); pv) {
+          return mx::random::permutation(nb::cast<int>(*pv), key, s);
+        } else {
+          return mx::random::permutation(std::get<mx::array>(x), axis, key, s);
+        }
+      },
+      "x"_a,
+      "axis"_a = 0,
+      "key"_a = nb::none(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def permutation(x: int | array, axis: int = 0, key: array | None = None, stream: StreamOrDevice = None) -> array"),
+      R"pbdoc(
+        Generate a random permutation or permute the entries of an array.
+
+        Args:
+            x (int or array, optional): If an integer is provided a random
+              permtuation of ``mx.arange(x)`` is returned. Otherwise the entries
+              of ``x`` along the given axis are randomly permuted.
+            axis (int, optional): The axis to permute along. Default: ``0``.
+            key (array, optional): A PRNG key. Default: ``None``.
+
+        Returns:
+            array:
+              The generated random permutation or randomly permuted input array.
+      )pbdoc");
+
+  // Ensure the main thread cleanup will happen before the interpreter goes
+  // away. As a result if the other threads join the main thread we should have
+  // a clean tear-down.
   auto atexit = nb::module_::import_("atexit");
-  atexit.attr("register")(nb::cpp_function([]() { default_key().release(); }));
+  atexit.attr("register")(nb::cpp_function([]() { default_key().reset(); }));
 }

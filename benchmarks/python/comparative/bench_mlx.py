@@ -38,10 +38,10 @@ def bench(f, *args):
     for i in range(10):
         f(*args)
 
-    s = time.time()
+    s = time.perf_counter()
     for i in range(100):
         f(*args)
-    e = time.time()
+    e = time.perf_counter()
     return e - s
 
 
@@ -142,6 +142,13 @@ def reduction(op, axis, x):
     for i in range(100):
         ys.append(getattr(mx, op)(x, axis=axis))
     mx.eval(ys)
+
+
+def sum_and_add(axis, x, y):
+    z = x.sum(axis=axis, keepdims=True)
+    for i in range(50):
+        z = (z + y).sum(axis=axis, keepdims=True)
+    mx.eval(z)
 
 
 def softmax(axis, x):
@@ -504,6 +511,9 @@ if __name__ == "__main__":
 
     elif args.benchmark == "selu":
         print(bench(selu, x))
+
+    elif args.benchmark == "sum_and_add":
+        print(bench(sum_and_add, axis, *xs))
 
     else:
         raise ValueError("Unknown benchmark")

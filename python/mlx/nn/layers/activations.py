@@ -36,6 +36,24 @@ def relu(x):
 
 
 @partial(mx.compile, shapeless=True)
+def relu2(x):
+    r"""Applies the ReLU² activation function.
+
+    Applies :math:`\max(0, x)^2` element wise.
+    """
+    return mx.square(mx.maximum(x, 0))
+
+
+@partial(mx.compile, shapeless=True)
+def relu6(x):
+    r"""Applies the Rectified Linear Unit 6.
+
+    Applies :math:`\min(\max(x, 0), 6)` element wise.
+    """
+    return mx.minimum(mx.maximum(x, 0), 6.0)
+
+
+@partial(mx.compile, shapeless=True)
 def leaky_relu(x, negative_slope=0.01):
     r"""Applies the Leaky Rectified Linear Unit.
 
@@ -48,8 +66,12 @@ def leaky_relu(x, negative_slope=0.01):
 def log_softmax(x, axis=-1):
     r"""Applies the Log Softmax function.
 
-    Applies :math:`x + \log \sum_i e^{x_i}` element wise.
+    Applies :math:`x - \log \sum_i e^{x_i}` element wise.
     """
+    # Shift by the max first. Subtracting the logsumexp of x directly loses the
+    # normalizer, since adding it to a large max rounds away before the
+    # subtraction happens.
+    x = x - mx.stop_gradient(mx.max(x, axis=axis, keepdims=True))
     return x - mx.logsumexp(x, axis=axis, keepdims=True)
 
 
@@ -60,15 +82,6 @@ def elu(x, alpha=1.0):
     Simply ``mx.where(x > 0, x, alpha * (mx.exp(x) - 1))``.
     """
     return mx.where(x > 0, x, alpha * (mx.exp(x) - 1))
-
-
-@partial(mx.compile, shapeless=True)
-def relu6(x):
-    r"""Applies the Rectified Linear Unit 6.
-
-    Applies :math:`\min(\max(x, 0), 6)` element wise.
-    """
-    return mx.minimum(mx.maximum(x, 0), 6.0)
 
 
 @partial(mx.compile, shapeless=True)
@@ -167,7 +180,7 @@ def gelu_approx(x):
 
     .. math::
 
-        x = 0.5 * x * \left(1 + \text{Tanh}\left((\sqrt{2 / \pi} * \left(x + 0.044715 * x^3\right)\right)\right)
+        x = 0.5 * x * \left(1 + \text{Tanh}\left(\sqrt{2 / \pi} * \left(x + 0.044715 * x^3\right)\right)\right)
 
     """
     return 0.5 * x * (1 + mx.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x**3)))
@@ -216,7 +229,8 @@ def step(x: mx.array, threshold: float = 0.0):
     r"""Applies the Step Activation Function.
 
     This function implements a binary step activation, where the output is set
-    to 1 if the input is greater than a specified threshold, and 0 otherwise.
+    to 1 if the input is greater than or equal to a specified threshold, and 0
+    otherwise.
 
     .. math::
         \text{step}(x) = \begin{cases}
@@ -225,10 +239,10 @@ def step(x: mx.array, threshold: float = 0.0):
         \end{cases}
 
     Args:
-        threshold: The value to threshold at.
+        threshold: The value to threshold at. Default: ``0.0``.
     """
 
-    return mx.where(x > threshold, 1, 0)
+    return mx.where(x >= threshold, 1, 0)
 
 
 @partial(mx.compile, shapeless=True)
@@ -284,6 +298,38 @@ def hardswish(x):
     """
     max_x_3 = mx.maximum(x + 3, 0)
     return x * mx.minimum(max_x_3, 6) / 6
+
+
+@partial(mx.compile, shapeless=True)
+def hard_tanh(x, min_val=-1.0, max_val=1.0):
+    r"""Applies the HardTanh function.
+
+    Applies :math:`\max(\min(x, \mathrm{max\_val}), \mathrm{min\_val})` element-wise.
+    """
+    return mx.minimum(mx.maximum(x, min_val), max_val)
+
+
+@partial(mx.compile, shapeless=True)
+def hard_shrink(x, lambd=0.5):
+    r"""Applies the HardShrink activation function.
+
+    .. math::
+        \text{hardshrink}(x) = \begin{cases}
+        x & \text{if } x > \lambda \\
+        x & \text{if } x < -\lambda \\
+        0 & \text{otherwise}
+        \end{cases}
+    """
+    return mx.where(mx.abs(x) > lambd, x, 0)
+
+
+@partial(mx.compile, shapeless=True)
+def softmin(x, axis=-1):
+    r"""Applies the Softmin function.
+
+    Applies :math:`\frac{e^{-x_i}}{\sum_j e^{-x_j}}` element-wise.
+    """
+    return mx.softmax(-x, axis=axis)
 
 
 def tanh(x):
@@ -345,6 +391,22 @@ class ReLU(Module):
     """
 
 
+@_make_activation_module(relu2)
+class ReLU2(Module):
+    r"""Applies the ReLU² activation function.
+
+    See :func:`relu2` for the functional equivalent.
+    """
+
+
+@_make_activation_module(relu6)
+class ReLU6(Module):
+    r"""Applies the Rectified Linear Unit 6.
+
+    See :func:`relu6` for the functional equivalent.
+    """
+
+
 class LeakyReLU(Module):
     r"""Applies the Leaky Rectified Linear Unit.
 
@@ -378,14 +440,6 @@ class ELU(Module):
 
     def __call__(self, x):
         return elu(x, self._alpha)
-
-
-@_make_activation_module(relu6)
-class ReLU6(Module):
-    r"""Applies the Rectified Linear Unit 6.
-
-    See :func:`relu6` for the functional equivalent.
-    """
 
 
 @_make_activation_module(softmax)
@@ -503,13 +557,18 @@ class GELU(Module):
     However, if ``approx`` is set to 'precise' or 'fast' it applies
 
     .. math::
-        \textrm{GELUApprox}(x) &= 0.5 * x * \left(1 + \text{Tanh}\left((\sqrt{2 / \pi} * \left(x + 0.044715 * x^3\right)\right)\right) \\
-        \textrm{GELUFast}(x) &= x * \sigma\left(1.773 * x\right)
+        \textrm{GELUApprox}(x) &= 0.5 * x * \left(1 + \text{Tanh}\left(\sqrt{2 / \pi} * \left(x + 0.044715 * x^3\right)\right)\right) \\
+        \textrm{GELUFast}(x) &= x * \sigma\left(1.702 * x\right)
 
     respectively.
 
+    .. note::
+       For compatibility with the PyTorch API, 'tanh' can be used as an alias
+       for 'precise'.
+
     See :func:`gelu`, :func:`gelu_approx` and :func:`gelu_fast_approx` for the
     functional equivalents and information regarding error bounds.
+
 
     Args:
         approx ('none' | 'precise' | 'fast'): Which approximation to gelu to use if any.
@@ -517,20 +576,19 @@ class GELU(Module):
 
     def __init__(self, approx="none"):
         super().__init__()
-
-        if approx == "none":
-            self._act = gelu
-        elif approx == "precise":
-            self._act = gelu_approx
-        elif approx == "fast":
-            self._act = gelu_fast_approx
-        else:
+        self._approx = approx
+        allowed = ["none", "precise", "tanh", "fast"]
+        if approx not in allowed:
             raise ValueError(
-                f"The approximation should be in ['none', 'precise', 'fast'] but '{approx}' was given"
+                f"The approximation should be in {allowed} but '{approx}' was given"
             )
 
     def __call__(self, x):
-        return self._act(x)
+        if self._approx == "none":
+            return gelu(x)
+        elif self._approx in ["precise", "tanh"]:
+            return gelu_approx(x)
+        return gelu_fast_approx(x)
 
 
 @_make_activation_module(tanh)
@@ -553,7 +611,8 @@ class Step(Module):
     r"""Applies the Step Activation Function.
 
     This function implements a binary step activation, where the output is set
-    to 1 if the input is greater than a specified threshold, and 0 otherwise.
+    to 1 if the input is greater than or equal to a specified threshold, and 0
+    otherwise.
 
     .. math::
         \text{step}(x) = \begin{cases}
@@ -562,7 +621,7 @@ class Step(Module):
         \end{cases}
 
     Args:
-        threshold: The value to threshold at.
+        threshold: The value to threshold at. Default: ``0.0``.
     """
 
     def __init__(self, threshold: float = 0.0):
@@ -578,4 +637,37 @@ class SELU(Module):
     r"""Applies the Scaled Exponential Linear Unit.
 
     See :func:`selu` for the functional equivalent.
+    """
+
+
+@_make_activation_module(hard_tanh)
+class HardTanh(Module):
+    r"""Applies the HardTanh function.
+
+    See :func:`hard_tanh` for the functional equivalent.
+    """
+
+
+class HardShrink(Module):
+    r"""Applies the HardShrink function.
+
+    See :func:`hard_shrink` for the functional equivalent.
+
+    Args:
+        lambd: the :math:`\lambda` value for Hardshrink. Default: ``0.5``
+    """
+
+    def __init__(self, lambd=0.5):
+        super().__init__()
+        self.lambd = lambd
+
+    def __call__(self, x):
+        return hard_shrink(x, self.lambd)
+
+
+@_make_activation_module(softmin)
+class Softmin(Module):
+    r"""Applies the Softmin function.
+
+    See :func:`softmin` for the functional equivalent.
     """

@@ -1,6 +1,8 @@
 // Copyright © 2023 Apple Inc.
-
+#include <cassert>
 #include <climits>
+#include <stdexcept>
+#include <vector>
 
 #include "doctest/doctest.h"
 
@@ -13,10 +15,10 @@ TEST_CASE("test array basics") {
   array x(1.0);
   CHECK_EQ(x.size(), 1);
   CHECK_EQ(x.ndim(), 0);
-  CHECK_EQ(x.shape(), std::vector<int>{});
+  CHECK_EQ(x.shape(), Shape{});
   CHECK_THROWS_AS(x.shape(0), std::out_of_range);
   CHECK_THROWS_AS(x.shape(-1), std::out_of_range);
-  CHECK_EQ(x.strides(), std::vector<size_t>{});
+  CHECK_EQ(x.strides(), Strides{});
   CHECK_EQ(x.itemsize(), sizeof(float));
   CHECK_EQ(x.nbytes(), sizeof(float));
   CHECK_EQ(x.dtype(), float32);
@@ -39,12 +41,12 @@ TEST_CASE("test array basics") {
   CHECK_EQ(x.dtype(), float32);
   CHECK_EQ(x.size(), 1);
   CHECK_EQ(x.ndim(), 1);
-  CHECK_EQ(x.shape(), std::vector<int>{1});
+  CHECK_EQ(x.shape(), Shape{1});
   CHECK_EQ(x.shape(0), 1);
   CHECK_EQ(x.shape(-1), 1);
   CHECK_THROWS_AS(x.shape(1), std::out_of_range);
   CHECK_THROWS_AS(x.shape(-2), std::out_of_range);
-  CHECK_EQ(x.strides(), std::vector<size_t>{1});
+  CHECK_EQ(x.strides(), Strides{1});
   CHECK_EQ(x.item<float>(), 1.0);
 
   // Check empty array
@@ -57,7 +59,7 @@ TEST_CASE("test array basics") {
 
   x = array({1.0, 1.0});
   CHECK_EQ(x.size(), 2);
-  CHECK_EQ(x.shape(), std::vector<int>{2});
+  CHECK_EQ(x.shape(), Shape{2});
   CHECK_EQ(x.itemsize(), sizeof(float));
   CHECK_EQ(x.nbytes(), x.itemsize() * x.size());
 
@@ -65,9 +67,9 @@ TEST_CASE("test array basics") {
   CHECK_THROWS_AS(x.item<float>(), std::invalid_argument);
 
   x = array({1.0, 1.0, 1.0}, {1, 3});
-  CHECK(x.size() == 3);
-  CHECK(x.shape() == std::vector<int>{1, 3});
-  CHECK(x.strides() == std::vector<size_t>{3, 1});
+  CHECK_EQ(x.size(), 3);
+  CHECK_EQ(x.shape(), Shape{1, 3});
+  CHECK_EQ(x.strides(), Strides{3, 1});
 
   // Test wrong size/shapes throw:
   CHECK_THROWS_AS(array({1.0, 1.0, 1.0}, {4}), std::invalid_argument);
@@ -103,6 +105,16 @@ TEST_CASE("test array basics") {
     CHECK_EQ(x.dtype(), bool_);
     CHECK(array_equal(x, array({false, true, false, true})).item<bool>());
   }
+
+  // Regression: vector<bool>::reference to fp16/bf16 stored raw bits
+  {
+    std::vector<bool> data = {true, false, true};
+    auto bf = array(data.begin(), {3}, bfloat16);
+    CHECK(array_equal(bf, array({1.0f, 0.0f, 1.0f}, bfloat16)).item<bool>());
+
+    auto fp = array(data.begin(), {3}, float16);
+    CHECK(array_equal(fp, array({1.0f, 0.0f, 1.0f}, float16)).item<bool>());
+  }
 }
 
 TEST_CASE("test array types") {
@@ -129,37 +141,61 @@ TEST_CASE("test array types") {
   }
 
   // uint8
-  { basic_dtype_test(uint8_t, uint8); }
+  {
+    basic_dtype_test(uint8_t, uint8);
+  }
 
   // uint16
-  { basic_dtype_test(uint16_t, uint16); }
+  {
+    basic_dtype_test(uint16_t, uint16);
+  }
 
   // uint32
-  { basic_dtype_test(uint32_t, uint32); }
+  {
+    basic_dtype_test(uint32_t, uint32);
+  }
 
   // uint64
-  { basic_dtype_test(uint64_t, uint64); }
+  {
+    basic_dtype_test(uint64_t, uint64);
+  }
 
   // int8
-  { basic_dtype_test(int8_t, int8); }
+  {
+    basic_dtype_test(int8_t, int8);
+  }
 
   // int16
-  { basic_dtype_test(int16_t, int16); }
+  {
+    basic_dtype_test(int16_t, int16);
+  }
 
   // int32
-  { basic_dtype_test(int32_t, int32); }
+  {
+    basic_dtype_test(int32_t, int32);
+  }
 
   // int64
-  { basic_dtype_test(int64_t, int64); }
+  {
+    basic_dtype_test(int64_t, int64);
+  }
 
   // float16
-  { basic_dtype_test(float16_t, float16); }
+  {
+    basic_dtype_test(float16_t, float16);
+  }
 
   // float32
-  { basic_dtype_test(float, float32); }
+  {
+    basic_dtype_test(float, float32);
+  }
 
   // bfloat16
-  { basic_dtype_test(bfloat16_t, bfloat16); }
+  {
+    basic_dtype_test(bfloat16_t, bfloat16);
+  }
+
+#undef basic_dtype_test
 
   // uint32
   {
@@ -233,31 +269,6 @@ TEST_CASE("test array types") {
     CHECK_EQ(x.dtype(), complex64);
     CHECK_EQ(x.item<complex64_t>(), v);
   }
-
-#undef basic_dtype_test
-
-#define basic_dtype_str_test(s, dtype)         \
-  CHECK_EQ(s, dtype_to_array_protocol(dtype)); \
-  CHECK_EQ(dtype_from_array_protocol(s), dtype);
-
-  // To and from str
-  {
-    basic_dtype_str_test("|b1", bool_);
-    basic_dtype_str_test("|u1", uint8);
-    basic_dtype_str_test("<u2", uint16);
-    basic_dtype_str_test("<u4", uint32);
-    basic_dtype_str_test("<u8", uint64);
-    basic_dtype_str_test("|i1", int8);
-    basic_dtype_str_test("<i2", int16);
-    basic_dtype_str_test("<i4", int32);
-    basic_dtype_str_test("<i8", int64);
-    basic_dtype_str_test("<f2", float16);
-    basic_dtype_str_test("<f4", float32);
-    basic_dtype_str_test("<V2", bfloat16);
-    basic_dtype_str_test("<c8", complex64);
-  }
-
-#undef basic_dtype_str_test
 }
 
 TEST_CASE("test array metadata") {
@@ -473,7 +484,7 @@ TEST_CASE("test array metadata") {
   x = array({1.0f, 2.0f, 3.0f}, {1, 3});
   y = slice(x, {0, 0}, {1, 2}, {2, 3});
   eval(y);
-  CHECK_EQ(y.shape(), std::vector<int>{1, 1});
+  CHECK_EQ(y.shape(), Shape{1, 1});
   CHECK_EQ(y.data_size(), 1);
   CHECK_EQ(y.flags().contiguous, true);
   CHECK_EQ(y.flags().row_contiguous, true);
@@ -482,7 +493,7 @@ TEST_CASE("test array metadata") {
   x = array({0.0f, 1.0f, 2.0f, 3.0f}, {1, 4});
   y = slice(x, {0, 0}, {1, 4}, {1, 2});
   eval(y);
-  CHECK_EQ(y.shape(), std::vector<int>{1, 2});
+  CHECK_EQ(y.shape(), Shape{1, 2});
   CHECK_EQ(y.flags().contiguous, false);
   CHECK_EQ(y.flags().row_contiguous, false);
   CHECK_EQ(y.flags().col_contiguous, false);
@@ -490,7 +501,7 @@ TEST_CASE("test array metadata") {
   x = broadcast_to(array(1.0f), {4, 10});
   y = slice(x, {0, 0}, {4, 10}, {2, 2});
   eval(y);
-  CHECK_EQ(y.shape(), std::vector<int>{2, 5});
+  CHECK_EQ(y.shape(), Shape{2, 5});
   CHECK_EQ(y.data_size(), 1);
   CHECK_EQ(y.flags().contiguous, true);
   CHECK_EQ(y.flags().row_contiguous, false);
@@ -567,8 +578,8 @@ TEST_CASE("test array iteration") {
 }
 
 TEST_CASE("test array shared buffer") {
-  std::vector<int> shape = {2, 2};
-  int n_elem = shape[0] * shape[1];
+  Shape shape = {2, 2};
+  auto n_elem = shape[0] * shape[1];
 
   allocator::Buffer buf_b = allocator::malloc(n_elem * sizeof(float));
   void* buf_b_ptr = buf_b.raw_ptr();
@@ -608,4 +619,74 @@ TEST_CASE("test make empty array") {
   a = array({}, bool_);
   CHECK_EQ(a.size(), 0);
   CHECK_EQ(a.dtype(), bool_);
+}
+
+TEST_CASE("test make array from user buffer") {
+  int size = 4096;
+  std::vector<int> buffer(size, 0);
+
+  int count = 0;
+  auto deleter = [&count, data = buffer.data()](void* ptr) {
+    // make sure pointer is correct
+    if (ptr == data) {
+      count++;
+    }
+  };
+
+  {
+    auto a = array(buffer.data(), Shape{size}, int32, deleter);
+    if (metal::is_available()) {
+      CHECK_EQ(buffer.data(), a.data<int>());
+    }
+    auto b = a + array(1);
+    eval(b);
+    auto expected = ones({4096});
+    CHECK(array_equal(b, expected).item<bool>());
+  }
+  // deleter should always get called
+  CHECK_EQ(count, 1);
+}
+
+TEST_CASE("test negative indexing for shape/strides") {
+  // 2D array: shape = {2, 3}
+  std::vector<float> data(6, 1.0f);
+  array a(data.begin(), Shape{2, 3});
+
+  // Valid negative indexing
+  CHECK_EQ(a.shape(-1), a.shape(1));
+  CHECK_EQ(a.shape(-2), a.shape(0));
+  CHECK_EQ(a.shape(-1), 3);
+  CHECK_EQ(a.shape(-2), 2);
+
+  CHECK_EQ(a.strides(-1), a.strides(1));
+  CHECK_EQ(a.strides(-2), a.strides(0));
+  CHECK_EQ(a.strides(-1), 1);
+  CHECK_EQ(a.strides(-2), 3);
+
+  // Invalid: too negative
+  CHECK_THROWS_AS(a.shape(-3), std::out_of_range);
+  CHECK_THROWS_AS(a.strides(-3), std::out_of_range);
+
+  // Invalid: too positive
+  CHECK_THROWS_AS(a.shape(2), std::out_of_range);
+  CHECK_THROWS_AS(a.strides(2), std::out_of_range);
+}
+
+// https://github.com/ml-explore/mlx/pull/1590
+TEST_CASE("test siblings circular references without eval") {
+  std::weak_ptr<array::Data> tracker;
+  auto fun = [&]() {
+    array key({1, 2});
+    auto splits = split(key, 2);
+    {
+      // Set fake data as a tracker for ArrayDesc's lifetime.
+      splits[0].set_data(allocator::malloc(0));
+      tracker = splits[0].data_shared_ptr();
+    }
+    auto a = reshape(splits[0], {});
+    auto b = reshape(splits[1], {});
+    return b;
+  };
+  fun();
+  CHECK(tracker.expired());
 }

@@ -1,6 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include "python/src/trees.h"
+#include "python/src/random.h"
 
 template <typename T, typename U, typename V>
 void validate_subtrees(const std::vector<nb::object>& subtrees) {
@@ -41,6 +42,7 @@ nb::object tree_map(
       int len = nb::cast<nb::tuple>(subtrees[0]).size();
       nb::list l;
       validate_subtrees<nb::tuple, nb::list, nb::dict>(subtrees);
+      auto type = subtrees[0].type();
       for (int i = 0; i < len; ++i) {
         for (int j = 0; j < subtrees.size(); ++j) {
           if (nb::isinstance<nb::tuple>(subtrees[j])) {
@@ -51,7 +53,10 @@ nb::object tree_map(
         }
         l.append(recurse(items));
       }
-      return nb::cast<nb::object>(nb::tuple(l));
+      if (PyTuple_CheckExact(subtrees[0].ptr())) {
+        return nb::cast<nb::object>(nb::tuple(l));
+      }
+      return nb::hasattr(type, "_fields") ? type(*l) : type(l);
     } else if (nb::isinstance<nb::dict>(subtrees[0])) {
       std::vector<nb::object> items(subtrees.size());
       validate_subtrees<nb::dict, nb::list, nb::tuple>(subtrees);
@@ -146,10 +151,14 @@ void tree_visit(
   return recurse(trees);
 }
 
-void tree_visit(nb::object tree, std::function<void(nb::handle)> visitor) {
+void tree_visit(nb::handle tree, std::function<void(nb::handle)> visitor) {
   std::function<void(nb::handle)> recurse;
+  auto random_state = random_state_sentinel();
   recurse = [&](nb::handle subtree) {
-    if (nb::isinstance<nb::list>(subtree) ||
+    if (subtree.is(random_state)) {
+      visitor(nb::cast(random_state_key()));
+    } else if (
+        nb::isinstance<nb::list>(subtree) ||
         nb::isinstance<nb::tuple>(subtree)) {
       for (auto item : subtree) {
         recurse(item);
@@ -170,25 +179,36 @@ void tree_visit_update(
     nb::object tree,
     std::function<nb::object(nb::handle)> visitor) {
   std::function<nb::object(nb::handle)> recurse;
+  auto random_state = random_state_sentinel();
   recurse = [&](nb::handle subtree) {
-    if (nb::isinstance<nb::list>(subtree)) {
+    if (subtree.is(random_state)) {
+      // Read/write the calling thread's key; keep the sentinel in the tree.
+      set_random_state_key(
+          nb::cast<mx::array>(visitor(nb::cast(random_state_key()))));
+      return nb::cast<nb::object>(subtree);
+    } else if (nb::isinstance<nb::list>(subtree)) {
       auto l = nb::cast<nb::list>(subtree);
       for (int i = 0; i < l.size(); ++i) {
         l[i] = recurse(l[i]);
       }
       return nb::cast<nb::object>(l);
     } else if (nb::isinstance<nb::tuple>(subtree)) {
-      for (auto item : subtree) {
-        recurse(item);
+      auto type = subtree.type();
+      nb::list l(subtree);
+      for (int i = 0; i < l.size(); ++i) {
+        l[i] = recurse(l[i]);
       }
-      return nb::cast<nb::object>(subtree);
+      if (PyTuple_CheckExact(subtree.ptr())) {
+        return nb::cast<nb::object>(nb::tuple(l));
+      }
+      return nb::hasattr(type, "_fields") ? type(*l) : type(l);
     } else if (nb::isinstance<nb::dict>(subtree)) {
       auto d = nb::cast<nb::dict>(subtree);
       for (auto item : d) {
         d[item.first] = recurse(item.second);
       }
       return nb::cast<nb::object>(d);
-    } else if (nb::isinstance<array>(subtree)) {
+    } else if (nb::isinstance<mx::array>(subtree)) {
       return visitor(subtree);
     } else {
       return nb::cast<nb::object>(subtree);
@@ -200,7 +220,7 @@ void tree_visit_update(
 // Fill a pytree (recursive dict or list of dict or list)
 // in place with the given arrays
 // Non dict or list nodes are ignored
-void tree_fill(nb::object& tree, const std::vector<array>& values) {
+void tree_fill(nb::object& tree, const std::vector<mx::array>& values) {
   size_t index = 0;
   tree_visit_update(
       tree, [&](nb::handle node) { return nb::cast(values[index++]); });
@@ -209,14 +229,14 @@ void tree_fill(nb::object& tree, const std::vector<array>& values) {
 // Replace all the arrays from the src values with the dst values in the tree
 void tree_replace(
     nb::object& tree,
-    const std::vector<array>& src,
-    const std::vector<array>& dst) {
-  std::unordered_map<uintptr_t, array> src_to_dst;
+    const std::vector<mx::array>& src,
+    const std::vector<mx::array>& dst) {
+  std::unordered_map<uintptr_t, mx::array> src_to_dst;
   for (int i = 0; i < src.size(); ++i) {
     src_to_dst.insert({src[i].id(), dst[i]});
   }
   tree_visit_update(tree, [&](nb::handle node) {
-    auto arr = nb::cast<array>(node);
+    auto arr = nb::cast<mx::array>(node);
     if (auto it = src_to_dst.find(arr.id()); it != src_to_dst.end()) {
       return nb::cast(it->second);
     }
@@ -224,12 +244,12 @@ void tree_replace(
   });
 }
 
-std::vector<array> tree_flatten(nb::object tree, bool strict /* = true */) {
-  std::vector<array> flat_tree;
+std::vector<mx::array> tree_flatten(nb::handle tree, bool strict /* = true */) {
+  std::vector<mx::array> flat_tree;
 
   tree_visit(tree, [&](nb::handle obj) {
-    if (nb::isinstance<array>(obj)) {
-      flat_tree.push_back(nb::cast<array>(obj));
+    if (nb::isinstance<mx::array>(obj)) {
+      flat_tree.push_back(nb::cast<mx::array>(obj));
     } else if (strict) {
       throw std::invalid_argument(
           "[tree_flatten] The argument should contain only arrays");
@@ -241,10 +261,10 @@ std::vector<array> tree_flatten(nb::object tree, bool strict /* = true */) {
 
 nb::object tree_unflatten(
     nb::object tree,
-    const std::vector<array>& values,
+    const std::vector<mx::array>& values,
     int index /* = 0 */) {
   return tree_map(tree, [&](nb::handle obj) {
-    if (nb::isinstance<array>(obj)) {
+    if (nb::isinstance<mx::array>(obj)) {
       return nb::cast(values[index++]);
     } else {
       return nb::cast<nb::object>(obj);
@@ -253,28 +273,26 @@ nb::object tree_unflatten(
 }
 
 nb::object structure_sentinel() {
-  static nb::object sentinel;
-
-  if (sentinel.ptr() == nullptr) {
-    sentinel = nb::capsule(&sentinel);
-    // probably not needed but this should make certain that we won't ever
-    // delete the sentinel
+  static nb::object sentinel = []() {
+    PyObject* raw_obj = PyObject_New(PyObject, &PyBaseObject_Type);
+    nb::object sentinel = nb::steal(raw_obj);
     sentinel.inc_ref();
-  }
+    return sentinel;
+  }();
 
   return sentinel;
 }
 
-std::pair<std::vector<array>, nb::object> tree_flatten_with_structure(
+std::pair<std::vector<mx::array>, nb::object> tree_flatten_with_structure(
     nb::object tree,
     bool strict /* = true */) {
   auto sentinel = structure_sentinel();
-  std::vector<array> flat_tree;
+  std::vector<mx::array> flat_tree;
   auto structure = tree_map(
       tree,
       [&flat_tree, sentinel = std::move(sentinel), strict](nb::handle obj) {
-        if (nb::isinstance<array>(obj)) {
-          flat_tree.push_back(nb::cast<array>(obj));
+        if (nb::isinstance<mx::array>(obj)) {
+          flat_tree.push_back(nb::cast<mx::array>(obj));
           return sentinel;
         } else if (!strict) {
           return nb::cast<nb::object>(obj);
@@ -289,7 +307,7 @@ std::pair<std::vector<array>, nb::object> tree_flatten_with_structure(
 
 nb::object tree_unflatten_from_structure(
     nb::object structure,
-    const std::vector<array>& values,
+    const std::vector<mx::array>& values,
     int index /* = 0 */) {
   auto sentinel = structure_sentinel();
   return tree_map(structure, [&](nb::handle obj) {

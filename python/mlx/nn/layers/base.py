@@ -1,46 +1,12 @@
 # Copyright © 2023 Apple Inc.
 
+from __future__ import annotations
+
 import textwrap
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_unflatten
-
-
-def _unwrap(model, value_key, value, filter_fn, map_fn, is_leaf_fn):
-    if is_leaf_fn(model, value_key, value):
-        return map_fn(value)
-
-    elif isinstance(value, Module):
-        return {
-            k: _unwrap(value, k, v, filter_fn, map_fn, is_leaf_fn)
-            for k, v in value.items()
-            if filter_fn(value, k, v)
-        }
-
-    elif isinstance(value, dict):
-        nd = {}
-        for k, v in value.items():
-            tk = f"{value_key}.{k}"
-            nd[k] = (
-                _unwrap(model, tk, v, filter_fn, map_fn, is_leaf_fn)
-                if filter_fn(model, tk, v)
-                else {}
-            )
-        return nd
-
-    elif isinstance(value, list):
-        nl = []
-        for i, vi in enumerate(value):
-            tk = f"{value_key}.{i}"
-            nl.append(
-                _unwrap(model, tk, vi, filter_fn, map_fn, is_leaf_fn)
-                if filter_fn(model, tk, vi)
-                else {}
-            )
-        return nl
-
-    raise RuntimeError("Unexpected leaf found while traversing the module")
 
 
 class Module(dict):
@@ -115,7 +81,7 @@ class Module(dict):
         """
         return self
 
-    def _extra_repr(self):
+    def _extra_repr(self) -> str:
         return ""
 
     def __repr__(self):
@@ -146,19 +112,26 @@ class Module(dict):
             self[key] = val
         else:
             super(Module, self).__setattr__(key, val)
+            self.pop(key, None)
+
+    def __delattr__(self, name):
+        if (val := self.get(name, None)) is not None:
+            del self[name]
+        else:
+            super().__delattr__(name)
 
     def load_weights(
         self,
         file_or_weights: Union[str, List[Tuple[str, mx.array]]],
         strict: bool = True,
-    ) -> "Module":
+    ) -> Module:
         """
         Update the model's weights from a ``.npz``, a ``.safetensors`` file, or a list.
 
         Args:
-            file_or_weights (str or list(tuple(str, mx.array))): The path to
-                the weights ``.npz`` file (``.npz`` or ``.safetensors``) or a list of pairs of parameter names
-                and arrays.
+            file_or_weights (str or list(tuple(str, array))): The path to
+                the weights ``.npz`` file (``.npz`` or ``.safetensors``) or a list
+                of pairs of parameter names and arrays.
             strict (bool, optional): If ``True`` then checks that the provided
               weights exactly match the parameters of the model. Otherwise,
               only the weights actually contained in the model are loaded and
@@ -205,13 +178,17 @@ class Module(dict):
 
         if strict:
             new_weights = dict(weights)
-            curr_weights = dict(tree_flatten(self.parameters()))
+            curr_weights = tree_flatten(self.parameters(), destination={})
             if extras := (new_weights.keys() - curr_weights.keys()):
-                extras = " ".join(extras)
-                raise ValueError(f"Received parameters not in model: {extras}.")
+                num_extra = len(extras)
+                extras = ",\n".join(sorted(extras))
+                raise ValueError(
+                    f"Received {num_extra} parameters not in model: \n{extras}."
+                )
             if missing := (curr_weights.keys() - new_weights.keys()):
-                missing = " ".join(missing)
-                raise ValueError(f"Missing parameters: {missing}.")
+                num_missing = len(missing)
+                missing = ",\n".join(sorted(missing))
+                raise ValueError(f"Missing {num_missing} parameters: \n{missing}.")
             for k, v in curr_weights.items():
                 v_new = new_weights[k]
                 if not isinstance(v_new, mx.array):
@@ -222,10 +199,11 @@ class Module(dict):
                 if v_new.shape != v.shape:
                     raise ValueError(
                         f"Expected shape {v.shape} but received "
-                        f" shape {v_new.shape} for parameter {k}"
+                        f"shape {v_new.shape} for parameter {k}"
                     )
 
-        self.update(tree_unflatten(weights))
+        if len(weights) != 0:
+            self.update(tree_unflatten(weights), strict=False)
         return self
 
     def save_weights(self, file: str):
@@ -234,7 +212,7 @@ class Module(dict):
         - ``.npz`` will use :func:`mx.savez`
         - ``.safetensors`` will use :func:`mx.save_safetensors`
         """
-        params_dict = dict(tree_flatten(self.parameters()))
+        params_dict = tree_flatten(self.parameters(), destination={})
 
         if file.endswith(".npz"):
             mx.savez(file, **params_dict)
@@ -242,7 +220,7 @@ class Module(dict):
             mx.save_safetensors(file, params_dict)
         else:
             raise ValueError(
-                "Unsupported file extension. Use '.npz' or '.safetensors'."
+                f"Unsupported file extension for {file}. Use '.npz' or '.safetensors'."
             )
 
     @staticmethod
@@ -266,9 +244,9 @@ class Module(dict):
 
     def filter_and_map(
         self,
-        filter_fn: Callable[["mlx.nn.Module", str, Any], bool],
+        filter_fn: Callable[[Module, str, Any], bool],
         map_fn: Optional[Callable] = None,
-        is_leaf_fn: Optional[Callable[["mlx.nn.Module", str, Any], bool]] = None,
+        is_leaf_fn: Optional[Callable[[Module, str, Any], bool]] = None,
     ):
         """Recursively filter the contents of the module using ``filter_fn``,
         namely only select keys and values where ``filter_fn`` returns true.
@@ -277,13 +255,13 @@ class Module(dict):
         but it can also be used to extract any subset of the module's parameters.
 
         Args:
-            filter_fn (Callable): Given a value, the key in which it is found
-                and the containing module, decide whether to keep the value or
+            filter_fn (Callable): Given the containing module, the key in which
+                it is found and the value, decide whether to keep the value or
                 drop it.
             map_fn (Callable, optional): Optionally transform the value before
                 returning it.
-            is_leaf_fn (Callable, optional): Given a value, the key in which it
-                is found and the containing module decide if it is a leaf.
+            is_leaf_fn (Callable, optional): Given the containing module, the
+                key in which it is found and the value decide if it is a leaf.
 
         Returns:
             A dictionary containing the contents of the module recursively filtered
@@ -323,7 +301,7 @@ class Module(dict):
 
         return self.filter_and_map(self.valid_child_filter, is_leaf_fn=_is_leaf_module)
 
-    def update(self, parameters: dict) -> "Module":
+    def update(self, parameters: dict, strict: bool = True) -> Module:
         """Replace the parameters of this Module with the provided ones in the
         dict of dicts and lists.
 
@@ -337,7 +315,9 @@ class Module(dict):
 
         Args:
             parameters (dict): A complete or partial dictionary of the modules
-                               parameters.
+                parameters.
+            strict (bool): If ``True`` checks that ``parameters`` is a
+                subset of the module's parameters. Default: ``True``.
         Returns:
             The module instance after updating the parameters.
         """
@@ -349,21 +329,36 @@ class Module(dict):
                         current_value = dst[k]
                         new_value = parameters[k]
                         if isinstance(current_value, mx.array):
+                            if strict and not isinstance(new_value, mx.array):
+                                raise ValueError(
+                                    f"Received invalid type: {type(new_value).__name__}."
+                                )
                             dst[k] = new_value
-                        elif isinstance(current_value, Module):
-                            current_value.update(new_value)
-                        elif isinstance(current_value, (dict, list)):
+                        else:
                             apply(current_value, new_value)
+                    elif strict:
+                        raise ValueError(f'Module does not have parameter named "{k}".')
             elif isinstance(parameters, list):
                 for i in range(len(parameters)):
+                    if i >= len(dst):
+                        if strict:
+                            raise ValueError(
+                                f"List index {i} is out of bounds for "
+                                f"destination of length {len(dst)}."
+                            )
+                        continue
                     current_value = dst[i]
                     new_value = parameters[i]
                     if isinstance(current_value, mx.array):
+                        if strict and not isinstance(new_value, mx.array):
+                            raise ValueError(
+                                f"Received invalid type: {type(new_value).__name__}."
+                            )
                         dst[i] = new_value
-                    elif isinstance(current_value, Module):
-                        current_value.update(new_value)
-                    elif isinstance(current_value, (dict, list)):
+                    else:
                         apply(current_value, new_value)
+            elif strict:
+                raise ValueError(f"Received invalid type: {type(parameters).__name__}.")
 
         apply(self, parameters)
         return self
@@ -371,8 +366,8 @@ class Module(dict):
     def apply(
         self,
         map_fn: Callable[[mx.array], mx.array],
-        filter_fn: Optional[Callable[["mlx.nn.Module", str, Any], bool]] = None,
-    ) -> "Module":
+        filter_fn: Optional[Callable[[Module, str, Any], bool]] = None,
+    ) -> Module:
         """Map all the parameters using the provided ``map_fn`` and immediately
         update the module with the mapped parameters.
 
@@ -391,7 +386,7 @@ class Module(dict):
         self.update(self.filter_and_map(filter_fn, map_fn))
         return self
 
-    def update_modules(self, modules: dict) -> "Module":
+    def update_modules(self, modules: dict, strict: bool = True) -> Module:
         """Replace the child modules of this :class:`Module` instance with the
         provided ones in the dict of dicts and lists.
 
@@ -400,46 +395,29 @@ class Module(dict):
         programmatically swapping layers.
 
         The passed in parameters dictionary need not be a full dictionary
-        similar to :meth:`parameters`. Only the provided locations will be
+        similar to :meth:`modules`. Only the provided locations will be
         updated.
 
         Args:
-            modules (dict): A complete or partial dictionary of the modules
+            modules (dict): A complete or partial dictionary of the module's
                 submodules.
+            strict (bool): If ``True`` checks that ``modules`` is a
+                subset of the child modules of this instance. Default: ``True``.
         Returns:
             The module instance after updating the submodules.
         """
-
-        def apply(dst, modules):
-            if isinstance(modules, dict):
-                for k in modules:
-                    if k in dst:
-                        current_value = dst[k]
-                        new_value = modules[k]
-                        if self.is_module(current_value) and self.is_module(new_value):
-                            dst[k] = new_value
-                        elif isinstance(current_value, (dict, list)):
-                            apply(current_value, new_value)
-            elif isinstance(modules, list):
-                for i in range(len(dst)):
-                    current_value = dst[i]
-                    new_value = modules[i]
-                    if self.is_module(current_value) and self.is_module(new_value):
-                        dst[i] = new_value
-                    elif isinstance(current_value, (dict, list)):
-                        apply(current_value, new_value)
-
-        apply(self, modules)
+        _update_modules(self, modules, strict)
         return self
 
-    def apply_to_modules(
-        self, apply_fn: Callable[[str, "mlx.nn.Module"], Any]
-    ) -> "Module":
+    def apply_to_modules(self, apply_fn: Callable[[str, Module], Any]) -> Module:
         """Apply a function to all the modules in this instance (including this
         instance).
 
         Args:
-            apply_fn (Callable): The function to apply to the modules.
+            apply_fn (Callable): The function to apply to the modules which
+                takes two parameters. The first parameter is the string path of
+                the module (e.g. ``"model.layers.0.linear"``). The second
+                parameter is the module object.
 
         Returns:
             The module instance after updating submodules.
@@ -483,13 +461,23 @@ class Module(dict):
                     raise KeyError(f"Module doesn't contain member {k}.")
         return keys
 
+    def _validate_keys_recursive(self, keys):
+        # A key such as "bias" is expected to be present somewhere in the model
+        # but not necessarily in every single submodule, so validate against the
+        # whole model rather than each module in isolation.
+        keys = keys if isinstance(keys, list) else [keys]
+        modules = self.modules()
+        for k in keys:
+            if not any(k in m for m in modules):
+                raise KeyError(f"Module doesn't contain member {k}.")
+
     def freeze(
         self,
         *,
         recurse: bool = True,
         keys: Optional[Union[str, List[str]]] = None,
         strict: bool = False,
-    ) -> "Module":
+    ) -> Module:
         """Freeze the Module's parameters or some of them. Freezing a parameter means not
         computing gradients for it.
 
@@ -533,6 +521,9 @@ class Module(dict):
             m._no_grad.update(local_keys)
 
         if recurse:
+            if strict and keys is not None:
+                self._validate_keys_recursive(keys)
+                strict = False
             self.apply_to_modules(_freeze_impl)
         else:
             _freeze_impl("", self)
@@ -544,7 +535,7 @@ class Module(dict):
         recurse: bool = True,
         keys: Optional[Union[str, List[str]]] = None,
         strict: bool = False,
-    ) -> "Module":
+    ) -> Module:
         """Unfreeze the Module's parameters or some of them.
 
         This function is idempotent ie unfreezing a model that is not frozen is
@@ -583,12 +574,18 @@ class Module(dict):
                 m._no_grad.difference_update(local_keys)
 
         if recurse:
+            if strict and keys is not None:
+                self._validate_keys_recursive(keys)
+                strict = False
             self.apply_to_modules(_unfreeze_impl)
         else:
             _unfreeze_impl("", self)
         return self
 
-    def train(self, mode: bool = True) -> "Module":
+    def _set_training_mode(self, mode: bool) -> None:
+        self._training = mode
+
+    def train(self, mode: bool = True) -> Module:
         """Set the model in or out of training mode.
 
         Training mode only applies to certain layers. For example
@@ -602,13 +599,11 @@ class Module(dict):
             The module instance after updating the training mode.
         """
 
-        def _set_train(_, m):
-            m._training = mode
+        self.apply_to_modules(lambda _, m: m._set_training_mode(mode))
 
-        self.apply_to_modules(_set_train)
         return self
 
-    def eval(self) -> "Module":
+    def eval(self) -> Module:
         """Set the model to evaluation mode.
 
         See :func:`train`.
@@ -632,8 +627,79 @@ class Module(dict):
               parameters to the new dtype.
         """
         if predicate is None:
-
-            def predicate(_):
-                return True
+            predicate = lambda _: True
 
         self.apply(lambda x: x.astype(dtype) if predicate(x.dtype) else x)
+
+
+def _update_modules(dst, modules, strict):
+    if isinstance(modules, dict):
+        for k in modules:
+            if k in dst:
+                current_value = dst[k]
+                new_value = modules[k]
+                if Module.is_module(current_value) and Module.is_module(new_value):
+                    dst[k] = new_value
+                elif isinstance(current_value, (dict, list)):
+                    _update_modules(current_value, new_value, strict)
+                elif strict and new_value != {}:
+                    raise ValueError(
+                        f"Received invalid type: {type(new_value).__name__}."
+                    )
+            elif strict:
+                raise ValueError(f'Module does not have sub-module named "{k}".')
+    elif isinstance(modules, list):
+        for i in range(len(modules)):
+            if i >= len(dst):
+                if strict:
+                    raise ValueError(
+                        f"List index {i} is out of bounds for "
+                        f"destination of length {len(dst)}."
+                    )
+                continue
+            current_value = dst[i]
+            new_value = modules[i]
+            if Module.is_module(current_value) and Module.is_module(new_value):
+                dst[i] = new_value
+            elif isinstance(current_value, (dict, list)):
+                _update_modules(current_value, new_value, strict)
+            elif strict and new_value != {}:
+                raise ValueError(f"Received invalid type: {type(new_value).__name__}.")
+    elif strict:
+        raise ValueError(f"Received invalid type: {type(modules).__name__}.")
+
+
+def _unwrap(model, value_key, value, filter_fn, map_fn, is_leaf_fn):
+    if is_leaf_fn(model, value_key, value):
+        return map_fn(value)
+
+    elif isinstance(value, Module):
+        return {
+            k: _unwrap(value, k, v, filter_fn, map_fn, is_leaf_fn)
+            for k, v in value.items()
+            if filter_fn(value, k, v)
+        }
+
+    elif isinstance(value, dict):
+        nd = {}
+        for k, v in value.items():
+            tk = f"{value_key}.{k}"
+            nd[k] = (
+                _unwrap(model, tk, v, filter_fn, map_fn, is_leaf_fn)
+                if filter_fn(model, tk, v)
+                else {}
+            )
+        return nd
+
+    elif isinstance(value, list):
+        nl = []
+        for i, vi in enumerate(value):
+            tk = f"{value_key}.{i}"
+            nl.append(
+                _unwrap(model, tk, vi, filter_fn, map_fn, is_leaf_fn)
+                if filter_fn(model, tk, vi)
+                else {}
+            )
+        return nl
+
+    raise RuntimeError("Unexpected leaf found while traversing the module")

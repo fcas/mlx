@@ -1,5 +1,8 @@
 // Copyright © 2023 Apple Inc.
 
+// Required for using M_2_SQRTPI in MSVC.
+#define _USE_MATH_DEFINES
+
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -10,7 +13,27 @@
 #include "mlx/graph_utils.h"
 #include "mlx/mlx.h"
 
+#include "mlx/backend/cuda/cuda.h"
+
 using namespace mlx::core;
+
+namespace {
+
+int count_graph_nodes(const array& x, const std::string& node_name) {
+  std::ostringstream oss;
+  print_graph(oss, x);
+  auto graph = oss.str();
+
+  int count = 0;
+  size_t pos = 0;
+  while ((pos = graph.find(node_name, pos)) != std::string::npos) {
+    count++;
+    pos += node_name.size();
+  }
+  return count;
+}
+
+} // namespace
 
 TEST_CASE("test stop gradient") {
   auto x = zeros({5, 5});
@@ -323,6 +346,42 @@ TEST_CASE("test grad") {
   }
 }
 
+TEST_CASE("test transform container reuse does not accumulate stale wrappers") {
+  auto x = ones({128});
+
+  SUBCASE("grad reuses a single copy wrapper") {
+    std::vector<array> container = {array(1.0f)};
+    auto grad_fn = grad([&container](const std::vector<array>& inputs) {
+      container[0] = inputs[0];
+      return sum(inputs[1]);
+    });
+
+    for (int i = 0; i < 5; ++i) {
+      auto grads = grad_fn({container[0], x});
+      eval(grads);
+    }
+
+    CHECK_EQ(count_graph_nodes(container[0], "Copy "), 1);
+  }
+
+  SUBCASE("jvp reuses a single copy wrapper") {
+    std::vector<array> container = {array(1.0f)};
+    auto fun = [&container](const std::vector<array>& inputs) {
+      container[0] = inputs[0];
+      return std::vector<array>{sum(inputs[1])};
+    };
+
+    for (int i = 0; i < 5; ++i) {
+      auto [outputs, tangents] =
+          jvp(fun, {container[0], x}, {array(1.0f), ones({128})});
+      eval(outputs);
+      eval(tangents);
+    }
+
+    CHECK_EQ(count_graph_nodes(container[0], "Copy "), 1);
+  }
+}
+
 TEST_CASE("test creation grads") {
   // Test astype
   {
@@ -410,6 +469,25 @@ TEST_CASE("test op vjps") {
     CHECK(out.second.item<float>() == doctest::Approx(-std::sin(1.0f)));
   }
 
+  // Test arctan
+  {
+    auto out = vjp(
+        [](array input) { return arctan(input); }, array(2.0f), array(1.0f));
+    CHECK(out.second.item<float>() == doctest::Approx(0.2f));
+  }
+
+  // Test arctan2
+  {
+    auto out = vjp(
+        [](const std::vector<array>& xs) {
+          return std::vector<array>{arctan2(xs[0], xs[1])};
+        },
+        {array(2.0f), array(3.0f)},
+        {array(1.0f)});
+    CHECK(out.second[0].item<float>() == doctest::Approx(3.0f / 13.0f));
+    CHECK(out.second[1].item<float>() == doctest::Approx(-2.0f / 13.0f));
+  }
+
   // Test log
   {
     auto out = vjp([](array in) { return log(in); }, array(2.0f), array(1.0f));
@@ -434,10 +512,10 @@ TEST_CASE("test op vjps") {
   // Test erf
   {
     auto out = vjp([](array in) { return erf(in); }, array(inf), array(1.0f));
-    CHECK_EQ(out.second.item<float>(), 0.0f);
+    CHECK_EQ(out.second.item<float>(), doctest::Approx(0.0f));
 
     out = vjp([](array in) { return erf(in); }, array(-inf), array(2.0f));
-    CHECK_EQ(out.second.item<float>(), 0.0f);
+    CHECK_EQ(out.second.item<float>(), doctest::Approx(0.0f));
 
     out = vjp([](array in) { return erf(in); }, array(0.0f), array(1.0f));
     CHECK_EQ(out.second.item<float>(), static_cast<float>(M_2_SQRTPI));
@@ -614,7 +692,7 @@ TEST_CASE("test op vjps") {
     axes = {0};
     out = vjp(fun, array({}), array(3.0f)).second;
     CHECK_EQ(out.size(), 0);
-    CHECK_EQ(out.shape(), std::vector<int>{0});
+    CHECK_EQ(out.shape(), Shape{0});
 
     axes = {0};
     out = vjp(fun, ones({2, 2, 2}), array({1.0f, 2.0f, 3.0f, 4.0f}, {2, 2}))
@@ -722,9 +800,9 @@ TEST_CASE("test gather and take grads") {
 }
 
 TEST_CASE("test slice grads") {
-  std::vector<int> start = {5, 0, 0};
-  std::vector<int> stop = {7, 2, 4};
-  std::vector<int> strides = {1, 1, 1};
+  Shape start = {5, 0, 0};
+  Shape stop = {7, 2, 4};
+  Shape strides = {1, 1, 1};
 
   auto fn = [&start, &stop, &strides](array input) {
     return slice(input, start, stop, strides);
@@ -769,6 +847,30 @@ TEST_CASE("test slice grads") {
 
   out = jvp(fn, src, ones({4, 4})).second;
   CHECK_EQ(out.size(), 0);
+}
+
+TEST_CASE("test slice update jvp with one tangent") {
+  auto src = array({1.0f, 2.0f, 3.0f, 4.0f});
+  auto update = array({5.0f, 6.0f});
+  auto src_tan = array({1.0f, 2.0f, 3.0f, 4.0f});
+  auto update_tan = array({7.0f, 8.0f});
+
+  for (bool add : {false, true}) {
+    auto update_fn = [&src, add](array x) {
+      return add ? slice_update_add(src, x, Shape{1}, Shape{3})
+                 : slice_update(src, x, Shape{1}, Shape{3});
+    };
+    auto out = jvp(update_fn, update, update_tan).second;
+    CHECK(array_equal(out, array({0.0f, 7.0f, 8.0f, 0.0f})).item<bool>());
+
+    auto src_fn = [&update, add](array x) {
+      return add ? slice_update_add(x, update, Shape{1}, Shape{3})
+                 : slice_update(x, update, Shape{1}, Shape{3});
+    };
+    out = jvp(src_fn, src, src_tan).second;
+    auto expected = add ? src_tan : array({1.0f, 0.0f, 0.0f, 4.0f});
+    CHECK(array_equal(out, expected).item<bool>());
+  }
 }
 
 TEST_CASE("test min and max vjp") {
@@ -979,8 +1081,8 @@ TEST_CASE("test comparison grads") {
 
 TEST_CASE("test as_strided grads") {
   auto x = ones({11});
-  std::vector<int> shape = {5, 5};
-  std::vector<size_t> strides = {1, 1};
+  Shape shape = {5, 5};
+  Strides strides = {1, 1};
   size_t offset = 0;
 
   auto fun = [&shape, &strides, &offset](array x) {
@@ -1130,26 +1232,48 @@ TEST_CASE("test complex gradients") {
   }
 
   {
+    auto multiply_fn =
+        [](const std::vector<array>& inputs) -> std::vector<array> {
+      return {multiply(inputs[0], inputs[1])};
+    };
+
     // Compute jvp
     auto x = array(complex64_t{2.0, 4.0});
     auto y = array(3.0f);
-
     auto x_tan = array(complex64_t{1.0, 2.0});
     auto y_tan = array(2.0f);
+    auto jvp_out = jvp(multiply_fn, {x, y}, {x_tan, y_tan}).second;
+    CHECK_EQ(jvp_out[0].item<complex64_t>(), complex64_t{7.0, 14.0});
 
-    auto out = jvp([x](array a) { return multiply(a, x); }, y, y_tan).second;
-    CHECK_EQ(out.item<complex64_t>(), complex64_t{4.0, 8.0});
-
-    out = jvp([y](array a) { return multiply(a, y); }, x, x_tan).second;
-    CHECK_EQ(out.item<complex64_t>(), complex64_t{3.0, 6.0});
-
+    // Compute vjp
     auto cotan = array(complex64_t{2.0, 3.0});
-    out = vjp([x](array a) { return multiply(a, x); }, y, cotan).second;
-    CHECK_EQ(out.dtype(), float32);
-    CHECK_EQ(out.item<float>(), -8.0);
+    auto vjp_out = vjp(multiply_fn, {x, y}, {cotan}).second;
+    CHECK_EQ(vjp_out[0].dtype(), complex64);
+    CHECK_EQ(vjp_out[0].item<complex64_t>(), complex64_t{6.0, 9.0});
+    CHECK_EQ(vjp_out[1].dtype(), float32);
+    CHECK_EQ(vjp_out[1].item<float>(), 16);
+  }
 
-    out = vjp([y](array a) { return multiply(a, y); }, x, cotan).second;
-    CHECK_EQ(out.item<complex64_t>(), complex64_t{6.0, 9.0});
+  {
+    auto divide_fn =
+        [](const std::vector<array>& inputs) -> std::vector<array> {
+      return {divide(inputs[0], inputs[1])};
+    };
+
+    // Compute jvp
+    auto x = array(complex64_t{2.0, 3.0});
+    auto y = array(complex64_t{1.0, 2.0});
+    auto x_tan = array(complex64_t{3.0, 4.0});
+    auto y_tan = array(complex64_t{4.0, -2.0});
+    auto jvp_out = jvp(divide_fn, {x, y}, {x_tan, y_tan}).second;
+    CHECK_EQ(
+        jvp_out[0].item<complex64_t>(), doctest::Approx(complex64_t{2.6, 2.8}));
+
+    // Compute vjp
+    auto cotan = array(complex64_t{2.0, -4.0});
+    auto vjp_out = vjp(divide_fn, {x, y}, {cotan}).second;
+    CHECK_EQ(vjp_out[0].item<complex64_t>(), complex64_t{2.0, 0.0});
+    CHECK_EQ(vjp_out[1].item<complex64_t>(), complex64_t{-3.2, -0.4});
   }
 }
 
@@ -1213,6 +1337,68 @@ TEST_CASE("test scan grads") {
     reverse = false;
     out = vjp(fun, x, g).second;
     expected = array({32.0f, 15.0f, 8.0f, 0.0f}, {4});
+    CHECK(array_equal(out, expected).item<bool>());
+  }
+
+  // Test cummax
+  {
+    int axis = 0;
+    int reverse = false;
+    int inclusive = true;
+    auto fun = [&axis, &reverse, &inclusive](array x) {
+      return cummax(x, axis, reverse, inclusive);
+    };
+
+    auto x = array({3.0f, 3.0f, 1.0f, 5.0f, 5.0f}, {5});
+    auto g = ones({5});
+    auto out = vjp(fun, x, g).second;
+    auto expected = array({1.0f, 2.0f, 0.0f, 1.0f, 1.0f}, {5});
+    CHECK(array_equal(out, expected).item<bool>());
+
+    reverse = true;
+    out = vjp(fun, x, g).second;
+    expected = array({0.0f, 0.0f, 0.0f, 4.0f, 1.0f}, {5});
+    CHECK(array_equal(out, expected).item<bool>());
+
+    inclusive = false;
+    out = vjp(fun, x, g).second;
+    expected = array({0.0f, 0.0f, 0.0f, 3.0f, 1.0f}, {5});
+    CHECK(array_equal(out, expected).item<bool>());
+
+    reverse = false;
+    out = vjp(fun, x, g).second;
+    expected = array({1.0f, 2.0f, 0.0f, 1.0f, 0.0f}, {5});
+    CHECK(array_equal(out, expected).item<bool>());
+  }
+
+  // Test cummin
+  {
+    int axis = 0;
+    int reverse = false;
+    int inclusive = true;
+    auto fun = [&axis, &reverse, &inclusive](array x) {
+      return cummin(x, axis, reverse, inclusive);
+    };
+
+    auto x = array({3.0f, 3.0f, 1.0f, 5.0f, 5.0f}, {5});
+    auto g = ones({5});
+    auto out = vjp(fun, x, g).second;
+    auto expected = array({1.0f, 1.0f, 3.0f, 0.0f, 0.0f}, {5});
+    CHECK(array_equal(out, expected).item<bool>());
+
+    reverse = true;
+    out = vjp(fun, x, g).second;
+    expected = array({0.0f, 0.0f, 3.0f, 1.0f, 1.0f}, {5});
+    CHECK(array_equal(out, expected).item<bool>());
+
+    inclusive = false;
+    out = vjp(fun, x, g).second;
+    expected = array({0.0f, 0.0f, 2.0f, 1.0f, 1.0f}, {5});
+    CHECK(array_equal(out, expected).item<bool>());
+
+    reverse = false;
+    out = vjp(fun, x, g).second;
+    expected = array({1.0f, 1.0f, 2.0f, 0.0f, 0.0f}, {5});
     CHECK(array_equal(out, expected).item<bool>());
   }
 
@@ -1286,5 +1472,63 @@ TEST_CASE("test grad types") {
       auto out = grad(fn)({x, y});
       CHECK_EQ(out[0].dtype(), t);
     }
+  }
+}
+
+TEST_CASE("test grad dynamic slices") {
+  {
+    auto fn = [](const array& x) { return slice(x, array({0}), {0}, {1, 2}); };
+    auto x = array({1, 2, 3, 4}, {2, 2});
+    auto out = vjp(fn, x, array({1, 1}, {1, 2})).second;
+    CHECK(array_equal(out, array({1, 1, 0, 0}, {2, 2})).item<bool>());
+  }
+  {
+    auto fn = [](const std::vector<array>& inputs) {
+      const auto& x = inputs[0];
+      const auto& update = inputs[1];
+      return std::vector<array>{slice_update(x, update, array({0}), {0})};
+    };
+    auto x = zeros({2, 2});
+    auto update = array({3.f, 4.f}, {1, 2});
+    auto outs = vjp(fn, {x, update}, {ones({2, 2})}).second;
+    CHECK(allclose(outs[0], array({0.f, 0.f, 1.f, 1.f}, {2, 2})).item<bool>());
+    CHECK(allclose(outs[1], ones({1, 2})).item<bool>());
+  }
+}
+
+TEST_CASE("test masked_scatter autograd") {
+  // Test jvp
+  {
+    auto self = array({10.f, 20.f, 30.f, 40.f}, {4});
+    auto mask = array({false, true, false, true}, bool_);
+    auto src = array({7.f, 8.f}, {2});
+
+    auto self_tan = array({1.f, 2.f, 3.f, 4.f}, {4});
+    auto src_tan = array({9.f, 11.f}, {2});
+
+    auto fun = [&mask](const std::vector<array>& in) {
+      return std::vector<array>{masked_scatter(in[0], mask, in[1])};
+    };
+
+    auto outs = jvp(fun, {self, src}, {self_tan, src_tan}).second;
+    CHECK_EQ(outs.size(), 1);
+    CHECK(array_equal(outs[0], array({1.f, 9.f, 3.f, 11.f}, {4})).item<bool>());
+  }
+
+  // Test vjp
+  {
+    auto self = array({10.f, 20.f, 30.f, 40.f}, {4});
+    auto mask = array({true, false, false, true}, bool_);
+    auto src = array({7.f, 8.f}, {2});
+
+    auto f_sum = [&mask](const std::vector<array>& xs) {
+      return std::vector<array>{sum(masked_scatter(xs[0], mask, xs[1]))};
+    };
+
+    auto v = vjp(f_sum, {self, src}, {array(1.f)});
+    const auto& grads = v.second;
+
+    CHECK(array_equal(grads[0], array({0.f, 1.f, 1.f, 0.f}, {4})).item<bool>());
+    CHECK(array_equal(grads[1], array({1.f, 1.f}, {2})).item<bool>());
   }
 }

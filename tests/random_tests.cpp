@@ -141,7 +141,7 @@ TEST_CASE("test random bits") {
 
   {
     auto key = array({0u, 0u, 1u, 1u}, {2, 2});
-    auto shape = std::vector<int>{3};
+    auto shape = Shape{3};
     auto fn = [&shape](array k) { return random::bits(shape, k); };
 
     auto expected = array(
@@ -264,7 +264,7 @@ TEST_CASE("test random uniform") {
 
     // Check broadcasting
     x = random::uniform(zeros({3, 1}), ones({1, 3}), {3, 3});
-    CHECK_EQ(x.shape(), std::vector<int>{3, 3});
+    CHECK_EQ(x.shape(), Shape{3, 3});
     CHECK_THROWS_AS(
         random::uniform(zeros({3, 3}), 1.0, {1, 3}), std::invalid_argument);
     CHECK_THROWS_AS(
@@ -297,7 +297,7 @@ TEST_CASE("test random uniform") {
   //   print(jax.prng.threefry_prng_impl.random_bits(key, 32, shape))
 
   constexpr auto to_float = [](uint32_t n) {
-    return static_cast<float>(n) / UINT32_MAX;
+    return float(n) / float(UINT32_MAX);
   };
 
   {
@@ -332,11 +332,11 @@ TEST_CASE("test random uniform") {
       return random::uniform(low, 1, {3}, float32, k);
     };
     auto out = vmap(fun, -1)(key, zeros({2, 3}));
-    CHECK_EQ(out.shape(), std::vector<int>{2, 3});
+    CHECK_EQ(out.shape(), Shape{2, 3});
 
     key = zeros({2, 2}, uint32);
     out = vmap(fun)(key, zeros({2, 3}));
-    CHECK_EQ(out.shape(), std::vector<int>{2, 3});
+    CHECK_EQ(out.shape(), Shape{2, 3});
   }
 
   // Check bounds are respected
@@ -350,22 +350,22 @@ TEST_CASE("test random uniform") {
   // Check float16
   {
     auto key = random::key(0);
-    auto out = random::uniform({100}, float16, key);
+    auto out = random::uniform({1000}, float16, key);
     CHECK_EQ(out.dtype(), float16);
     CHECK(all(less(out, array(1.0f))).item<bool>());
     CHECK(all(greater_equal(out, array(0.0f))).item<bool>());
     CHECK(!all(equal(out, array(0.0f))).item<bool>());
-    CHECK(abs(float(mean(out).item<float16_t>()) - 0.5f) < 0.02);
+    CHECK(abs(mean(astype(out, float32)).item<float>() - 0.5f) < 0.02);
   }
 
   {
     auto key = random::key(0);
-    auto out = random::uniform({100}, bfloat16, key);
+    auto out = random::uniform({1000}, bfloat16, key);
     CHECK_EQ(out.dtype(), bfloat16);
     CHECK(all(less(out, array(1.0f))).item<bool>());
     CHECK(all(greater_equal(out, array(0.0f))).item<bool>());
     CHECK(!all(equal(out, array(0.0f))).item<bool>());
-    CHECK(abs(float(mean(out).item<bfloat16_t>()) - 0.5f) < 0.02);
+    CHECK(abs(mean(astype(out, float32)).item<float>() - 0.5f) < 0.02);
   }
 }
 
@@ -421,11 +421,14 @@ TEST_CASE("test random normal") {
 }
 
 TEST_CASE("test random multivariate_normal") {
+  // Scope switch to the cpu for SVDs
+  StreamContext sc(Device::cpu);
+
   {
     auto mean = zeros({3});
     auto cov = eye(3);
     auto x = random::multivariate_normal(mean, cov, {1000}, float32);
-    CHECK_EQ(x.shape(), std::vector<int>({1000, 3}));
+    CHECK_EQ(x.shape(), Shape{1000, 3});
     CHECK_EQ(x.dtype(), float32);
   }
 
@@ -435,7 +438,7 @@ TEST_CASE("test random multivariate_normal") {
     auto cov = array({1., -1, -.1, 1.});
     cov = reshape(cov, {2, 2});
     auto x = random::multivariate_normal(mean, cov, {1}, float32);
-    CHECK_EQ(x.shape(), std::vector<int>({1, 2}));
+    CHECK_EQ(x.shape(), Shape{1, 2});
     CHECK_EQ(x.dtype(), float32);
   }
 
@@ -457,7 +460,7 @@ TEST_CASE("test random multivariate_normal") {
     auto mean = zeros({3});
     auto cov = zeros({1, 2, 3, 3});
     auto x = random::multivariate_normal(mean, cov, {1000, 2}, float32);
-    CHECK_EQ(x.shape(), std::vector<int>({1000, 2, 3}));
+    CHECK_EQ(x.shape(), Shape{1000, 2, 3});
   }
   {
     auto mean = zeros({3});
@@ -537,7 +540,7 @@ TEST_CASE("test random bernoulli") {
 
   // Return array with correct shape
   x = random::bernoulli(0.5, {3, 3});
-  CHECK_EQ(x.shape(), std::vector<int>({3, 3}));
+  CHECK_EQ(x.shape(), Shape{3, 3});
 
   // Try with p = {}
   x = random::bernoulli(array({}));
@@ -547,13 +550,13 @@ TEST_CASE("test random bernoulli") {
   auto p = array({0.1, 0.2, 0.3});
   p = reshape(p, {1, 3});
   x = random::bernoulli(p, {4, 3});
-  CHECK_EQ(x.shape(), std::vector<int>({4, 3}));
+  CHECK_EQ(x.shape(), Shape{4, 3});
 
   CHECK_THROWS_AS(random::bernoulli(array({}), {3, 3}), std::invalid_argument);
 
   p = array({0.1, 0.2, 0.3});
   // Ask for the wrong shape => throws
-  CHECK_THROWS_AS(random::bernoulli(p, {2}), std::invalid_argument);
+  CHECK_THROWS_AS(random::bernoulli(p, Shape{2}), std::invalid_argument);
 
   // Check wrong key type or shape
   auto key = array({0, 0}, {1, 2});
@@ -572,7 +575,7 @@ TEST_CASE("Test truncated normal") {
 
   // Requested shape
   x = random::truncated_normal(array(-2.0), array(2.0), {3, 4});
-  CHECK_EQ(x.shape(), std::vector<int>({3, 4}));
+  CHECK_EQ(x.shape(), Shape{3, 4});
 
   // Empty array
   x = random::truncated_normal(array({}), array({}));
@@ -584,7 +587,7 @@ TEST_CASE("Test truncated normal") {
   x = random::truncated_normal(lower, higher);
 
   // All in bounds
-  CHECK_EQ(x.shape(), std::vector<int>({3, 2}));
+  CHECK_EQ(x.shape(), Shape{3, 2});
   CHECK((all(x <= higher).item<bool>() && all(lower <= x).item<bool>()));
 
   // high < low => all equal to low
@@ -611,21 +614,21 @@ TEST_CASE("test categorical") {
   CHECK_THROWS(categorical(logits, -3));
 
   // Invalid requested shapes
-  CHECK_THROWS(categorical(logits, 1, std::vector<int>{1}));
-  CHECK_THROWS(categorical(logits, 1, std::vector<int>{11}));
+  CHECK_THROWS(categorical(logits, 1, Shape{1}));
+  CHECK_THROWS(categorical(logits, 1, Shape{11}));
   CHECK_THROWS(categorical(logits, 1, {10, 1}));
 
-  CHECK_EQ(categorical(logits, -1).shape(), std::vector<int>{10});
-  CHECK_EQ(categorical(logits, 0).shape(), std::vector<int>{20});
-  CHECK_EQ(categorical(logits, 1).shape(), std::vector<int>{10});
+  CHECK_EQ(categorical(logits, -1).shape(), Shape{10});
+  CHECK_EQ(categorical(logits, 0).shape(), Shape{20});
+  CHECK_EQ(categorical(logits, 1).shape(), Shape{10});
 
   auto out = categorical(logits);
-  CHECK_EQ(out.shape(), std::vector<int>{10});
+  CHECK_EQ(out.shape(), Shape{10});
   CHECK_EQ(out.dtype(), uint32);
   CHECK(max(out).item<uint32_t>() < 20);
 
   out = categorical(logits, 0, {5, 20});
-  CHECK_EQ(out.shape(), std::vector<int>{5, 20});
+  CHECK_EQ(out.shape(), Shape{5, 20});
   CHECK(max(out).item<uint32_t>() < 10);
 
   float inf = std::numeric_limits<float>::infinity();
@@ -636,7 +639,91 @@ TEST_CASE("test categorical") {
   CHECK_EQ(categorical(logits).item<uint32_t>(), 1);
 
   logits = zeros({5, 4, 3});
-  CHECK_EQ(categorical(logits, -1, 7).shape(), std::vector<int>{5, 4, 7});
-  CHECK_EQ(categorical(logits, -2, 7).shape(), std::vector<int>{5, 3, 7});
-  CHECK_EQ(categorical(logits, -3, 7).shape(), std::vector<int>{4, 3, 7});
+  CHECK_EQ(categorical(logits, -1, 7).shape(), Shape{5, 4, 7});
+  CHECK_EQ(categorical(logits, -2, 7).shape(), Shape{5, 3, 7});
+  CHECK_EQ(categorical(logits, -3, 7).shape(), Shape{4, 3, 7});
+
+  // Infinities mean the same thing when several samples are drawn
+  logits = array({1.0f, -2.0f, inf, 4.0f, 3.0f});
+  CHECK(all(equal(categorical(logits, 0, 5), array(2u))).item<bool>());
+
+  logits = array({-inf, -2.0f, -inf, -inf});
+  CHECK(all(equal(categorical(logits, 0, 5), array(1u))).item<bool>());
+
+  // A -inf category carries no mass and is never drawn
+  logits = array({-inf, 0.0f, -inf, 0.0f});
+  out = categorical(logits, 0, 100);
+  CHECK(all(logical_or(equal(out, array(1u)), equal(out, array(3u))))
+            .item<bool>());
+}
+
+TEST_CASE("test laplace") {
+  // Test shapes, types, and sizes
+  {
+    auto x = random::laplace({});
+    CHECK_EQ(x.size(), 1);
+    CHECK_EQ(x.dtype(), float32);
+
+    // Non float type throws
+    CHECK_THROWS_AS(random::laplace({}, int32), std::invalid_argument);
+
+    // Check wrong key type or shape
+    auto key = array({0, 0});
+    CHECK_THROWS_AS(random::laplace({}, key), std::invalid_argument);
+    key = array({0, 0}, {1, 2});
+    CHECK_THROWS_AS(random::laplace({}, key), std::invalid_argument);
+    key = array({0u, 0u, 0u}, {3, 1});
+    CHECK_THROWS_AS(random::laplace({}, key), std::invalid_argument);
+    key = array({0u, 0u}, {2, 1});
+    CHECK_THROWS_AS(random::laplace({}, key), std::invalid_argument);
+  }
+
+  {
+    constexpr float inf = std::numeric_limits<float>::infinity();
+    auto key = random::key(128291);
+    auto out = random::laplace({1000000}, key);
+    float sample_mean = mean(out).item<float>();
+    float sample_variance = var(out).item<float>();
+
+    CHECK(all(less(abs(out), array(inf))).item<bool>());
+    CHECK(abs(sample_mean) < 0.1);
+
+    // Chebyshev's inequality.
+    for (int k = 1; k <= 5; ++k) {
+      float prob_above =
+          mean(greater_equal(out, array(k * std::sqrt(sample_variance))))
+              .item<float>();
+      float bound = 1 / std::pow(k, 2);
+      CHECK(prob_above < bound);
+    }
+
+    // Expected variance for Laplace distribution is 2*scale^2.
+    float expected_variance = 2.0;
+    CHECK(std::abs(sample_variance - expected_variance) < 0.01);
+
+    // Expected kurtosis of Laplace distribution is 3.
+    array fourth_pows = power(out - sample_mean, array(4));
+    float sample_kurtosis =
+        mean(fourth_pows).item<float>() / std::pow(sample_variance, 2) - 3;
+    float expected_kurtosis = 3.0;
+    CHECK(std::abs(sample_kurtosis - expected_kurtosis) < 0.1);
+  }
+
+  {
+    constexpr float inf = std::numeric_limits<float>::infinity();
+    auto key = random::key(128291);
+    auto out = random::laplace({10000}, float16, key);
+    CHECK_EQ(out.dtype(), float16);
+    CHECK(all(less(abs(out), array(inf))).item<bool>());
+    CHECK(abs(float(mean(out).item<float16_t>())) < 0.1);
+  }
+
+  {
+    constexpr float inf = std::numeric_limits<float>::infinity();
+    auto key = random::key(128291);
+    auto out = random::laplace({10000}, bfloat16, key);
+    CHECK_EQ(out.dtype(), bfloat16);
+    CHECK(all(less(abs(out), array(inf))).item<bool>());
+    CHECK(abs(float(mean(out).item<bfloat16_t>())) < 0.1);
+  }
 }

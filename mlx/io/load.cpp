@@ -1,10 +1,17 @@
-// Copyright © 2023-2024 Apple Inc.
+// Copyright © 2023-2026 Apple Inc.
 #include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <sstream>
 
+// Used by pread implementation.
+#ifdef _WIN32
+#include <windows.h>
+#endif // _WIN32
+
+#include "mlx/backend/cuda/cuda.h"
+#include "mlx/io.h"
 #include "mlx/io/load.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
@@ -26,6 +33,111 @@ constexpr uint8_t MAGIC[] = {
     0x59,
 };
 
+inline bool is_big_endian() {
+  union ByteOrder {
+    int32_t i;
+    uint8_t c[4];
+  };
+  ByteOrder b = {0x01234567};
+
+  return b.c[0] == 0x01;
+}
+
+// Array protocol typestring for Dtype
+std::string dtype_to_array_protocol(const Dtype& t) {
+  std::ostringstream r;
+  if (size_of(t) > 1) {
+    r << (is_big_endian() ? ">" : "<");
+  } else {
+    r << "|";
+  }
+  r << kindof(t) << (int)size_of(t);
+  return r.str();
+}
+
+// Dtype from array protocol type string
+Dtype dtype_from_array_protocol(std::string_view t) {
+  if (t.length() == 2 || t.length() == 3) {
+    std::string_view r = t.length() == 3 ? t.substr(1, 2) : t;
+
+    if (r == "V2") {
+      return bfloat16;
+    }
+
+    uint8_t size = r[1] - '0';
+
+    switch (r[0]) {
+      case 'b': {
+        if (size == 1)
+          return bool_;
+        break;
+      }
+      case 'i': {
+        if (size == 1)
+          return int8;
+        else if (size == 2)
+          return int16;
+        else if (size == 4)
+          return int32;
+        else if (size == 8)
+          return int64;
+        break;
+      }
+      case 'u': {
+        if (size == 1)
+          return uint8;
+        else if (size == 2)
+          return uint16;
+        else if (size == 4)
+          return uint32;
+        else if (size == 8)
+          return uint64;
+        break;
+      }
+      case 'f': {
+        if (size == 2)
+          return float16;
+        else if (size == 4)
+          return float32;
+        else if (size == 8)
+          return float64;
+        break;
+      }
+      case 'c': {
+        if (size == 8)
+          return complex64;
+        break;
+      }
+    }
+  }
+
+  throw std::invalid_argument(
+      "[from_str] Unsupported array protocol type-string: " + std::string(t));
+}
+
+#ifdef _WIN32
+// There is no pread on Windows, emulate it with ReadFile.
+int64_t pread(int fd, void* buf, uint64_t size, uint64_t offset) {
+  HANDLE file = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+  if (file == INVALID_HANDLE_VALUE) {
+    return -1;
+  }
+
+  OVERLAPPED overlapped = {0};
+  overlapped.Offset = offset & 0xFFFFFFFF;
+  overlapped.OffsetHigh = (offset >> 32) & 0xFFFFFFFF;
+
+  DWORD bytes_read;
+  if (!ReadFile(file, buf, size, &bytes_read, &overlapped)) {
+    if (GetLastError() != ERROR_HANDLE_EOF) {
+      return -1;
+    }
+  }
+
+  return bytes_read;
+}
+#endif
+
 } // namespace
 
 /** Save array to out stream in .npy format */
@@ -33,21 +145,8 @@ void save(std::shared_ptr<io::Writer> out_stream, array a) {
   ////////////////////////////////////////////////////////
   // Check array
 
+  a = contiguous(a, true);
   a.eval();
-
-  if (a.nbytes() == 0) {
-    throw std::invalid_argument("[save] cannot serialize an empty array");
-  }
-
-  if (!(a.flags().row_contiguous || a.flags().col_contiguous)) {
-    a = reshape(flatten(a), a.shape());
-    a.eval();
-  }
-  // Check once more in-case the above ops change
-  if (!(a.flags().row_contiguous || a.flags().col_contiguous)) {
-    throw std::invalid_argument(
-        "[save] can only serialize row or col contiguous arrays");
-  }
 
   ////////////////////////////////////////////////////////
   // Check file
@@ -109,7 +208,11 @@ void save(std::shared_ptr<io::Writer> out_stream, array a) {
 
   out_stream->write(magic_ver_len.str().c_str(), magic_ver_len.str().length());
   out_stream->write(header.str().c_str(), header.str().length());
-  out_stream->write(a.data<char>(), a.nbytes());
+  // An empty array has no data to write, and asking for its pointer is not
+  // meaningful, so stop after the header.
+  if (a.nbytes() > 0) {
+    out_stream->write(a.data<char>(), a.nbytes());
+  }
 }
 
 /** Save array to file in .npy format */
@@ -129,6 +232,8 @@ array load(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s) {
   if (!in_stream->good() || !in_stream->is_open()) {
     throw std::runtime_error("[load] Failed to open " + in_stream->label());
   }
+
+  auto stream = cu::is_available() ? to_stream(s) : to_stream(s, Device::cpu);
 
   ////////////////////////////////////////////////////////
   // Read header and prepare array details
@@ -164,7 +269,7 @@ array load(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s) {
   std::vector<char> buffer(header_len + 1);
   in_stream->read(&buffer[0], header_len);
   buffer[header_len] = 0;
-  std::string header(&buffer[0]);
+  std::string header(buffer.data(), header_len);
 
   // Read data type from header
   std::string dtype_str = header.substr(11, 3);
@@ -172,10 +277,10 @@ array load(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s) {
   Dtype dtype = dtype_from_array_protocol(dtype_str);
 
   // Read contiguity order
-  bool col_contiguous = header[34] == 'T';
+  bool col_contiguous = header.at(34) == 'T';
 
   // Read array shape from header
-  std::vector<int> shape;
+  Shape shape;
 
   size_t st = header.find_last_of('(') + 1;
   size_t ed = header.find_last_of(')');
@@ -213,7 +318,7 @@ array load(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s) {
   auto loaded_array = array(
       shape,
       dtype,
-      std::make_shared<Load>(to_stream(s), in_stream, offset, swap_endianness),
+      std::make_shared<Load>(stream, in_stream, offset, swap_endianness),
       std::vector<array>{});
   if (col_contiguous) {
     loaded_array = transpose(loaded_array, s);
@@ -224,7 +329,71 @@ array load(std::shared_ptr<io::Reader> in_stream, StreamOrDevice s) {
 
 /** Load array from file in .npy format */
 array load(std::string file, StreamOrDevice s) {
-  return load(std::make_shared<io::FileReader>(std::move(file)), s);
+  return load(std::make_shared<io::ParallelFileReader>(std::move(file)), s);
 }
+
+namespace io {
+
+ThreadPool& thread_pool() {
+  // Leak - see Scheduler singleton comment in scheduler.cpp.
+  static ThreadPool* pool_ = new ThreadPool{4};
+  return *pool_;
+}
+
+ThreadPool& ParallelFileReader::thread_pool() {
+  // Leak - see Scheduler singleton comment in scheduler.cpp.
+  static ThreadPool* thread_pool = new ThreadPool{4};
+  return *thread_pool;
+}
+
+void ParallelFileReader::read(char* data, size_t n) {
+  while (n != 0) {
+    auto m = ::read(fd_, data, std::min(n, static_cast<size_t>(INT32_MAX)));
+    if (m <= 0) {
+      std::ostringstream msg;
+      msg << "[read] Unable to read " << n << " bytes from file.";
+      throw std::runtime_error(msg.str());
+    }
+    data += m;
+    n -= m;
+  }
+}
+
+void ParallelFileReader::read(char* data, size_t n, size_t offset) {
+  auto readfn = [fd = fd_](size_t offset, size_t size, char* buffer) -> bool {
+    while (size != 0) {
+      auto m = pread(fd, buffer, size, offset);
+      if (m <= 0) {
+        return false;
+      }
+      buffer += m;
+      size -= m;
+    }
+    return true;
+  };
+  std::vector<std::future<bool>> futs;
+  while (n != 0) {
+    if (n < batch_size_) {
+      if (!readfn(offset, n, data)) {
+        throw std::runtime_error("[read] Unable to read from file.");
+      }
+      break;
+    } else {
+      size_t m = batch_size_;
+      futs.emplace_back(
+          ParallelFileReader::thread_pool().enqueue(readfn, offset, m, data));
+      data += m;
+      n -= m;
+      offset += m;
+    }
+  }
+  for (auto& f : futs) {
+    if (!f.get()) {
+      throw std::runtime_error("[read] Unable to read from file.");
+    }
+  }
+}
+
+} // namespace io
 
 } // namespace mlx::core

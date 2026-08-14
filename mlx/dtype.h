@@ -4,9 +4,8 @@
 
 #include <complex>
 #include <cstdint>
-#include <ostream>
-#include <string>
 
+#include "mlx/api.h"
 #include "mlx/types/complex.h"
 #include "mlx/types/half_types.h"
 
@@ -25,6 +24,7 @@ struct Dtype {
     int64,
     float16,
     float32,
+    float64,
     bfloat16,
     complex64,
   };
@@ -49,12 +49,21 @@ struct Dtype {
     generic
   };
 
-  Val val;
-  const uint8_t size;
-  constexpr explicit Dtype(Val val, uint8_t size) : val(val), size(size) {};
+  constexpr explicit Dtype(Val val, uint8_t size) : val_(val), size_(size) {}
+
   constexpr operator Val() const {
-    return val;
-  };
+    return val_;
+  }
+  constexpr Val val() const {
+    return val_;
+  }
+  constexpr uint8_t size() const {
+    return size_;
+  }
+
+ private:
+  Val val_;
+  uint8_t size_;
 };
 
 inline constexpr Dtype bool_{Dtype::Val::bool_, sizeof(bool)};
@@ -71,6 +80,7 @@ inline constexpr Dtype int64{Dtype::Val::int64, sizeof(int64_t)};
 
 inline constexpr Dtype float16{Dtype::Val::float16, sizeof(uint16_t)};
 inline constexpr Dtype float32{Dtype::Val::float32, sizeof(float)};
+inline constexpr Dtype float64{Dtype::Val::float64, sizeof(double)};
 inline constexpr Dtype bfloat16{Dtype::Val::bfloat16, sizeof(uint16_t)};
 inline constexpr Dtype complex64{Dtype::Val::complex64, sizeof(complex64_t)};
 
@@ -85,27 +95,22 @@ inline constexpr Dtype::Category integer = Dtype::Category::integer;
 inline constexpr Dtype::Category number = Dtype::Category::number;
 inline constexpr Dtype::Category generic = Dtype::Category::generic;
 
-bool issubdtype(const Dtype& a, const Dtype& b);
-bool issubdtype(const Dtype::Category& a, const Dtype& b);
-bool issubdtype(const Dtype& a, const Dtype::Category& b);
-bool issubdtype(const Dtype::Category& a, const Dtype::Category& b);
+MLX_API bool issubdtype(const Dtype& a, const Dtype& b);
+MLX_API bool issubdtype(const Dtype::Category& a, const Dtype& b);
+MLX_API bool issubdtype(const Dtype& a, const Dtype::Category& b);
+MLX_API bool issubdtype(const Dtype::Category& a, const Dtype::Category& b);
 
-Dtype promote_types(const Dtype& t1, const Dtype& t2);
+MLX_API Dtype promote_types(const Dtype& t1, const Dtype& t2);
 
 inline uint8_t size_of(const Dtype& t) {
-  return t.size;
+  return t.size();
 }
 
-Dtype::Kind kindof(const Dtype& t);
+MLX_API Dtype::Kind kindof(const Dtype& t);
 
 template <typename T>
-struct TypeToDtype {
+struct MLX_API TypeToDtype {
   operator Dtype();
 };
-
-// Array protocol typestring for Dtype
-std::string dtype_to_array_protocol(const Dtype& t);
-// Dtype from array protocol type string
-Dtype dtype_from_array_protocol(std::string_view t);
 
 } // namespace mlx::core

@@ -10,7 +10,7 @@ import mlx.core as mx
 # -- Project information -----------------------------------------------------
 
 project = "MLX"
-copyright = "2023, MLX Contributors"
+copyright = "2023, Apple"
 author = "MLX Contributors"
 version = ".".join(mx.__version__.split(".")[:3])
 release = version
@@ -18,6 +18,7 @@ release = version
 # -- General configuration ---------------------------------------------------
 
 extensions = [
+    "sphinx_copybutton",
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
     "sphinx.ext.intersphinx",
@@ -27,7 +28,10 @@ extensions = [
 
 python_use_unqualified_type_names = True
 autosummary_generate = True
-autosummary_filename_map = {"mlx.core.Stream": "stream_class"}
+autosummary_filename_map = {
+    "mlx.core.Stream": "stream_class",
+    "mlx.core.PrintOptions": "printoptions_class",
+}
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
@@ -60,6 +64,7 @@ html_theme_options = {
     },
 }
 
+html_favicon = html_theme_options["logo"]["image_light"]
 
 # -- Options for HTMLHelp output ---------------------------------------------
 
@@ -83,3 +88,15 @@ def setup(app):
 # -- Options for LaTeX output ------------------------------------------------
 
 latex_documents = [(main_doc, "MLX.tex", "MLX Documentation", author, "manual")]
+latex_elements = {
+    "preamble": r"""
+    \usepackage{enumitem}
+    \setlistdepth{5}
+    \setlist[itemize,1]{label=$\bullet$}
+    \setlist[itemize,2]{label=$\bullet$}
+    \setlist[itemize,3]{label=$\bullet$}
+    \setlist[itemize,4]{label=$\bullet$}
+    \setlist[itemize,5]{label=$\bullet$}
+    \renewlist{itemize}{itemize}{5}
+""",
+}

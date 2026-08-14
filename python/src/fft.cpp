@@ -2,36 +2,61 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 #include <numeric>
+#include <string_view>
 
 #include "mlx/fft.h"
 #include "mlx/ops.h"
+#include "python/src/small_vector.h"
+#include "python/src/utils.h"
 
+namespace mx = mlx::core;
 namespace nb = nanobind;
 using namespace nb::literals;
 
-using namespace mlx::core;
+namespace {
+
+mx::fft::FFTNorm parse_norm(std::string_view norm, std::string_view op) {
+  if (norm == "backward") {
+    return mx::fft::FFTNorm::Backward;
+  }
+  if (norm == "ortho") {
+    return mx::fft::FFTNorm::Ortho;
+  }
+  if (norm == "forward") {
+    return mx::fft::FFTNorm::Forward;
+  }
+  throw std::invalid_argument(
+      std::string("[") + std::string(op) +
+      "] Invalid norm. Expected one of {'backward', 'ortho', 'forward'}.");
+}
+
+} // namespace
 
 void init_fft(nb::module_& parent_module) {
   auto m = parent_module.def_submodule(
       "fft", "mlx.core.fft: Fast Fourier Transforms.");
   m.def(
       "fft",
-      [](const array& a,
+      [](const mx::array& a,
          const std::optional<int>& n,
          int axis,
-         StreamOrDevice s) {
+         const std::string& norm,
+         mx::StreamOrDevice s) {
+        auto fft_norm = parse_norm(norm, "fft");
         if (n.has_value()) {
-          return fft::fft(a, n.value(), axis, s);
+          return mx::fft::fft(a, n.value(), axis, fft_norm, s);
         } else {
-          return fft::fft(a, axis, s);
+          return mx::fft::fft(a, axis, fft_norm, s);
         }
       },
       "a"_a,
       "n"_a = nb::none(),
       "axis"_a = -1,
+      "norm"_a = "backward",
       "stream"_a = nb::none(),
       R"pbdoc(
         One dimensional discrete Fourier Transform.
@@ -43,25 +68,30 @@ void init_fft(nb::module_& parent_module) {
                zeros to match ``n``. The default value is ``a.shape[axis]``.
             axis (int, optional): Axis along which to perform the FFT. The
                default is ``-1``.
+            norm (str, optional): One of ``"backward"``, ``"ortho"``, or
+               ``"forward"``. Default is ``"backward"``.
 
         Returns:
             array: The DFT of the input along the given axis.
       )pbdoc");
   m.def(
       "ifft",
-      [](const array& a,
+      [](const mx::array& a,
          const std::optional<int>& n,
          int axis,
-         StreamOrDevice s) {
+         const std::string& norm,
+         mx::StreamOrDevice s) {
+        auto fft_norm = parse_norm(norm, "ifft");
         if (n.has_value()) {
-          return fft::ifft(a, n.value(), axis, s);
+          return mx::fft::ifft(a, n.value(), axis, fft_norm, s);
         } else {
-          return fft::ifft(a, axis, s);
+          return mx::fft::ifft(a, axis, fft_norm, s);
         }
       },
       "a"_a,
       "n"_a = nb::none(),
       "axis"_a = -1,
+      "norm"_a = "backward",
       "stream"_a = nb::none(),
       R"pbdoc(
         One dimensional inverse discrete Fourier Transform.
@@ -73,31 +103,35 @@ void init_fft(nb::module_& parent_module) {
                zeros to match ``n``. The default value is ``a.shape[axis]``.
             axis (int, optional): Axis along which to perform the FFT. The
                default is ``-1``.
+            norm (str, optional): One of ``"backward"``, ``"ortho"``, or
+               ``"forward"``. Default is ``"backward"``.
 
         Returns:
             array: The inverse DFT of the input along the given axis.
       )pbdoc");
   m.def(
       "fft2",
-      [](const array& a,
-         const std::optional<std::vector<int>>& n,
+      [](const mx::array& a,
+         const std::optional<mx::Shape>& n,
          const std::optional<std::vector<int>>& axes,
-         StreamOrDevice s) {
+         const std::string& norm,
+         mx::StreamOrDevice s) {
+        auto fft_norm = parse_norm(norm, "fft2");
         if (axes.has_value() && n.has_value()) {
-          return fft::fftn(a, n.value(), axes.value(), s);
+          return mx::fft::fftn(a, n.value(), axes.value(), fft_norm, s);
         } else if (axes.has_value()) {
-          return fft::fftn(a, axes.value(), s);
+          return mx::fft::fftn(a, axes.value(), fft_norm, s);
         } else if (n.has_value()) {
-          std::vector<int> axes_(n.value().size());
-          std::iota(axes_.begin(), axes_.end(), -n.value().size());
-          return fft::fftn(a, n.value(), axes_, s);
+          throw std::invalid_argument(
+              "[fft2] `axes` should not be `None` if `s` is not `None`.");
         } else {
-          return fft::fftn(a, s);
+          return mx::fft::fftn(a, fft_norm, s);
         }
       },
       "a"_a,
       "s"_a = nb::none(),
       "axes"_a.none() = std::vector<int>{-2, -1},
+      "norm"_a = "backward",
       "stream"_a = nb::none(),
       R"pbdoc(
         Two dimensional discrete Fourier Transform.
@@ -110,31 +144,35 @@ void init_fft(nb::module_& parent_module) {
                sizes of ``a`` along ``axes``.
             axes (list(int), optional): Axes along which to perform the FFT.
                The default is ``[-2, -1]``.
+            norm (str, optional): One of ``"backward"``, ``"ortho"``, or
+               ``"forward"``. Default is ``"backward"``.
 
         Returns:
             array: The DFT of the input along the given axes.
       )pbdoc");
   m.def(
       "ifft2",
-      [](const array& a,
-         const std::optional<std::vector<int>>& n,
+      [](const mx::array& a,
+         const std::optional<mx::Shape>& n,
          const std::optional<std::vector<int>>& axes,
-         StreamOrDevice s) {
+         const std::string& norm,
+         mx::StreamOrDevice s) {
+        auto fft_norm = parse_norm(norm, "ifft2");
         if (axes.has_value() && n.has_value()) {
-          return fft::ifftn(a, n.value(), axes.value(), s);
+          return mx::fft::ifftn(a, n.value(), axes.value(), fft_norm, s);
         } else if (axes.has_value()) {
-          return fft::ifftn(a, axes.value(), s);
+          return mx::fft::ifftn(a, axes.value(), fft_norm, s);
         } else if (n.has_value()) {
-          std::vector<int> axes_(n.value().size());
-          std::iota(axes_.begin(), axes_.end(), -n.value().size());
-          return fft::ifftn(a, n.value(), axes_, s);
+          throw std::invalid_argument(
+              "[ifft2] `axes` should not be `None` if `s` is not `None`.");
         } else {
-          return fft::ifftn(a, s);
+          return mx::fft::ifftn(a, fft_norm, s);
         }
       },
       "a"_a,
       "s"_a = nb::none(),
       "axes"_a.none() = std::vector<int>{-2, -1},
+      "norm"_a = "backward",
       "stream"_a = nb::none(),
       R"pbdoc(
         Two dimensional inverse discrete Fourier Transform.
@@ -147,31 +185,35 @@ void init_fft(nb::module_& parent_module) {
                sizes of ``a`` along ``axes``.
             axes (list(int), optional): Axes along which to perform the FFT.
                The default is ``[-2, -1]``.
+            norm (str, optional): One of ``"backward"``, ``"ortho"``, or
+               ``"forward"``. Default is ``"backward"``.
 
         Returns:
             array: The inverse DFT of the input along the given axes.
       )pbdoc");
   m.def(
       "fftn",
-      [](const array& a,
-         const std::optional<std::vector<int>>& n,
+      [](const mx::array& a,
+         const std::optional<mx::Shape>& n,
          const std::optional<std::vector<int>>& axes,
-         StreamOrDevice s) {
+         const std::string& norm,
+         mx::StreamOrDevice s) {
+        auto fft_norm = parse_norm(norm, "fftn");
         if (axes.has_value() && n.has_value()) {
-          return fft::fftn(a, n.value(), axes.value(), s);
+          return mx::fft::fftn(a, n.value(), axes.value(), fft_norm, s);
         } else if (axes.has_value()) {
-          return fft::fftn(a, axes.value(), s);
+          return mx::fft::fftn(a, axes.value(), fft_norm, s);
         } else if (n.has_value()) {
-          std::vector<int> axes_(n.value().size());
-          std::iota(axes_.begin(), axes_.end(), -n.value().size());
-          return fft::fftn(a, n.value(), axes_, s);
+          throw std::invalid_argument(
+              "[fftn] `axes` should not be `None` if `s` is not `None`.");
         } else {
-          return fft::fftn(a, s);
+          return mx::fft::fftn(a, fft_norm, s);
         }
       },
       "a"_a,
       "s"_a = nb::none(),
       "axes"_a = nb::none(),
+      "norm"_a = "backward",
       "stream"_a = nb::none(),
       R"pbdoc(
         n-dimensional discrete Fourier Transform.
@@ -185,31 +227,35 @@ void init_fft(nb::module_& parent_module) {
             axes (list(int), optional): Axes along which to perform the FFT.
                The default is ``None`` in which case the FFT is over the last
                ``len(s)`` axes are or all axes if ``s`` is also ``None``.
+            norm (str, optional): One of ``"backward"``, ``"ortho"``, or
+               ``"forward"``. Default is ``"backward"``.
 
         Returns:
             array: The DFT of the input along the given axes.
       )pbdoc");
   m.def(
       "ifftn",
-      [](const array& a,
-         const std::optional<std::vector<int>>& n,
+      [](const mx::array& a,
+         const std::optional<mx::Shape>& n,
          const std::optional<std::vector<int>>& axes,
-         StreamOrDevice s) {
+         const std::string& norm,
+         mx::StreamOrDevice s) {
+        auto fft_norm = parse_norm(norm, "ifftn");
         if (axes.has_value() && n.has_value()) {
-          return fft::ifftn(a, n.value(), axes.value(), s);
+          return mx::fft::ifftn(a, n.value(), axes.value(), fft_norm, s);
         } else if (axes.has_value()) {
-          return fft::ifftn(a, axes.value(), s);
+          return mx::fft::ifftn(a, axes.value(), fft_norm, s);
         } else if (n.has_value()) {
-          std::vector<int> axes_(n.value().size());
-          std::iota(axes_.begin(), axes_.end(), -n.value().size());
-          return fft::ifftn(a, n.value(), axes_, s);
+          throw std::invalid_argument(
+              "[ifftn] `axes` should not be `None` if `s` is not `None`.");
         } else {
-          return fft::ifftn(a, s);
+          return mx::fft::ifftn(a, fft_norm, s);
         }
       },
       "a"_a,
       "s"_a = nb::none(),
       "axes"_a = nb::none(),
+      "norm"_a = "backward",
       "stream"_a = nb::none(),
       R"pbdoc(
         n-dimensional inverse discrete Fourier Transform.
@@ -223,25 +269,30 @@ void init_fft(nb::module_& parent_module) {
             axes (list(int), optional): Axes along which to perform the FFT.
                The default is ``None`` in which case the FFT is over the last
                ``len(s)`` axes or all axes if ``s`` is also ``None``.
+            norm (str, optional): One of ``"backward"``, ``"ortho"``, or
+               ``"forward"``. Default is ``"backward"``.
 
         Returns:
             array: The inverse DFT of the input along the given axes.
       )pbdoc");
   m.def(
       "rfft",
-      [](const array& a,
+      [](const mx::array& a,
          const std::optional<int>& n,
          int axis,
-         StreamOrDevice s) {
+         const std::string& norm,
+         mx::StreamOrDevice s) {
+        auto fft_norm = parse_norm(norm, "rfft");
         if (n.has_value()) {
-          return fft::rfft(a, n.value(), axis, s);
+          return mx::fft::rfft(a, n.value(), axis, fft_norm, s);
         } else {
-          return fft::rfft(a, axis, s);
+          return mx::fft::rfft(a, axis, fft_norm, s);
         }
       },
       "a"_a,
       "n"_a = nb::none(),
       "axis"_a = -1,
+      "norm"_a = "backward",
       "stream"_a = nb::none(),
       R"pbdoc(
         One dimensional discrete Fourier Transform on a real input.
@@ -257,6 +308,8 @@ void init_fft(nb::module_& parent_module) {
                zeros to match ``n``. The default value is ``a.shape[axis]``.
             axis (int, optional): Axis along which to perform the FFT. The
                default is ``-1``.
+            norm (str, optional): One of ``"backward"``, ``"ortho"``, or
+               ``"forward"``. Default is ``"backward"``.
 
         Returns:
             array: The DFT of the input along the given axis. The output
@@ -264,19 +317,22 @@ void init_fft(nb::module_& parent_module) {
       )pbdoc");
   m.def(
       "irfft",
-      [](const array& a,
+      [](const mx::array& a,
          const std::optional<int>& n,
          int axis,
-         StreamOrDevice s) {
+         const std::string& norm,
+         mx::StreamOrDevice s) {
+        auto fft_norm = parse_norm(norm, "irfft");
         if (n.has_value()) {
-          return fft::irfft(a, n.value(), axis, s);
+          return mx::fft::irfft(a, n.value(), axis, fft_norm, s);
         } else {
-          return fft::irfft(a, axis, s);
+          return mx::fft::irfft(a, axis, fft_norm, s);
         }
       },
       "a"_a,
       "n"_a = nb::none(),
       "axis"_a = -1,
+      "norm"_a = "backward",
       "stream"_a = nb::none(),
       R"pbdoc(
         The inverse of :func:`rfft`.
@@ -292,31 +348,35 @@ void init_fft(nb::module_& parent_module) {
                ``a.shape[axis] // 2 + 1``.
             axis (int, optional): Axis along which to perform the FFT. The
                default is ``-1``.
+            norm (str, optional): One of ``"backward"``, ``"ortho"``, or
+               ``"forward"``. Default is ``"backward"``.
 
         Returns:
             array: The real array containing the inverse of :func:`rfft`.
       )pbdoc");
   m.def(
       "rfft2",
-      [](const array& a,
-         const std::optional<std::vector<int>>& n,
+      [](const mx::array& a,
+         const std::optional<mx::Shape>& n,
          const std::optional<std::vector<int>>& axes,
-         StreamOrDevice s) {
+         const std::string& norm,
+         mx::StreamOrDevice s) {
+        auto fft_norm = parse_norm(norm, "rfft2");
         if (axes.has_value() && n.has_value()) {
-          return fft::rfftn(a, n.value(), axes.value(), s);
+          return mx::fft::rfftn(a, n.value(), axes.value(), fft_norm, s);
         } else if (axes.has_value()) {
-          return fft::rfftn(a, axes.value(), s);
+          return mx::fft::rfftn(a, axes.value(), fft_norm, s);
         } else if (n.has_value()) {
-          std::vector<int> axes_(n.value().size());
-          std::iota(axes_.begin(), axes_.end(), -n.value().size());
-          return fft::rfftn(a, n.value(), axes_, s);
+          throw std::invalid_argument(
+              "[rfft2] `axes` should not be `None` if `s` is not `None`.");
         } else {
-          return fft::rfftn(a, s);
+          return mx::fft::rfftn(a, fft_norm, s);
         }
       },
       "a"_a,
       "s"_a = nb::none(),
       "axes"_a.none() = std::vector<int>{-2, -1},
+      "norm"_a = "backward",
       "stream"_a = nb::none(),
       R"pbdoc(
         Two dimensional real discrete Fourier Transform.
@@ -334,6 +394,8 @@ void init_fft(nb::module_& parent_module) {
                sizes of ``a`` along ``axes``.
             axes (list(int), optional): Axes along which to perform the FFT.
                The default is ``[-2, -1]``.
+            norm (str, optional): One of ``"backward"``, ``"ortho"``, or
+               ``"forward"``. Default is ``"backward"``.
 
         Returns:
             array: The real DFT of the input along the given axes. The output
@@ -341,25 +403,27 @@ void init_fft(nb::module_& parent_module) {
       )pbdoc");
   m.def(
       "irfft2",
-      [](const array& a,
-         const std::optional<std::vector<int>>& n,
+      [](const mx::array& a,
+         const std::optional<mx::Shape>& n,
          const std::optional<std::vector<int>>& axes,
-         StreamOrDevice s) {
+         const std::string& norm,
+         mx::StreamOrDevice s) {
+        auto fft_norm = parse_norm(norm, "irfft2");
         if (axes.has_value() && n.has_value()) {
-          return fft::irfftn(a, n.value(), axes.value(), s);
+          return mx::fft::irfftn(a, n.value(), axes.value(), fft_norm, s);
         } else if (axes.has_value()) {
-          return fft::irfftn(a, axes.value(), s);
+          return mx::fft::irfftn(a, axes.value(), fft_norm, s);
         } else if (n.has_value()) {
-          std::vector<int> axes_(n.value().size());
-          std::iota(axes_.begin(), axes_.end(), -n.value().size());
-          return fft::irfftn(a, n.value(), axes_, s);
+          throw std::invalid_argument(
+              "[irfft2] `axes` should not be `None` if `s` is not `None`.");
         } else {
-          return fft::irfftn(a, s);
+          return mx::fft::irfftn(a, fft_norm, s);
         }
       },
       "a"_a,
       "s"_a = nb::none(),
       "axes"_a.none() = std::vector<int>{-2, -1},
+      "norm"_a = "backward",
       "stream"_a = nb::none(),
       R"pbdoc(
         The inverse of :func:`rfft2`.
@@ -378,31 +442,35 @@ void init_fft(nb::module_& parent_module) {
                sizes of ``a`` along ``axes``.
             axes (list(int), optional): Axes along which to perform the FFT.
                The default is ``[-2, -1]``.
+            norm (str, optional): One of ``"backward"``, ``"ortho"``, or
+               ``"forward"``. Default is ``"backward"``.
 
         Returns:
             array: The real array containing the inverse of :func:`rfft2`.
       )pbdoc");
   m.def(
       "rfftn",
-      [](const array& a,
-         const std::optional<std::vector<int>>& n,
+      [](const mx::array& a,
+         const std::optional<mx::Shape>& n,
          const std::optional<std::vector<int>>& axes,
-         StreamOrDevice s) {
+         const std::string& norm,
+         mx::StreamOrDevice s) {
+        auto fft_norm = parse_norm(norm, "rfftn");
         if (axes.has_value() && n.has_value()) {
-          return fft::rfftn(a, n.value(), axes.value(), s);
+          return mx::fft::rfftn(a, n.value(), axes.value(), fft_norm, s);
         } else if (axes.has_value()) {
-          return fft::rfftn(a, axes.value(), s);
+          return mx::fft::rfftn(a, axes.value(), fft_norm, s);
         } else if (n.has_value()) {
-          std::vector<int> axes_(n.value().size());
-          std::iota(axes_.begin(), axes_.end(), -n.value().size());
-          return fft::rfftn(a, n.value(), axes_, s);
+          throw std::invalid_argument(
+              "[rfftn] `axes` should not be `None` if `s` is not `None`.");
         } else {
-          return fft::rfftn(a, s);
+          return mx::fft::rfftn(a, fft_norm, s);
         }
       },
       "a"_a,
       "s"_a = nb::none(),
       "axes"_a = nb::none(),
+      "norm"_a = "backward",
       "stream"_a = nb::none(),
       R"pbdoc(
         n-dimensional real discrete Fourier Transform.
@@ -421,31 +489,36 @@ void init_fft(nb::module_& parent_module) {
             axes (list(int), optional): Axes along which to perform the FFT.
                The default is ``None`` in which case the FFT is over the last
                ``len(s)`` axes or all axes if ``s`` is also ``None``.
+            norm (str, optional): One of ``"backward"``, ``"ortho"``, or
+               ``"forward"``. Default is ``"backward"``.
 
         Returns:
             array: The real DFT of the input along the given axes. The output
+            data type will be complex.
       )pbdoc");
   m.def(
       "irfftn",
-      [](const array& a,
-         const std::optional<std::vector<int>>& n,
+      [](const mx::array& a,
+         const std::optional<mx::Shape>& n,
          const std::optional<std::vector<int>>& axes,
-         StreamOrDevice s) {
+         const std::string& norm,
+         mx::StreamOrDevice s) {
+        auto fft_norm = parse_norm(norm, "irfftn");
         if (axes.has_value() && n.has_value()) {
-          return fft::irfftn(a, n.value(), axes.value(), s);
+          return mx::fft::irfftn(a, n.value(), axes.value(), fft_norm, s);
         } else if (axes.has_value()) {
-          return fft::irfftn(a, axes.value(), s);
+          return mx::fft::irfftn(a, axes.value(), fft_norm, s);
         } else if (n.has_value()) {
-          std::vector<int> axes_(n.value().size());
-          std::iota(axes_.begin(), axes_.end(), -n.value().size());
-          return fft::irfftn(a, n.value(), axes_, s);
+          throw std::invalid_argument(
+              "[irfftn] `axes` should not be `None` if `s` is not `None`.");
         } else {
-          return fft::irfftn(a, s);
+          return mx::fft::irfftn(a, fft_norm, s);
         }
       },
       "a"_a,
       "s"_a = nb::none(),
       "axes"_a = nb::none(),
+      "norm"_a = "backward",
       "stream"_a = nb::none(),
       R"pbdoc(
         The inverse of :func:`rfftn`.
@@ -464,8 +537,101 @@ void init_fft(nb::module_& parent_module) {
             axes (list(int), optional): Axes along which to perform the FFT.
                The default is ``None`` in which case the FFT is over the last
                ``len(s)`` axes or all axes if ``s`` is also ``None``.
+            norm (str, optional): One of ``"backward"``, ``"ortho"``, or
+               ``"forward"``. Default is ``"backward"``.
 
         Returns:
             array: The real array containing the inverse of :func:`rfftn`.
+      )pbdoc");
+  m.def(
+      "fftfreq",
+      [](int n, double d, mx::StreamOrDevice s) {
+        return mx::fft::fftfreq(n, d, s);
+      },
+      "n"_a,
+      "d"_a = 1.0,
+      "stream"_a = nb::none(),
+      R"pbdoc(
+        Return the discrete Fourier Transform sample frequencies.
+
+        Args:
+            n (int): Window length.
+            d (float, optional): Sample spacing. The default is ``1.0``.
+
+        Returns:
+            array: The sample frequencies as a one-dimensional array of type ``float32``.
+      )pbdoc");
+  m.def(
+      "rfftfreq",
+      [](int n, double d, mx::StreamOrDevice s) {
+        return mx::fft::rfftfreq(n, d, s);
+      },
+      "n"_a,
+      "d"_a = 1.0,
+      "stream"_a = nb::none(),
+      R"pbdoc(
+        Return the discrete Fourier Transform sample frequencies
+        for use with :func:`rfft` and :func:`irfft`.
+
+        The returned array contains the non-negative frequency terms
+        in the range ``[0, floor(n/2)]``.
+
+        Args:
+            n (int): Window length.
+            d (float, optional): Sample spacing. The default is ``1.0``.
+
+        Returns:
+            array: The sample frequencies as a one-dimensional array of type ``float32``.
+      )pbdoc");
+  m.def(
+      "fftshift",
+      [](const mx::array& a, const IntOrVec& axes, mx::StreamOrDevice s) {
+        if (std::holds_alternative<std::monostate>(axes)) {
+          return mx::fft::fftshift(a, s);
+        } else if (auto pv = std::get_if<int>(&axes); pv) {
+          return mx::fft::fftshift(a, {*pv}, s);
+        } else {
+          return mx::fft::fftshift(a, std::get<std::vector<int>>(axes), s);
+        }
+      },
+      "a"_a,
+      "axes"_a = nb::none(),
+      "stream"_a = nb::none(),
+      R"pbdoc(
+        Shift the zero-frequency component to the center of the spectrum.
+
+        Args:
+            a (array): The input array.
+            axes (int or list(int), optional): Axis or axes over which to perform the shift.
+               If ``None``, shift all axes. 
+
+        Returns:
+            array: The shifted array with the same shape as the input.
+      )pbdoc");
+  m.def(
+      "ifftshift",
+      [](const mx::array& a, const IntOrVec& axes, mx::StreamOrDevice s) {
+        if (std::holds_alternative<std::monostate>(axes)) {
+          return mx::fft::ifftshift(a, s);
+        } else if (auto pv = std::get_if<int>(&axes); pv) {
+          return mx::fft::ifftshift(a, {*pv}, s);
+        } else {
+          return mx::fft::ifftshift(a, std::get<std::vector<int>>(axes), s);
+        }
+      },
+      "a"_a,
+      "axes"_a = nb::none(),
+      "stream"_a = nb::none(),
+      R"pbdoc(
+        The inverse of :func:`fftshift`. While identical to :func:`fftshift` for even-length axes,
+        the behavior differs for odd-length axes.
+
+        Args:
+            a (array): The input array.
+            axes (int or list(int), optional): Axis or axes over which to perform the inverse shift.
+               If ``None``, shift all axes. 
+
+        Returns:
+            array: The inverse-shifted array with the same shape as the input.
       )pbdoc");
 }

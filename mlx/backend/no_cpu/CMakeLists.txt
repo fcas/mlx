@@ -1,9 +1,7 @@
 target_sources(
   mlx
-  PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/load.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/primitives.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/common.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/compiled.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/compiled_nocpu.cpp
-)
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device_info.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/primitives.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/../cpu/eval.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/../cpu/encoder.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/compiled.cpp)

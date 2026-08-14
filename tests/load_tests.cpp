@@ -1,6 +1,7 @@
 // Copyright © 2023 Apple Inc.
 
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <vector>
 
@@ -11,7 +12,7 @@
 using namespace mlx::core;
 
 std::string get_temp_file(const std::string& name) {
-  return std::filesystem::temp_directory_path().append(name);
+  return std::filesystem::temp_directory_path().append(name).string();
 }
 
 TEST_CASE("test save_safetensors") {
@@ -32,12 +33,85 @@ TEST_CASE("test save_safetensors") {
   CHECK_EQ(dict.count("test2"), 1);
   array test = dict.at("test");
   CHECK_EQ(test.dtype(), float32);
-  CHECK_EQ(test.shape(), std::vector<int>({4}));
+  CHECK_EQ(test.shape(), Shape{4});
   CHECK(array_equal(test, array({1.0, 2.0, 3.0, 4.0})).item<bool>());
   array test2 = dict.at("test2");
   CHECK_EQ(test2.dtype(), float32);
-  CHECK_EQ(test2.shape(), std::vector<int>({2, 2}));
+  CHECK_EQ(test2.shape(), Shape{2, 2});
   CHECK(array_equal(test2, ones({2, 2})).item<bool>());
+}
+
+// Helper to write a raw safetensors file from a JSON header and data buffer
+void write_raw_safetensors(
+    const std::string& path,
+    const std::string& json_header,
+    const std::vector<char>& data) {
+  std::ofstream out(path, std::ios::binary);
+  uint64_t header_len = json_header.size();
+  out.write(reinterpret_cast<const char*>(&header_len), 8);
+  out.write(json_header.data(), json_header.size());
+  out.write(data.data(), data.size());
+}
+
+TEST_CASE("test safetensors file boundary validation") {
+  // Test that loading a safetensors file where data_offsets extend beyond the
+  // actual file size throws an error instead of reading out-of-bounds memory.
+
+  SUBCASE("data_offsets beyond file boundary") {
+    std::string file_path = get_temp_file("test_oob_safetensors.safetensors");
+
+    // Create a header claiming a 4MB tensor but only provide 4 bytes of data
+    std::string json_header =
+        R"({"tensor":{"dtype":"F32","shape":[1000,1000],"data_offsets":[0,4000000]}})";
+    std::vector<char> data(4, 0); // Only 4 bytes of actual data
+
+    write_raw_safetensors(file_path, json_header, data);
+    CHECK_THROWS_AS(load_safetensors(file_path), std::runtime_error);
+  }
+
+  SUBCASE("data_offsets begin > end") {
+    std::string file_path = get_temp_file("test_reversed_offsets.safetensors");
+
+    std::string json_header =
+        R"({"tensor":{"dtype":"F32","shape":[1],"data_offsets":[100,0]}})";
+    std::vector<char> data(200, 0);
+
+    write_raw_safetensors(file_path, json_header, data);
+    CHECK_THROWS_AS(load_safetensors(file_path), std::runtime_error);
+  }
+
+  SUBCASE("valid file still loads correctly") {
+    std::string file_path = get_temp_file("test_valid_safetensors.safetensors");
+    auto map = std::unordered_map<std::string, array>();
+    map.insert({"test", array({1.0, 2.0, 3.0, 4.0})});
+    save_safetensors(file_path, map);
+    auto [dict, metadata] = load_safetensors(file_path);
+
+    CHECK_EQ(dict.size(), 1);
+    CHECK_EQ(dict.count("test"), 1);
+    array test = dict.at("test");
+    CHECK(array_equal(test, array({1.0, 2.0, 3.0, 4.0})).item<bool>());
+  }
+
+  SUBCASE("mismatched data_offsets") {
+    std::string file_path = get_temp_file("test_bad_offsets.safetensors");
+    std::string json_header =
+        R"({"t":{"dtype":"F32","shape":[10,10],"data_offsets":[0,4]}})";
+    std::vector<char> data(400, 0);
+
+    write_raw_safetensors(file_path, json_header, data);
+    CHECK_THROWS_AS(load_safetensors(file_path), std::runtime_error);
+  }
+
+  SUBCASE("bad data_offsets count") {
+    std::string file_path = get_temp_file("test_bad_offsets_count.safetensors");
+    std::string json_header =
+        R"({"t":{"dtype":"F32","shape":[1],"data_offsets":[0,4,8]}})";
+    std::vector<char> data(4, 0);
+
+    write_raw_safetensors(file_path, json_header, data);
+    CHECK_THROWS_AS(load_safetensors(file_path), std::runtime_error);
+  }
 }
 
 TEST_CASE("test gguf") {
@@ -94,6 +168,95 @@ TEST_CASE("test gguf") {
   }
 }
 
+// Writes a one-tensor GGUF (name "t", ndim 1, dim 4, type F32) whose tensor
+// data offset field is set verbatim to `tensor_data_offset`. Writes
+// `data_bytes` bytes of tensor data, defaulting to the full four floats.
+void write_raw_gguf(
+    const std::string& path,
+    uint64_t tensor_data_offset,
+    size_t data_bytes = 4 * sizeof(float)) {
+  std::ofstream out(path, std::ios::binary);
+  auto u32 = [&out](uint32_t v) {
+    out.write(reinterpret_cast<const char*>(&v), 4);
+  };
+  auto u64 = [&out](uint64_t v) {
+    out.write(reinterpret_cast<const char*>(&v), 8);
+  };
+  out.write("GGUF", 4);
+  u32(3); // version
+  u64(1); // tensor_count
+  u64(0); // metadata_kv_count
+  u64(1); // tensor name length
+  out.write("t", 1);
+  u32(1); // ndim
+  u64(4); // dim[0]
+  u32(0); // GGUF_TYPE_F32
+  u64(tensor_data_offset);
+  while (out.tellp() % 32 != 0) { // default GGUF alignment
+    out.put(0);
+  }
+  std::vector<char> data(data_bytes, 0);
+  out.write(data.data(), data.size());
+}
+
+TEST_CASE("test gguf tensor data offset validation") {
+  // A crafted tensor data offset must be rejected rather than turned into a
+  // pointer outside the mapping. See ml-explore/mlx#4136.
+  SUBCASE("valid offset loads") {
+    std::string file_path = get_temp_file("test_gguf_offset_ok.gguf");
+    write_raw_gguf(file_path, 0);
+    auto [weights, metadata] = load_gguf(file_path);
+    CHECK_EQ(weights.size(), 1);
+    CHECK(array_equal(weights.at("t"), zeros({4}, float32)).item<bool>());
+  }
+
+  SUBCASE("offset past the end of the file") {
+    std::string file_path = get_temp_file("test_gguf_offset_past_end.gguf");
+    write_raw_gguf(file_path, 1ull << 20);
+    CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
+  }
+
+  SUBCASE("offset far past the end of the file") {
+    std::string file_path = get_temp_file("test_gguf_offset_far_past.gguf");
+    write_raw_gguf(file_path, 1ull << 40);
+    CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
+  }
+
+  SUBCASE("offset that overflows the data section base") {
+    // Wraps back to an in-mapping address, so an end-pointer-only check would
+    // silently read the wrong bytes instead of reading out of bounds.
+    std::string file_path = get_temp_file("test_gguf_offset_wrap.gguf");
+    write_raw_gguf(file_path, ~0ull - 8);
+    CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
+  }
+
+  SUBCASE("tensor extends past the end of the file") {
+    // In-range offset, but the data is truncated: only the extent check
+    // catches this.
+    std::string file_path = get_temp_file("test_gguf_truncated.gguf");
+    write_raw_gguf(file_path, 0, 4 * sizeof(float) - 1);
+    CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
+  }
+
+  SUBCASE("tensor starts inside the file but ends past it") {
+    // A small offset, so the start is in range and only the extent decides.
+    // Pins the extent check to the tensor's own start rather than to the
+    // start of the data section.
+    std::string file_path = get_temp_file("test_gguf_partial_overrun.gguf");
+    write_raw_gguf(file_path, 8);
+    CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
+  }
+
+  SUBCASE("offset just past the end of the file") {
+    // Only a few bytes past the end rather than far outside it, so the
+    // resulting pointer is still in the mapped page and reads succeed
+    // silently. Pins the offset bound to the file size exactly.
+    std::string file_path = get_temp_file("test_gguf_offset_just_past.gguf");
+    write_raw_gguf(file_path, 20);
+    CHECK_THROWS_AS(load_gguf(file_path), std::runtime_error);
+  }
+}
+
 TEST_CASE("test gguf metadata") {
   std::string file_path = get_temp_file("test_arr.gguf");
   using dict = std::unordered_map<std::string, array>;
@@ -140,6 +303,17 @@ TEST_CASE("test gguf metadata") {
 
     loaded_arr = std::get<array>(loaded_metadata.at("test_arr"));
     CHECK(array_equal(arr, loaded_arr).item<bool>());
+  }
+
+  // 1D int64 array with negative values
+  {
+    std::unordered_map<std::string, GGUFMetaData> original_metadata;
+    auto arr = array({static_cast<int64_t>(-1)}, int64);
+    original_metadata.insert({"test_arr", arr});
+    save_gguf(file_path, original_weights, original_metadata);
+    auto [loaded_weights, loaded_metadata] = load_gguf(file_path);
+    CHECK(array_equal(arr, std::get<array>(loaded_metadata.at("test_arr")))
+              .item<bool>());
   }
 
   // > 1D array throws

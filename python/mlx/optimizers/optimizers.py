@@ -1,10 +1,10 @@
 # Copyright © 2023-2024 Apple Inc.
 
-import math
 from typing import Callable, List, Optional, Tuple, Union
 
 import mlx.core as mx
-from mlx.utils import tree_map, tree_reduce
+from mlx.nn import Module
+from mlx.utils import tree_flatten, tree_map, tree_merge, tree_reduce, tree_unflatten
 
 
 class Optimizer:
@@ -17,7 +17,7 @@ class Optimizer:
         self._state = {"step": mx.array(0, mx.uint64)}
         self._schedulers = {k: v for k, v in (schedulers or {}).items()}
 
-    def update(self, model: "mlx.nn.Module", gradients: dict):
+    def update(self, model: Module, gradients: dict):
         """Apply the gradients to the parameters of the model and update the
         model with the new parameters.
 
@@ -39,7 +39,7 @@ class Optimizer:
         :meth:`Optimizer.update`.
 
         Args:
-            model (dict): A Python tree of parameters.
+            parameters (dict): A Python tree of parameters.
 
         Example:
             >>> optimizer = optim.SGD(learning_rate=1e-1, momentum=0.9)
@@ -48,8 +48,28 @@ class Optimizer:
             >>> optimizer.state.keys()
             dict_keys(['step', 'learning_rate', 'weight', 'bias'])
         """
-        self._state.update(tree_map(lambda x: {}, parameters))
-        tree_map(self.init_single, parameters, self._state)
+
+        # Initialize the optimizer state to match the parameter state
+        def update_state(params, state):
+            if isinstance(params, (list, tuple)):
+                state = list(state)
+                for i in range(len(state)):
+                    state[i] = update_state(params[i], state[i])
+                if len(state) != len(params):
+                    state.extend(tree_map(lambda _: {}, params[len(state) :]))
+                return type(params)(state)
+            elif isinstance(params, dict):
+                for k, v in params.items():
+                    if k not in state:
+                        state[k] = tree_map(lambda _: {}, v)
+                    else:
+                        state[k] = update_state(v, state[k])
+                return state
+            else:
+                return state
+
+        update_state(parameters, self._state)
+        tree_map(lambda p, s: s or self.init_single(p, s), parameters, self._state)
         self._initialized = True
 
     def init_single(self, parameter: mx.array, state: dict):
@@ -57,7 +77,8 @@ class Optimizer:
         state initialization.
 
         Args:
-            parameter (mx.array): A single parameter that will be optimized.
+            parameter (array): A single parameter that will be optimized.
+            state (dict): The optimizer's state.
         """
         raise NotImplementedError()
 
@@ -91,8 +112,8 @@ class Optimizer:
         """To be extended by derived classes to implement the optimizer's update.
 
         Args:
-            gradient (mx.array): The ``parameter`` gradient.
-            parameter (mx.array): The ``parameter`` to update.
+            gradient (array): The ``parameter`` gradient.
+            parameter (array): The ``parameter`` to update.
             state (dict): The optimizer's state.
         """
         raise NotImplementedError()
@@ -104,6 +125,7 @@ class Optimizer:
 
     @state.setter
     def state(self, state: dict):
+        self._initialized = False
         self._state = state
 
     @property
@@ -126,10 +148,83 @@ class Optimizer:
         """
         if isinstance(param, Callable):
             self._schedulers[name] = param
-            param = param(self.step)
+            parameter = param(self.step)
         else:
-            param = mx.array(param)
-        self.state[name] = param
+            parameter = mx.array(param)
+        self.state[name] = parameter
+
+
+class MultiOptimizer(Optimizer):
+    """Wraps a list of optimizers with corresponding weight predicates/filters
+    to make it easy to use different optimizers for different weights.
+
+    The predicates take the full "path" of the weight and the weight itself and
+    return True if it should be considered for this optimizer. The last
+    optimizer in the list is a fallback optimizer and no predicate should be
+    given for it.
+
+    Args:
+        optimizers (list[Optimizer]): A list of optimizers to delegate to
+        filters (list[Callable[[str, array], bool]]): A list of predicates that
+            should be one less than the provided optimizers.
+    """
+
+    def __init__(self, optimizers, filters: list = []):
+        super().__init__()
+        self._state = {}
+
+        if len(filters) != len(optimizers) - 1:
+            raise ValueError(
+                f"Given {len(filters)} filters but {len(optimizers)-1} needed."
+            )
+
+        self.optimizers = optimizers
+        self.filters = filters + [lambda *args, **kwargs: True]
+
+    def _split_dictionary(self, gradients: dict):
+        if len(self.optimizers) == 1:
+            return [gradients]
+
+        parts = [[] for _ in range(len(self.optimizers))]
+        flat_gradients = tree_flatten(gradients)
+        for k, g in flat_gradients:
+            for i, fn in enumerate(self.filters):
+                if fn(k, g):
+                    parts[i].append((k, g))
+                    break
+
+        return [tree_unflatten(p) for p in parts]
+
+    def init(self, parameters: dict):
+        for o, p in zip(self.optimizers, self._split_dictionary(parameters)):
+            o.init(p)
+
+    def apply_gradients(self, gradients: dict, parameters: dict):
+        tree = {}
+        for o, g in zip(self.optimizers, self._split_dictionary(gradients)):
+            tree = tree_merge(tree, o.apply_gradients(g, parameters))
+        return tree
+
+    @property
+    def state(self):
+        return {"states": [o.state for o in self.optimizers]}
+
+    @state.setter
+    def state(self, state: dict):
+        if "states" not in state or len(state["states"]) != len(self.optimizers):
+            raise ValueError("Invalid state provided")
+
+        for o, s in zip(self.optimizers, state["states"]):
+            o.state = s
+
+    @property
+    def learning_rate(self):
+        return self.optimizers[0].learning_rate
+
+    @learning_rate.setter
+    def learning_rate(self, learning_rate: Union[float, mx.array]):
+        for o in self.optimizers:
+            o.learning_rate = learning_rate
 
 
 class SGD(Optimizer):
@@ -233,7 +328,7 @@ class RMSprop(Optimizer):
             raise ValueError(
                 f"RMSprop alpha should be >=0, {self.alpha} was provided instead"
             )
-        if self.eps < 0.0:
+        if self.eps <= 0.0:
             raise ValueError(
                 f"RMSprop epsilon should be >0, {self.eps} was provided instead"
             )
@@ -284,7 +379,7 @@ class Adagrad(Optimizer):
         self._maybe_schedule("learning_rate", learning_rate)
         self.eps = eps
 
-        if self.eps < 0.0:
+        if self.eps <= 0.0:
             raise ValueError(
                 f"Adagrad epsilon should be >0, {self.eps} was provided instead"
             )
@@ -324,7 +419,7 @@ class AdaDelta(Optimizer):
         rho (float, optional): The coefficient :math:`\rho` used for computing a
             running average of squared gradients. Default: ``0.9``
         eps (float, optional): The term :math:`\epsilon` added to the denominator to improve
-          numerical stability. Default: `1e-8`
+          numerical stability. Default: ``1e-6``
     """
 
     def __init__(
@@ -342,7 +437,7 @@ class AdaDelta(Optimizer):
             raise ValueError(
                 f"AdaDelta rho should be >=0, {self.rho} was provided instead"
             )
-        if self.eps < 0.0:
+        if self.eps <= 0.0:
             raise ValueError(
                 f"AdaDelta epsilon should be >0, {self.eps} was provided instead"
             )
@@ -373,10 +468,7 @@ class AdaDelta(Optimizer):
 
 
 class Adam(Optimizer):
-    r"""The Adam optimizer [1].
-
-    Our Adam implementation follows the original paper and omits the bias
-    correction in the first and second moment estimates. In detail,
+    r"""The Adam optimizer [1]. In detail,
 
     [1]: Kingma, D.P. and Ba, J., 2015. Adam: A method for stochastic
     optimization. ICLR 2015.
@@ -385,7 +477,7 @@ class Adam(Optimizer):
 
         m_{t+1} &= \beta_1 m_t + (1 - \beta_1) g_t \\
         v_{t+1} &= \beta_2 v_t + (1 - \beta_2) g_t^2 \\
-        w_{t+1} &= w_t - \lambda \frac{m_{t+1}}{\sqrt{v_{t+1} + \epsilon}}
+        w_{t+1} &= w_t - \lambda \frac{m_{t+1}}{\sqrt{v_{t+1}} + \epsilon}
 
     Args:
         learning_rate (float or callable): The learning rate :math:`\lambda`.
@@ -394,6 +486,8 @@ class Adam(Optimizer):
           gradient and its square. Default: ``(0.9, 0.999)``
         eps (float, optional): The term :math:`\epsilon` added to the
           denominator to improve numerical stability. Default: ``1e-8``
+        bias_correction (bool, optional): If set to ``True``, bias correction
+          is applied. Default: ``False``
     """
 
     def __init__(
@@ -401,12 +495,14 @@ class Adam(Optimizer):
         learning_rate: Union[float, Callable[[mx.array], mx.array]],
         betas: List[float] = [0.9, 0.999],
         eps: float = 1e-8,
+        bias_correction: bool = False,
     ):
         super().__init__()
 
         self._maybe_schedule("learning_rate", learning_rate)
         self.betas = betas
         self.eps = eps
+        self.bias_correction = bias_correction
 
     def init_single(self, parameter: mx.array, state: dict):
         """Initialize optimizer state"""
@@ -419,6 +515,8 @@ class Adam(Optimizer):
         lr = self.learning_rate.astype(gradient.dtype)
         b1, b2 = self.betas
         eps = self.eps
+        bias_correction = self.bias_correction
+        step = self.step
 
         m = state["m"]
         v = state["v"]
@@ -427,15 +525,19 @@ class Adam(Optimizer):
         state["m"] = m
         state["v"] = v
 
-        return parameter - lr * m / (mx.sqrt(v) + eps)
+        if bias_correction:
+            c1 = (lr / (1 - b1**step)).astype(gradient.dtype)
+            c2 = mx.rsqrt(1 - b2**step).astype(gradient.dtype)
+            numerator = c1 * m
+            denominator = mx.sqrt(v) * c2 + eps
+            return parameter - numerator / denominator
+        else:
+            return parameter - lr * m / (mx.sqrt(v) + eps)
 
 
 class AdamW(Adam):
-    r"""The AdamW optimizer [1].
-
-    Following the above convention, in contrast with [1], we do not use bias
-    correction in the first and second moments for AdamW. We update the weights
-    with a weight_decay (:math:`\lambda`) value:
+    r"""The AdamW optimizer [1]. We update the weights with a weight_decay
+    (:math:`\lambda`) value:
 
     [1]: Loshchilov, I. and Hutter, F., 2019. Decoupled weight decay
     regularization. ICLR 2019.
@@ -444,7 +546,7 @@ class AdamW(Adam):
 
         m_{t+1} &= \beta_1 m_t + (1 - \beta_1) g_t \\
         v_{t+1} &= \beta_2 v_t + (1 - \beta_2) g_t^2 \\
-        w_{t+1} &= w_t - \alpha (\frac{m_{t+1}}{\sqrt{v_{t+1} + \epsilon}} + \lambda w_t)
+        w_{t+1} &= w_t - \alpha (\frac{m_{t+1}}{\sqrt{v_{t+1}} + \epsilon} + \lambda w_t)
 
     Args:
         learning_rate (float or callable): The learning rate :math:`\alpha`.
@@ -454,7 +556,9 @@ class AdamW(Adam):
         eps (float, optional): The term :math:`\epsilon` added to the
           denominator to improve numerical stability. Default: ``1e-8``
         weight_decay (float, optional): The weight decay :math:`\lambda`.
-          Default: ``0``.
+          Default: ``0.01``.
+        bias_correction (bool, optional): If set to ``True``, bias correction
+          is applied. Default: ``False``
     """
 
     def __init__(
@@ -463,8 +567,14 @@ class AdamW(Adam):
         betas: List[float] = [0.9, 0.999],
         eps: float = 1e-8,
         weight_decay: float = 0.01,
+        bias_correction: bool = False,
     ):
-        super().__init__(learning_rate=learning_rate, betas=betas, eps=eps)
+        super().__init__(
+            learning_rate=learning_rate,
+            betas=betas,
+            eps=eps,
+            bias_correction=bias_correction,
+        )
         self.weight_decay = weight_decay
 
     def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
@@ -496,8 +606,9 @@ class Adamax(Adam):
     Args:
         learning_rate (float or callable): The learning rate :math:`\lambda`.
         betas (Tuple[float, float], optional): The coefficients
-          :math:`(\beta_1, \beta_2)` used for computing running averages of the
-          gradient and its square. Default: ``(0.9, 0.999)``
+          :math:`(\beta_1, \beta_2)` used for computing the running average of
+          the gradient and the exponentially weighted infinity norm.
+          Default: ``(0.9, 0.999)``
         eps (float, optional): The term :math:`\epsilon` added to the
           denominator to improve numerical stability. Default: ``1e-8``
     """
@@ -687,9 +798,7 @@ class Adafactor(Optimizer):
             exp_avg_sq_row / mx.mean(exp_avg_sq_row, axis=-1, keepdims=True)
         )
         c_factor = mx.rsqrt(exp_avg_sq_col)
-        return mx.matmul(
-            mx.expand_dims(r_factor, axis=-1), mx.expand_dims(c_factor, axis=0)
-        )
+        return mx.expand_dims(r_factor, axis=-1) * mx.expand_dims(c_factor, axis=-2)
 
     def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
         """Performs the Adafactor parameter and state update."""
@@ -738,6 +847,106 @@ class Adafactor(Optimizer):
         return parameter - update
 
 
+class Muon(Optimizer):
+    r"""The Muon optimizer.
+
+    Our Muon (MomentUm Orthogonalized by Newton-schulz) optimizer follows the
+    original implementation: `Muon: An optimizer for hidden layers in neural
+    networks <https://kellerjordan.github.io/posts/muon/>`_
+
+    Note:
+        - Muon may be sub-optimal for the embedding layer, the final fully
+          connected layer, or any 0D/1D parameters. Those should be optimized
+          by a different method (e.g., :class:`AdamW`).
+        - For 4D convolutional filters, it works by flattening their last
+          dimensions.
+
+    Args:
+        learning_rate (float or callable): The learning rate.
+        momentum (float, optional): The momentum strength. Default: ``0.95``
+        weight_decay (float, optional): The weight decay (L2 penalty).
+            Default: ``0.01``
+        nesterov (bool, optional): Enables Nesterov momentum. Recommended for
+            better performance.  Default: ``True``
+        ns_steps (int, optional): Number of Newton-Schulz iteration steps for
+            orthogonalization.  Default: ``5``
+    """
+
+    def __init__(
+        self,
+        learning_rate: Union[float, Callable[[mx.array], mx.array]],
+        momentum: float = 0.95,
+        weight_decay: float = 0.01,
+        nesterov: bool = True,
+        ns_steps: int = 5,
+    ):
+        super().__init__()
+
+        self._maybe_schedule("learning_rate", learning_rate)
+        self.momentum = momentum
+        self.weight_decay = weight_decay
+        self.nesterov = nesterov
+        self.ns_steps = ns_steps
+
+    def init_single(self, parameter: mx.array, state: dict):
+        """Initialize optimizer state"""
+        state["v"] = mx.zeros_like(parameter)
+
+    def _zeropower_via_newtonschulz5(self, X, steps: int):
+        assert (
+            X.ndim == 2
+        ), f"Expected a 2D array for Newton-Schulz iteration, got shape {X.shape} instead."
+        a, b, c = (3.4445, -4.7750, 2.0315)
+        transpose_needed = X.shape[-2] > X.shape[-1]
+
+        if transpose_needed:
+            X = X.T
+
+        X = X / (mx.linalg.norm(X, keepdims=True) + 1e-7)
+
+        for _ in range(steps):
+            A = X @ X.T
+            B = mx.addmm(b * A, A, A, beta=1.0, alpha=c)
+            X = mx.addmm(a * X, B, X, beta=1.0, alpha=1.0)
+
+        if transpose_needed:
+            X = X.T
+        return X
+
+    def apply_single(self, gradient: mx.array, parameter: mx.array, state: dict):
+        """Performs the Muon parameter update"""
+
+        if self.weight_decay != 0:
+            gradient = gradient + self.weight_decay * parameter
+
+        v = self.momentum * state["v"]
+        v = v + (1 - self.momentum) * gradient
+        state["v"] = v
+
+        if self.nesterov:
+            update = gradient * (1 - self.momentum) + v * self.momentum
+        else:
+            update = v
+
+        lr = self.learning_rate.astype(gradient.dtype)
+
+        if update.ndim >= 2:
+            original_shape = update.shape
+            reshape_needed = update.ndim > 2
+
+            if reshape_needed:
+                update = mx.reshape(update, (update.shape[0], -1))
+
+            update = self._zeropower_via_newtonschulz5(update, steps=self.ns_steps)
+
+            if reshape_needed:
+                update = mx.reshape(update, original_shape)
+
+            lr *= max(1, update.shape[-2] / update.shape[-1]) ** 0.5
+
+        return parameter - lr * update
+
+
 def clip_grad_norm(grads, max_norm):
     """Clips the global norm of the gradients.
 
@@ -759,12 +968,11 @@ def clip_grad_norm(grads, max_norm):
         (dict, float): The possibly rescaled gradients and the original
         gradient norm.
     """
+    if max_norm < 0:
+        raise ValueError(f"max_norm should be >=0, {max_norm} was provided instead")
+
     norm_squared = tree_reduce(lambda acc, g: acc + g.square().sum(), grads, 0.0)
     total_norm = mx.sqrt(norm_squared)
-    normalizer = max_norm / (total_norm + 1e-6)
-
-    def clipper(g):
-        return mx.where(total_norm < max_norm, g, g * normalizer)
-
-    clipped_grads = tree_map(clipper, grads)
+    normalizer = mx.minimum(max_norm / (total_norm + 1e-6), 1.0)
+    clipped_grads = tree_map(lambda g: g * normalizer, grads)
     return clipped_grads, total_norm

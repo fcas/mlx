@@ -12,7 +12,7 @@ class Dropout(Module):
     expected value of a given element will remain the same.
 
     Args:
-        p (float): The probability to zero an element
+        p (float): The probability to zero an element. Default: ``0.5``.
     """
 
     def __init__(self, p: float = 0.5):
@@ -23,16 +23,16 @@ class Dropout(Module):
 
         self._p_1 = 1 - p
 
-    def _extra_repr(self):
+    def _extra_repr(self) -> str:
         return f"p={1-self._p_1}"
 
-    def __call__(self, x):
+    def __call__(self, x: mx.array) -> mx.array:
         if self._p_1 == 1 or not self.training:
             return x
 
         mask = mx.random.bernoulli(self._p_1, x.shape)
 
-        return (1 / self._p_1) * mask * x
+        return (mask * x) * (1 / self._p_1)
 
 
 class Dropout2d(Module):
@@ -40,7 +40,7 @@ class Dropout2d(Module):
 
     Randomly zero out entire channels independently with probability :math:`p`.
     This layer expects the channels to be last, i.e. the input shape should be
-    ``NWHC`` or ``WHC`` where:``N`` is the batch dimension,``H`` is the input
+    ``NHWC`` or ``HWC`` where:``N`` is the batch dimension,``H`` is the input
     image height,``W`` is the input image width, and``C`` is the number of
     input channels
 
@@ -56,6 +56,7 @@ class Dropout2d(Module):
 
     Args:
         p (float): Probability of zeroing a channel during training.
+            Default: ``0.5``.
     """
 
     def __init__(self, p: float = 0.5):
@@ -66,10 +67,10 @@ class Dropout2d(Module):
 
         self._p_1 = 1 - p
 
-    def _extra_repr(self):
+    def _extra_repr(self) -> str:
         return f"p={1-self._p_1}"
 
-    def __call__(self, x):
+    def __call__(self, x: mx.array) -> mx.array:
         if x.ndim not in (3, 4):
             raise ValueError(
                 f"Received input with {x.ndim} dimensions. Expected 3 or 4 dimensions."
@@ -85,7 +86,7 @@ class Dropout2d(Module):
         mask_shape[-2] = mask_shape[-3] = 1
 
         mask = mx.random.bernoulli(p=self._p_1, shape=mask_shape)
-        return (1 / self._p_1) * mask * x
+        return (mask * x) * (1 / self._p_1)
 
 
 class Dropout3d(Module):
@@ -105,6 +106,7 @@ class Dropout3d(Module):
 
     Args:
         p (float): Probability of zeroing a channel during training.
+            Default: ``0.5``.
     """
 
     def __init__(self, p: float = 0.5):
@@ -115,10 +117,10 @@ class Dropout3d(Module):
 
         self._p_1 = 1 - p
 
-    def _extra_repr(self):
+    def _extra_repr(self) -> str:
         return f"p={1-self._p_1}"
 
-    def __call__(self, x):
+    def __call__(self, x: mx.array) -> mx.array:
         if x.ndim not in (4, 5):
             raise ValueError(
                 f"Received input with {x.ndim} dimensions. Expected 4 or 5 dimensions."
@@ -134,4 +136,4 @@ class Dropout3d(Module):
         mask_shape[-2] = mask_shape[-3] = mask_shape[-4] = 1
 
         mask = mx.random.bernoulli(p=self._p_1, shape=mask_shape)
-        return (1 / self._p_1) * mask * x
+        return (mask * x) * (1 / self._p_1)

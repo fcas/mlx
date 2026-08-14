@@ -2,7 +2,6 @@
 
 #pragma once
 
-#include "mlx/array.h"
 #include "mlx/backend/common/utils.h"
 
 namespace mlx::core {
@@ -23,18 +22,29 @@ enum class CopyType {
   GeneralGeneral
 };
 
-void copy(const array& src, array& dst, CopyType ctype);
-void copy_inplace(const array& src, array& dst, CopyType ctype);
-
-template <typename stride_t>
-void copy_inplace(
-    const array& src,
-    array& dst,
-    const std::vector<int>& data_shape,
-    const std::vector<stride_t>& i_strides,
-    const std::vector<stride_t>& o_strides,
-    int64_t i_offset,
-    int64_t o_offset,
-    CopyType ctype);
+inline bool set_copy_output_data(
+    const array& in,
+    array& out,
+    CopyType ctype,
+    std::function<allocator::Buffer(size_t)> mallocfn = allocator::malloc) {
+  if (ctype == CopyType::Vector) {
+    // If the input is donateable, we are doing a vector copy and the types
+    // have the same size, then the input buffer can hold the output.
+    if (is_donatable(in, out)) {
+      out.copy_shared_buffer(in);
+      return true;
+    } else {
+      out.set_data(
+          mallocfn(in.data_size() * out.itemsize()),
+          in.data_size(),
+          in.strides(),
+          in.flags());
+      return false;
+    }
+  } else {
+    out.set_data(mallocfn(out.nbytes()));
+    return false;
+  }
+}
 
 } // namespace mlx::core

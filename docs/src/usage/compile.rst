@@ -33,12 +33,12 @@ Let's start with a simple example:
   # Compile the function
   compiled_fun = mx.compile(fun)
 
-  # Prints: array(2.36788, dtype=float32) 
+  # Prints: array(2.36788, dtype=float32)
   print(compiled_fun(x, y))
 
 The output of both the regular function and the compiled function is the same
 up to numerical precision.
-   
+
 The first time you call a compiled function, MLX will build the compute
 graph, optimize it, and generate and compile code. This can be relatively
 slow. However, MLX will cache compiled functions, so calling a compiled
@@ -96,7 +96,7 @@ element-wise operations:
 
 .. code-block:: python
 
-  def gelu(x):  
+  def gelu(x):
       return x * (1 + mx.erf(x / math.sqrt(2))) / 2
 
 If you use this function with small arrays, it will be overhead bound. If you
@@ -130,18 +130,11 @@ Now make an array, and benchmark both functions:
 .. code-block:: python
 
   x = mx.random.uniform(shape=(32, 1000, 4096))
-  timeit(nn.gelu, x)
-  timeit(mx.compile(nn.gelu), x)
+  timeit(gelu, x)
+  timeit(mx.compile(gelu), x)
 
 On an M1 Max the times are 15.5 and 3.1 milliseconds. The compiled ``gelu`` is
 five times faster.
-
-.. note::
-
-  As of the latest MLX, CPU functions are not fully compiled. Compiling CPU
-  functions can still be helpful, but won't typically result in as large a
-  speedup as compiling operations that run on the GPU.
-
 
 Debugging
 ---------
@@ -162,7 +155,7 @@ contents) inside compiled functions.
 
 For debugging, inspecting arrays can be helpful. One way to do that is to
 globally disable compilation using the :func:`disable_compile` function or
-``MLX_DISABLE_COMPILE`` flag. For example the following is okay even though
+:envvar:`MLX_DISABLE_COMPILE` flag. For example the following is okay even though
 ``fun`` is compiled:
 
 .. code-block:: python
@@ -214,9 +207,9 @@ You have two options to deal with this. The first option is to simply return
       state.append(z)
       return mx.exp(z), state
 
-    _, state = fun(mx.array(1.0), mx.array(2.0))
-    # Prints [array(3, dtype=float32)]
-    print(state)
+   _, state = fun(mx.array(1.0), mx.array(2.0))
+   # Prints [array(3, dtype=float32)]
+   print(state)
 
 In some cases returning updated state can be pretty inconvenient. Hence,
 :func:`compile` has a parameter to capture implicit outputs:
@@ -232,7 +225,7 @@ In some cases returning updated state can be pretty inconvenient. Hence,
   def fun(x, y):
       z = x + y
       state.append(z)
-      return mx.exp(z), state
+      return mx.exp(z)
 
   fun(mx.array(1.0), mx.array(2.0))
   # Prints [array(3, dtype=float32)]
@@ -264,7 +257,26 @@ constants. For example:
 
 In order to have the change of state reflected in the outputs of ``fun`` you
 again have two options. The first option is to simply pass ``state`` as input
-to the function. In some cases this can be pretty inconvenient. Hence,
+to the function.
+
+.. code-block:: python
+
+  state = [mx.array(1.0)]
+
+  @mx.compile
+  def fun(x, state):
+      return x + state[0]
+
+  # Prints array(2, dtype=float32)
+  print(fun(mx.array(1.0), state))
+
+  # Update state
+  state[0] = mx.array(5.0)
+
+  # Prints array(6, dtype=float32)
+  print(fun(mx.array(1.0), state))
+
+In some cases this can be pretty inconvenient. Hence,
 :func:`compile` also has a parameter to capture implicit inputs:
 
 .. code-block:: python
@@ -287,7 +299,7 @@ to the function. In some cases this can be pretty inconvenient. Hence,
   print(fun(mx.array(1.0)))
 
 
-Compiling Training Graphs 
+Compiling Training Graphs
 -------------------------
 
 This section will step through how to use :func:`compile` with a simple example
@@ -297,7 +309,7 @@ full forward, backward, and update with :func:`compile`.
 
 To start, here is the simple example without any compilation:
 
-.. code-block:: python 
+.. code-block:: python
 
   import mlx.core as mx
   import mlx.nn as nn
@@ -330,7 +342,7 @@ To start, here is the simple example without any compilation:
 To compile the update we can put it all in a function and compile it with the
 appropriate input and output captures. Here's the same example but compiled:
 
-.. code-block:: python 
+.. code-block:: python
 
   import mlx.core as mx
   import mlx.nn as nn
@@ -355,7 +367,7 @@ appropriate input and output captures. Here's the same example but compiled:
 
   # The state that will be captured as input and output
   state = [model.state, optimizer.state]
-      
+
   @partial(mx.compile, inputs=state, outputs=state)
   def step(x, y):
       loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
@@ -410,7 +422,7 @@ Compiling transformed functions works just as expected:
 
    In order to compile as much as possible, a transformation of a compiled
    function will not by default be compiled. To compile the transformed
-   function simply pass it through :func:`compile`. 
+   function simply pass it through :func:`compile`.
 
 You can also compile functions which themselves call compiled functions. A
 good practice is to compile the outer most function to give :func:`compile`
@@ -428,3 +440,77 @@ the most opportunity to optimize the computation graph:
   # Compiling the outer function is good to do as it will likely
   # be faster even though the inner functions are compiled
   fun = mx.compile(outer)
+
+
+
+.. _shapeless_compile:
+
+Shapeless Compilation
+---------------------
+
+When the shape of an input to a compiled function changes, the function is
+recompiled. You can compile a function once and run it on inputs with
+variable shapes by specifying ``shapeless=True`` to :func:`compile`. In this
+case changes to the shapes of the inputs do not cause the function to be
+recompiled.
+
+.. code-block:: python
+
+  def fun(x, y):
+      return mx.abs(x + y)
+
+  compiled_fun = mx.compile(fun, shapeless=True)
+
+  x = mx.array(1.0)
+  y = mx.array(-2.0)
+
+  # First call compiles the function
+  print(compiled_fun(x, y))
+
+  # Second call with different shapes
+  # does not recompile the function
+  x = mx.array([1.0, -6.0])
+  y = mx.array([-2.0, 3.0])
+  print(compiled_fun(x, y))
+
+
+Use shapeless compilations carefully. Since compilation is not triggered when
+shapes change, any graphs which are conditional on the input shapes will not
+work as expected. Shape-dependent computations are common and sometimes subtle
+to detect. For example:
+
+.. code-block:: python
+
+  def fun(x):
+      return x.reshape(x.shape[0] * x.shape[1], -1)
+
+  compiled_fun = mx.compile(fun, shapeless=True)
+
+  x = mx.random.uniform(shape=(2, 3, 4))
+
+  out = compiled_fun(x)
+
+  x = mx.random.uniform(shape=(5, 5, 3))
+
+  # Error, can't reshape (5, 5, 3) to (6, -1)
+  out = compiled_fun(x)
+
+The second call to the ``compiled_fun`` fails because of the call to
+:func:`reshape` which uses the static shape of ``x`` in the first call. We can
+fix this by using :func:`flatten` to avoid hardcoding the shape of ``x``:
+
+.. code-block:: python
+
+  def fun(x):
+      return x.flatten(0, 1)
+
+  compiled_fun = mx.compile(fun, shapeless=True)
+
+  x = mx.random.uniform(shape=(2, 3, 4))
+
+  out = compiled_fun(x)
+
+  x = mx.random.uniform(shape=(5, 5, 3))
+
+  # Ok
+  out = compiled_fun(x)

@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <algorithm>
 #include <cmath>
 #include <sstream>
 
@@ -34,19 +35,24 @@ array key(uint64_t seed) {
 }
 
 array bits(
-    const std::vector<int>& shape,
+    const Shape& shape,
     int width /* 4 */,
     const std::optional<array>& key_ /*= nullopt */,
     StreamOrDevice s /* = {} */) {
+  if (std::any_of(shape.begin(), shape.end(), [](auto i) { return i < 0; })) {
+    throw std::invalid_argument("[bits] Negative dimensions not allowed.");
+  }
+
   auto key = key_ ? *key_ : KeySequence::default_().next();
   if (key.dtype() != uint32) {
     std::ostringstream msg;
-    msg << "Expected key type uint32 but received " << key.dtype() << ".";
+    msg << "[bits] Expected key type uint32 but received " << key.dtype()
+        << ".";
     throw std::invalid_argument(msg.str());
   }
-  if (key.shape() != std::vector<int>{2}) {
+  if (key.shape() != Shape{2}) {
     std::ostringstream msg;
-    msg << "Expected key shape (2) but received " << key.shape() << ".";
+    msg << "[bits] Expected key shape (2) but received " << key.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
 
@@ -91,26 +97,17 @@ T below_one() {
   return f;
 }
 
-// Get the next representable value above -1.0 for half precision
-// floating point types (fp16, bf16)
-template <typename T>
-T above_minus_one() {
-  T f = T(-1.0);
-  uint16_t* m = (uint16_t*)&f;
-  *m -= 1;
-  return f;
-}
-
 array uniform(
     const array& low,
     const array& high,
-    const std::vector<int>& shape,
+    const Shape& shape,
     Dtype dtype /* = float32 */,
     const std::optional<array>& key /*= nullopt */,
     StreamOrDevice s /* = {} */) {
   if (!issubdtype(dtype, floating)) {
     throw std::invalid_argument(
-        "Can only generate uniform numbers with real floating point type.");
+        "[uniform] Can only generate uniform numbers with real "
+        "floating point type.");
   }
 
   auto stream = to_stream(s);
@@ -120,40 +117,36 @@ array uniform(
   auto out_shape = broadcast_shapes(shape, range.shape());
   if (out_shape != shape) {
     std::ostringstream msg;
-    msg << "Cannot generate random values of shape " << shape
+    msg << "[uniform] Cannot generate random values of shape " << shape
         << " from broadcasted shape " << out_shape << ".";
     throw std::invalid_argument(msg.str());
   }
-  // Get random values between [0, nextafter(maxval, 0.0f)] since samples must
+
+  // Get random values between [0, nextafter(1.0, 0.0)] since samples must
   // be in [low, high)
-  auto get_limits = [&dtype]() {
+  auto get_upper = [&dtype]() {
     switch (dtype) {
       case float32:
-        return std::make_pair(
-            array(std::nextafter(1.0f, 0.0f), float32),
-            array(std::numeric_limits<uint32_t>::max(), float32));
+        return array(std::nextafter(1.0f, 0.0f), float32);
       case float16:
-        return std::make_pair(
-            array(below_one<float16_t>(), float16),
-            array(std::numeric_limits<uint16_t>::max(), float32));
+        return array(below_one<float16_t>(), float32);
       case bfloat16:
-        return std::make_pair(
-            array(below_one<bfloat16_t>(), bfloat16),
-            array(std::numeric_limits<uint16_t>::max(), float32));
+        return array(below_one<bfloat16_t>(), float32);
       default:
         throw std::runtime_error("[uniform] Unsupported type.");
     }
   };
 
-  auto [upper, maxval] = get_limits();
-  auto out = bits(shape, size_of(dtype), key, stream);
-  out = astype(divide(out, maxval, stream), dtype, stream);
-  out = minimum(out, upper, stream);
+  auto upper = get_upper();
+  auto maxval = array(std::numeric_limits<uint32_t>::max(), float32);
+  auto out = bits(shape, size_of(float32), key, stream);
+  out = divide(out, maxval, stream);
+  out = astype(minimum(out, upper, stream), dtype, stream);
   return add(multiply(range, out, stream), lo, stream);
 }
 
 array uniform(
-    const std::vector<int>& shape,
+    const Shape& shape,
     Dtype dtype,
     const std::optional<array>& key /*= nullopt */,
     StreamOrDevice s /* = {} */) {
@@ -161,34 +154,55 @@ array uniform(
       array(0.0, dtype), array(1.0, dtype), shape, dtype, key, to_stream(s));
 }
 
-array normal(
-    const std::vector<int>& shape,
-    Dtype dtype,
-    const float loc /* = 0.0 */,
-    const float scale /* = 1.0 */,
-    const std::optional<array>& key /*= nullopt */,
-    StreamOrDevice s /* = {} */) {
+inline array complex_normal(
+    Shape shape,
+    const std::optional<array>& loc,
+    const std::optional<array>& scale,
+    const std::optional<array>& key,
+    StreamOrDevice s) {
   auto stream = to_stream(s);
-  auto get_low = [&dtype]() {
-    switch (dtype) {
-      case float16:
-        return array(above_minus_one<float16_t>(), dtype);
-      case bfloat16:
-        return array(above_minus_one<bfloat16_t>(), dtype);
-      default:
-        return array(std::nextafter(-1.0f, 0.0f), dtype);
-    }
-  };
-  auto low = get_low();
-  auto high = array(1.0f, dtype);
-  auto samples = uniform(low, high, shape, dtype, key, stream);
-  samples =
-      multiply(array(std::sqrt(2.0), dtype), erfinv(samples, stream), stream);
-  if (scale != 1.0) {
-    samples = multiply(array(scale, dtype), samples, stream);
+  auto low = array(std::nextafter(-1.0f, 0.0f), float32);
+  auto high = array(1.0f, float32);
+  shape.push_back(2);
+  auto samples =
+      erfinv(uniform(low, high, shape, float32, key, stream), stream);
+  samples = squeeze(view(samples, complex64, stream), -1, stream);
+  if (scale.has_value()) {
+    samples = multiply(*scale, samples, stream);
   }
-  if (loc != 0.0) {
-    samples = add(array(loc, dtype), samples, stream);
+  if (loc.has_value()) {
+    samples = add(*loc, samples, stream);
+  }
+  return samples;
+}
+
+array normal(
+    const Shape& shape,
+    Dtype dtype,
+    const std::optional<array>& loc,
+    const std::optional<array>& scale,
+    const std::optional<array>& key,
+    StreamOrDevice s /* = {} */) {
+  if (dtype == complex64) {
+    return complex_normal(shape, loc, scale, key, s);
+  } else if (!issubdtype(dtype, floating)) {
+    throw std::invalid_argument(
+        "[normal] Only floating point and complex64 types are supported.");
+  }
+
+  auto stream = to_stream(s);
+  auto low = array(std::nextafter(-1.0f, 0.0f), float32);
+  auto high = array(1.0f, float32);
+  auto samples = uniform(low, high, shape, float32, key, stream);
+  auto applied_scale = array(std::sqrt(2.0), dtype);
+  if (scale.has_value()) {
+    applied_scale =
+        multiply(applied_scale, astype(*scale, dtype, stream), stream);
+  }
+  samples = astype(erfinv(samples, stream), dtype, stream);
+  samples = multiply(applied_scale, samples, stream);
+  if (loc.has_value()) {
+    samples = add(astype(*loc, dtype, stream), samples, stream);
   }
   return samples;
 }
@@ -196,7 +210,7 @@ array normal(
 array multivariate_normal(
     const array& mean,
     const array& cov,
-    const std::vector<int>& shape,
+    const Shape& shape,
     Dtype dtype,
     const std::optional<array>& key /* = nullopt */,
     StreamOrDevice s) {
@@ -218,7 +232,7 @@ array multivariate_normal(
 
   auto n = mean.shape(-1);
 
-  // Check shapes comatibility of mean and cov
+  // Check shapes compatibility of mean and cov
   if (cov.shape(-1) != cov.shape(-2)) {
     throw std::invalid_argument(
         "[multivariate_normal] last two dimensions of cov must be equal.");
@@ -229,12 +243,9 @@ array multivariate_normal(
   }
 
   // Compute output shape
-  std::vector<int> truncated_output_shape;
-
   auto truncated_mean_shape =
-      std::vector<int>(mean.shape().begin(), mean.shape().end() - 1);
-  auto truncated_cov_shape =
-      std::vector<int>(cov.shape().begin(), cov.shape().end() - 2);
+      Shape(mean.shape().begin(), mean.shape().end() - 1);
+  auto truncated_cov_shape = Shape(cov.shape().begin(), cov.shape().end() - 2);
   auto output_shape =
       broadcast_shapes(truncated_cov_shape, truncated_mean_shape);
   output_shape = broadcast_shapes(output_shape, shape);
@@ -242,7 +253,7 @@ array multivariate_normal(
 
   // Compute the square-root of the covariance matrix, using the SVD
   auto covariance = astype(cov, float32, stream);
-  auto SVD = linalg::svd(covariance, stream);
+  auto SVD = linalg::svd(covariance, true, stream);
   auto std = astype(
       matmul(
           multiply(
@@ -264,7 +275,7 @@ array multivariate_normal(
 array randint(
     const array& low,
     const array& high,
-    const std::vector<int>& shape,
+    const Shape& shape,
     Dtype dtype /* = int32 */,
     const std::optional<array>& key /*= nullopt */,
     StreamOrDevice s /* = {} */) {
@@ -273,20 +284,32 @@ array randint(
         "[randint] randint only accepts integer dtypes and bool.");
   }
   auto u = uniform(low, high, shape, float32, key, s);
-  return astype(maximum(u, low, s), dtype, s);
+  // astype truncates decimal parts so -1.7 becomes -1, use floor.
+  auto out = astype(floor(u, s), dtype, s);
+  // low/high may not be representable in float32 so actual range of uniform
+  // may be larger than [low, high) and we have to clamp to [low, high - 1].
+  auto hi = astype(subtract(high, array(1, high.dtype()), s), dtype, s);
+  return maximum(minimum(out, hi, s), astype(low, dtype, s), s);
 }
 
 array bernoulli(
     const array& p,
-    const std::vector<int>& shape,
+    const Shape& shape,
     const std::optional<array>& key /*= nullopt */,
     StreamOrDevice s /* = {} */) {
   if (!issubdtype(p.dtype(), floating)) {
     throw std::invalid_argument(
         "[bernoulli] bernoulli probability `p` must be a float type.");
   }
-  auto res = uniform(shape, p.dtype(), key, s);
-  res = less(res, p, s);
+
+  // Place p on the scale [0, nexthigher(UINT32_MAX)] so that if p >= 1.0 we
+  // get all true and if p <= 0.0 we get all false
+  auto upper = array(
+      std::nextafter(
+          static_cast<float>(std::numeric_limits<uint32_t>::max()),
+          std::numeric_limits<float>::max()),
+      float32);
+  auto res = less(bits(shape, key, s), multiply(p, upper, s), s);
   if (res.shape() != shape) {
     throw std::invalid_argument(
         "[bernoulli] shape of `p` is incompatible with argument `shape`.");
@@ -310,7 +333,7 @@ array bernoulli(
 array truncated_normal(
     const array& lower,
     const array& upper,
-    const std::vector<int>& shape,
+    const Shape& shape,
     Dtype dtype /* = float32 */,
     const std::optional<array>& key /*= nullopt */,
     StreamOrDevice s /* = {} */) {
@@ -345,7 +368,7 @@ array truncated_normal(
 }
 
 array gumbel(
-    const std::vector<int>& shape,
+    const Shape& shape,
     Dtype dtype /* = float32 */,
     const std::optional<array>& key /*= nullopt */,
     StreamOrDevice s /* = {} */) {
@@ -365,12 +388,42 @@ int get_valid_axis(int axis, int ndim) {
   return ax;
 }
 
+// O(N + M) in memory, where the Gumbel-max trick needs O(N * M)
+array categorical_inverse_cdf(
+    const array& logits,
+    const Shape& shape,
+    const std::optional<array>& key,
+    StreamOrDevice s) {
+  auto dtype = promote_types(logits.dtype(), float32);
+  auto x = astype(logits, dtype, s);
+  auto m = max(x, s);
+
+  // exp(x - m) is NaN when m is infinite, where the distribution is uniform
+  // over the maximal entries
+  auto w = where(
+      isinf(m, s),
+      astype(equal(x, m, s), dtype, s),
+      exp(subtract(x, m, s), s),
+      s);
+
+  auto cdf = cumsum(w, 0, /* reverse = */ false, /* inclusive = */ false, s);
+  auto u = multiply(uniform(shape, float32, key, s), sum(w, s), s);
+
+  return subtract(searchsorted(cdf, u, "right", s), array(1u, uint32), s);
+}
+
 array categorical_impl(
     const array& logits,
     int axis,
-    const std::vector<int>& shape,
+    const Shape& shape,
     const std::optional<array>& key /*= nullopt */,
     StreamOrDevice s) {
+  // searchsorted only takes 1D sequence.
+  auto n = logits.shape(axis);
+  if (n > 0 && logits.size() == static_cast<size_t>(n) && !shape.empty()) {
+    return categorical_inverse_cdf(reshape(logits, {n}, s), shape, key, s);
+  }
+
   auto gumbel_shape = shape;
   auto offset = axis + shape.size() - logits.ndim() + 1;
   gumbel_shape.insert(gumbel_shape.begin() + offset, logits.shape(axis));
@@ -381,7 +434,7 @@ array categorical_impl(
 array categorical(
     const array& logits,
     int axis,
-    const std::vector<int>& shape,
+    const Shape& shape,
     const std::optional<array>& key /*= nullopt */,
     StreamOrDevice s /* = {} */) {
   // Validate and normalize axis
@@ -393,7 +446,7 @@ array categorical(
   if (broadcast_shapes(shape, reduced_shape) != shape) {
     std::ostringstream msg;
     msg << "[categorical] Requested shape " << shape
-        << " is not broadcast compatable with reduced logits shape"
+        << " is not broadcast compatible with reduced logits shape"
         << reduced_shape << ".";
     throw std::invalid_argument(msg.str());
   }
@@ -424,6 +477,54 @@ array categorical(
   auto shape = logits.shape();
   shape.erase(shape.begin() + axis);
   return categorical_impl(logits, axis, shape, key, s);
+}
+
+array laplace(
+    const Shape& shape,
+    Dtype dtype,
+    const float loc /* = 0.0 */,
+    const float scale /* = 1.0 */,
+    const std::optional<array>& key /*= nullopt */,
+    StreamOrDevice s /* = {} */) {
+  if (!issubdtype(dtype, floating)) {
+    throw std::invalid_argument(
+        "[laplace] Only real floating point types are supported.");
+  }
+
+  auto stream = to_stream(s);
+  auto low = array(std::nextafter(-1.0f, 0.0f), float32);
+  auto high = array(1.0f, float32);
+  auto samples = uniform(low, high, shape, float32, key, stream);
+  // Use inverse CDF to generate Laplacian noise
+  samples = multiply(
+      sign(samples, stream),
+      log1p(
+          multiply(array(-1.0f, dtype), abs(samples, stream), stream), stream),
+      stream);
+  samples = astype(samples, dtype, stream);
+
+  if (scale != 1.0) {
+    samples = multiply(array(scale, dtype), samples, stream);
+  }
+  if (loc != 0.0) {
+    samples = add(array(loc, dtype), samples, stream);
+  }
+  return samples;
+}
+
+array permutation(
+    const array& x,
+    int axis /* = 0 */,
+    const std::optional<array>& key /* = std::nullopt */,
+    StreamOrDevice s /* = {} */) {
+  return take(x, permutation(x.shape(axis), key, s), axis, s);
+}
+
+array permutation(
+    int x,
+    const std::optional<array>& key /* = std::nullopt */,
+    StreamOrDevice s /* = {} */) {
+  return argsort(bits({x}, key, s), s);
 }
 
 } // namespace mlx::core::random

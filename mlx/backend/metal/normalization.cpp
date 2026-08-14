@@ -1,7 +1,7 @@
 // Copyright © 2024 Apple Inc.
 #include <algorithm>
 
-#include "mlx/backend/metal/copy.h"
+#include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/kernels/defines.h"
 #include "mlx/backend/metal/reduce.h"
@@ -9,6 +9,10 @@
 #include "mlx/fast_primitives.h"
 
 namespace mlx::core::fast {
+
+bool RMSNorm::use_fallback(Stream s) {
+  return s.device == Device::cpu;
+}
 
 void RMSNorm::eval_gpu(
     const std::vector<array>& inputs,
@@ -18,33 +22,32 @@ void RMSNorm::eval_gpu(
   auto& out = outputs[0];
 
   // Make sure that the last dimension is contiguous
-  std::vector<array> copies;
-  auto check_input = [&copies, &s](const array& x) -> const array& {
-    bool no_copy = x.strides()[x.ndim() - 1] == 1;
-    if (x.ndim() > 1) {
+  auto set_output = [&s, &out](const array& x) {
+    bool no_copy = x.flags().contiguous && x.strides()[x.ndim() - 1] == 1;
+    if (no_copy && x.ndim() > 1) {
       auto s = x.strides()[x.ndim() - 2];
-      no_copy &= (s == 0 || s == x.shape().back());
+      no_copy &= (s == 0 || s == x.shape().back() || x.shape(-2) == 1);
     }
     if (no_copy) {
+      if (x.is_donatable()) {
+        out.copy_shared_buffer(x);
+      } else {
+        out.set_data(
+            allocator::malloc(x.data_size() * x.itemsize()),
+            x.data_size(),
+            x.strides(),
+            x.flags());
+      }
       return x;
     } else {
-      copies.push_back(array(x.shape(), x.dtype(), nullptr, {}));
-      copy_gpu(x, copies.back(), CopyType::General, s);
-      return copies.back();
+      array x_copy = contiguous_copy_gpu(x, s);
+      out.copy_shared_buffer(x_copy);
+      return x_copy;
     }
   };
-  const array& x = check_input(inputs[0]);
-  const array& w = inputs[1];
 
-  if (x.is_donatable()) {
-    out.move_shared_buffer(x);
-  } else {
-    out.set_data(
-        allocator::malloc_or_wait(x.data_size() * x.itemsize()),
-        x.data_size(),
-        x.strides(),
-        x.flags());
-  }
+  const array x = set_output(inputs[0]);
+  const array& w = inputs[1];
 
   auto axis_size = static_cast<uint32_t>(x.shape().back());
   int n_rows = x.data_size() / axis_size;
@@ -57,7 +60,7 @@ void RMSNorm::eval_gpu(
     op_name += "_looped";
   }
   op_name += type_to_name(out);
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
   {
     auto kernel = d.get_kernel(op_name);
 
@@ -77,22 +80,16 @@ void RMSNorm::eval_gpu(
       group_dims = MTL::Size(threadgroup_size, 1, 1);
     }
 
-    uint32_t w_stride = w.strides()[0];
-    compute_encoder->setComputePipelineState(kernel);
-    compute_encoder.set_input_array(
-        x.data_shared_ptr() == nullptr ? out : x, 0);
+    uint32_t w_stride = (w.ndim() == 1) ? w.strides()[0] : 0;
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(x, 0);
     compute_encoder.set_input_array(w, 1);
     compute_encoder.set_output_array(out, 2);
-    compute_encoder->setBytes(&eps_, sizeof(float), 3);
-    compute_encoder->setBytes(&axis_size, sizeof(int), 4);
-    compute_encoder->setBytes(&w_stride, sizeof(uint32_t), 5);
-    compute_encoder->setThreadgroupMemoryLength(
-        16 * 8, 0); // minimum of 16 bytes
-    compute_encoder->setThreadgroupMemoryLength(simd_size * sizeof(float), 1);
-    compute_encoder.dispatchThreads(grid_dims, group_dims);
+    compute_encoder.set_bytes(eps_, 3);
+    compute_encoder.set_bytes(axis_size, 4);
+    compute_encoder.set_bytes(w_stride, 5);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
   }
-  d.get_command_buffer(s.index)->addCompletedHandler(
-      [copies](MTL::CommandBuffer*) mutable { copies.clear(); });
 }
 
 void RMSNormVJP::eval_gpu(
@@ -100,57 +97,59 @@ void RMSNormVJP::eval_gpu(
     std::vector<array>& outputs) {
   auto& s = stream();
   auto& d = metal::device(s.device);
+  auto& compute_encoder = metal::get_command_encoder(s);
 
   // Ensure row contiguity. We could relax this step by checking that the array
   // is contiguous (no broadcasts or holes) and that the input strides are the
   // same as the cotangent strides but for now this is simpler.
-  std::vector<array> copies;
-  auto check_input = [&copies, &s](const array& x) -> const array& {
+  auto check_input = [&s](const array& x) -> std::pair<array, bool> {
     if (x.flags().row_contiguous) {
-      return x;
+      return {x, false};
     }
-    copies.push_back(array(x.shape(), x.dtype(), nullptr, {}));
-    copy_gpu(x, copies.back(), CopyType::General, s);
-    return copies.back();
+    array x_copy = contiguous_copy_gpu(x, s);
+    return {x_copy, true};
   };
-  const array& x = check_input(inputs[0]);
+  bool donate_g = inputs[2].is_donatable();
+  auto [x, copied] = check_input(inputs[0]);
   const array& w = inputs[1];
-  const array& g = check_input(inputs[2]);
+  auto [g, g_copied] = check_input(inputs[2]);
+  donate_g |= g_copied;
   array& gx = outputs[0];
   array& gw = outputs[1];
 
+  // Check whether we had a weight
+  bool has_w = w.ndim() != 0;
+
   // Allocate space for the outputs
-  bool x_in_gx = false;
   bool g_in_gx = false;
   if (x.is_donatable()) {
-    gx.move_shared_buffer(x);
-    x_in_gx = true;
+    gx.copy_shared_buffer(x);
   } else if (g.is_donatable()) {
-    gx.move_shared_buffer(g);
+    gx.copy_shared_buffer(g);
     g_in_gx = true;
   } else {
-    gx.set_data(allocator::malloc_or_wait(gx.nbytes()));
+    gx.set_data(allocator::malloc(gx.nbytes()));
+  }
+  if (g_copied && !g_in_gx) {
+    compute_encoder.add_temporary(g);
   }
 
   auto axis_size = static_cast<uint32_t>(x.shape().back());
   int n_rows = x.data_size() / axis_size;
 
-  // Allocate a temporary to store the gradients for w and initialize the
-  // gradient accumulator to 0.
-  array gw_temp({n_rows, x.shape().back()}, gw.dtype(), nullptr, {});
-  bool g_in_gw = false;
-  if (!g_in_gx && g.is_donatable()) {
-    gw_temp.move_shared_buffer(g);
-    g_in_gw = true;
-  } else {
-    gw_temp.set_data(allocator::malloc_or_wait(gw_temp.nbytes()));
+  // Allocate the gradient accumulator gw and a temporary to store the
+  // gradients before they are accumulated.
+  array gw_temp =
+      (has_w) ? array({n_rows, x.shape().back()}, gw.dtype(), nullptr, {}) : w;
+  if (has_w) {
+    if (!g_in_gx && donate_g) {
+      gw_temp.copy_shared_buffer(g);
+    } else {
+      gw_temp.set_data(allocator::malloc(gw_temp.nbytes()));
+      compute_encoder.add_temporary(gw_temp);
+    }
   }
-  copies.push_back(gw_temp);
-  {
-    array zero(0, gw.dtype());
-    copy_gpu(zero, gw, CopyType::Scalar, s);
-    copies.push_back(std::move(zero));
-  }
+  gw.set_data(allocator::malloc(gw.nbytes()));
 
   const int simd_size = 32;
   const int n_reads = RMS_N_READS;
@@ -160,9 +159,14 @@ void RMSNormVJP::eval_gpu(
     op_name += "_looped";
   }
   op_name += type_to_name(gx);
-  auto& compute_encoder = d.get_command_encoder(s.index);
+
+  std::string hash_name = op_name + ((has_w) ? "_w" : "_now");
+  metal::MTLFCList func_consts = {
+      {&has_w, MTL::DataType::DataTypeBool, 20},
+  };
+
   {
-    auto kernel = d.get_kernel(op_name);
+    auto kernel = d.get_kernel(op_name, hash_name, func_consts);
 
     MTL::Size grid_dims, group_dims;
     if (axis_size <= looped_limit) {
@@ -180,26 +184,29 @@ void RMSNormVJP::eval_gpu(
       group_dims = MTL::Size(threadgroup_size, 1, 1);
     }
 
-    uint32_t w_stride = w.strides()[0];
-    compute_encoder->setComputePipelineState(kernel);
-    compute_encoder.set_input_array(x_in_gx ? gx : x, 0);
+    uint32_t w_stride = (w.ndim() == 1) ? w.strides()[0] : 0;
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(x, 0);
     compute_encoder.set_input_array(w, 1);
-    compute_encoder.set_input_array(g_in_gx ? gx : (g_in_gw ? gw_temp : g), 2);
+    compute_encoder.set_input_array(g, 2);
     compute_encoder.set_output_array(gx, 3);
     compute_encoder.set_output_array(gw_temp, 4);
-    compute_encoder->setBytes(&eps_, sizeof(float), 5);
-    compute_encoder->setBytes(&axis_size, sizeof(int), 6);
-    compute_encoder->setBytes(&w_stride, sizeof(uint32_t), 7);
-    compute_encoder.dispatchThreads(grid_dims, group_dims);
+    compute_encoder.set_bytes(eps_, 5);
+    compute_encoder.set_bytes(axis_size, 6);
+    compute_encoder.set_bytes(w_stride, 7);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
   }
 
-  ReductionPlan plan(
-      ReductionOpType::ContiguousStridedReduce, {n_rows}, {axis_size});
-  strided_reduce_general_dispatch(
-      gw_temp, gw, "sum", plan, {0}, compute_encoder, d, s);
+  if (has_w) {
+    ReductionPlan plan(
+        ReductionOpType::ContiguousStridedReduce, {n_rows}, {axis_size});
+    strided_reduce_general_dispatch(
+        gw_temp, gw, "sum", plan, {0}, compute_encoder, d, s);
+  }
+}
 
-  d.get_command_buffer(s.index)->addCompletedHandler(
-      [copies](MTL::CommandBuffer*) mutable { copies.clear(); });
+bool LayerNorm::use_fallback(Stream s) {
+  return s.device == Device::cpu;
 }
 
 void LayerNorm::eval_gpu(
@@ -210,47 +217,47 @@ void LayerNorm::eval_gpu(
   auto& out = outputs[0];
 
   // Make sure that the last dimension is contiguous
-  std::vector<array> copies;
-  auto check_input = [&copies, &s](const array& x) -> const array& {
-    bool no_copy = x.strides()[x.ndim() - 1] == 1;
-    if (x.ndim() > 1) {
+  auto set_output = [&s, &out](const array& x) {
+    bool no_copy = x.flags().contiguous && x.strides()[x.ndim() - 1] == 1;
+    if (no_copy && x.ndim() > 1) {
       auto s = x.strides()[x.ndim() - 2];
-      no_copy &= (s == 0 || s == x.shape().back());
+      no_copy &= (s == 0 || s == x.shape().back() || x.shape(-2) == 1);
     }
     if (no_copy) {
+      if (x.is_donatable()) {
+        out.copy_shared_buffer(x);
+      } else {
+        out.set_data(
+            allocator::malloc(x.data_size() * x.itemsize()),
+            x.data_size(),
+            x.strides(),
+            x.flags());
+      }
       return x;
     } else {
-      copies.push_back(array(x.shape(), x.dtype(), nullptr, {}));
-      copy_gpu(x, copies.back(), CopyType::General, s);
-      return copies.back();
+      array x_copy = contiguous_copy_gpu(x, s);
+      out.copy_shared_buffer(x_copy);
+      return x_copy;
     }
   };
-  const array& x = check_input(inputs[0]);
+
+  const array x = set_output(inputs[0]);
   const array& w = inputs[1];
   const array& b = inputs[2];
-
-  if (x.is_donatable()) {
-    out.move_shared_buffer(x);
-  } else {
-    out.set_data(
-        allocator::malloc_or_wait(x.data_size() * x.itemsize()),
-        x.data_size(),
-        x.strides(),
-        x.flags());
-  }
 
   auto axis_size = static_cast<uint32_t>(x.shape().back());
   int n_rows = x.data_size() / axis_size;
 
-  const int simd_size = 32;
-  const int n_reads = RMS_N_READS;
-  const int looped_limit = RMS_LOOPED_LIMIT;
+  int simd_size = 32;
+  int n_reads = 8;
+  int looped_limit = 6656;
   std::string op_name = "layer_norm";
   if (axis_size > looped_limit) {
     op_name += "_looped";
+    n_reads = 4;
   }
   op_name += type_to_name(out);
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
   {
     auto kernel = d.get_kernel(op_name);
 
@@ -259,7 +266,13 @@ void LayerNorm::eval_gpu(
       size_t threadgroup_needed = (axis_size + n_reads - 1) / n_reads;
       size_t simds_needed = (threadgroup_needed + simd_size - 1) / simd_size;
       size_t threadgroup_size = simd_size * simds_needed;
-      assert(threadgroup_size <= kernel->maxTotalThreadsPerThreadgroup());
+      if (threadgroup_size > kernel->maxTotalThreadsPerThreadgroup()) {
+        std::ostringstream msg;
+        msg << "[layer_norm] Threadgroup size " << threadgroup_size
+            << " is larger than the maximum allowed threadgroup size "
+            << kernel->maxTotalThreadsPerThreadgroup();
+        throw std::runtime_error(msg.str());
+      }
       size_t n_threads = n_rows * threadgroup_size;
       grid_dims = MTL::Size(n_threads, 1, 1);
       group_dims = MTL::Size(threadgroup_size, 1, 1);
@@ -272,20 +285,17 @@ void LayerNorm::eval_gpu(
 
     uint32_t w_stride = (w.ndim() == 1) ? w.strides()[0] : 0;
     uint32_t b_stride = (b.ndim() == 1) ? b.strides()[0] : 0;
-    compute_encoder->setComputePipelineState(kernel);
-    compute_encoder.set_input_array(
-        x.data_shared_ptr() == nullptr ? out : x, 0);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(x, 0);
     compute_encoder.set_input_array(w, 1);
     compute_encoder.set_input_array(b, 2);
     compute_encoder.set_output_array(out, 3);
-    compute_encoder->setBytes(&eps_, sizeof(float), 4);
-    compute_encoder->setBytes(&axis_size, sizeof(int), 5);
-    compute_encoder->setBytes(&w_stride, sizeof(uint32_t), 6);
-    compute_encoder->setBytes(&b_stride, sizeof(uint32_t), 7);
-    compute_encoder.dispatchThreads(grid_dims, group_dims);
+    compute_encoder.set_bytes(eps_, 4);
+    compute_encoder.set_bytes(axis_size, 5);
+    compute_encoder.set_bytes(w_stride, 6);
+    compute_encoder.set_bytes(b_stride, 7);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
   }
-  d.get_command_buffer(s.index)->addCompletedHandler(
-      [copies](MTL::CommandBuffer*) mutable { copies.clear(); });
 }
 
 void LayerNormVJP::eval_gpu(
@@ -293,94 +303,102 @@ void LayerNormVJP::eval_gpu(
     std::vector<array>& outputs) {
   auto& s = stream();
   auto& d = metal::device(s.device);
+  auto& compute_encoder = metal::get_command_encoder(s);
 
   // Ensure row contiguity. We could relax this step by checking that the array
   // is contiguous (no broadcasts or holes) and that the input strides are the
   // same as the cotangent strides but for now this is simpler.
-  std::vector<array> copies;
-  auto check_input = [&copies, &s](const array& x) -> const array& {
+  auto check_input = [&s](const array& x) -> std::pair<array, bool> {
     if (x.flags().row_contiguous) {
-      return x;
+      return {x, false};
     }
-    copies.push_back(array(x.shape(), x.dtype(), nullptr, {}));
-    copy_gpu(x, copies.back(), CopyType::General, s);
-    return copies.back();
+    array x_copy = contiguous_copy_gpu(x, s);
+    return {x_copy, true};
   };
-  const array& x = check_input(inputs[0]);
+  bool donate_x = inputs[0].is_donatable();
+  bool donate_g = inputs[3].is_donatable();
+  auto [x, copied] = check_input(inputs[0]);
+  donate_x |= copied;
   const array& w = inputs[1];
-  const array& b = inputs[2];
-  const array& g = check_input(inputs[3]);
+  auto [g, g_copied] = check_input(inputs[3]);
+  donate_g |= g_copied;
   array& gx = outputs[0];
   array& gw = outputs[1];
   array& gb = outputs[2];
 
+  // Check whether we had a weight
+  bool has_w = w.ndim() != 0;
+
   // Allocate space for the outputs
-  bool x_in_gx = false;
   bool g_in_gx = false;
-  if (x.is_donatable()) {
-    gx.move_shared_buffer(x);
-    x_in_gx = true;
-  } else if (g.is_donatable()) {
-    gx.move_shared_buffer(g);
+  if (donate_x) {
+    gx.copy_shared_buffer(x);
+  } else if (donate_g) {
+    gx.copy_shared_buffer(g);
     g_in_gx = true;
   } else {
-    gx.set_data(allocator::malloc_or_wait(gx.nbytes()));
+    gx.set_data(allocator::malloc(gx.nbytes()));
+  }
+  if (g_copied && !g_in_gx) {
+    compute_encoder.add_temporary(g);
   }
 
   auto axis_size = static_cast<uint32_t>(x.shape().back());
   int n_rows = x.data_size() / axis_size;
 
-  // Allocate a temporary to store the gradients for w and initialize the
-  // gradient accumulator to 0.
-  array gw_temp({n_rows, x.shape().back()}, gw.dtype(), nullptr, {});
-  bool g_in_gw = false;
-  if (!g_in_gx && g.is_donatable()) {
-    gw_temp.move_shared_buffer(g);
-    g_in_gw = true;
-  } else {
-    gw_temp.set_data(allocator::malloc_or_wait(gw_temp.nbytes()));
+  // Allocate a temporary to store the gradients for w and allocate the output
+  // gradient accumulators.
+  array gw_temp =
+      (has_w) ? array({n_rows, x.shape().back()}, gw.dtype(), nullptr, {}) : w;
+  if (has_w) {
+    if (!g_in_gx && donate_g) {
+      gw_temp.copy_shared_buffer(g);
+    } else {
+      gw_temp.set_data(allocator::malloc(gw_temp.nbytes()));
+      compute_encoder.add_temporary(gw_temp);
+    }
   }
-  copies.push_back(gw_temp);
-  {
-    array zero(0, gw.dtype());
-    copy_gpu(zero, gw, CopyType::Scalar, s);
-    copy_gpu(zero, gb, CopyType::Scalar, s);
-    copies.push_back(std::move(zero));
-  }
+  gw.set_data(allocator::malloc(gw.nbytes()));
+  gb.set_data(allocator::malloc(gb.nbytes()));
 
   // Finish with the gradient for b in case we had a b
-  auto& compute_encoder = d.get_command_encoder(s.index);
   if (gb.ndim() == 1 && gb.size() == axis_size) {
     ReductionPlan plan(
         ReductionOpType::ContiguousStridedReduce, {n_rows}, {axis_size});
     strided_reduce_general_dispatch(
-        g_in_gx ? gx : (g_in_gw ? gw_temp : g),
-        gb,
-        "sum",
-        plan,
-        {0},
-        compute_encoder,
-        d,
-        s);
+        g, gb, "sum", plan, {0}, compute_encoder, d, s);
   }
 
-  const int simd_size = 32;
-  const int n_reads = RMS_N_READS;
-  const int looped_limit = RMS_LOOPED_LIMIT;
+  int simd_size = 32;
+  int n_reads = 8;
+  int looped_limit = 8192;
   std::string op_name = "vjp_layer_norm";
   if (axis_size > looped_limit) {
     op_name += "_looped";
+    n_reads = 4;
   }
   op_name += type_to_name(gx);
+
+  std::string hash_name = op_name + ((has_w) ? "_w" : "_now");
+  metal::MTLFCList func_consts = {
+      {&has_w, MTL::DataType::DataTypeBool, 20},
+  };
+
   {
-    auto kernel = d.get_kernel(op_name);
+    auto kernel = d.get_kernel(op_name, hash_name, func_consts);
 
     MTL::Size grid_dims, group_dims;
     if (axis_size <= looped_limit) {
       size_t threadgroup_needed = (axis_size + n_reads - 1) / n_reads;
       size_t simds_needed = (threadgroup_needed + simd_size - 1) / simd_size;
       size_t threadgroup_size = simd_size * simds_needed;
-      assert(threadgroup_size <= kernel->maxTotalThreadsPerThreadgroup());
+      if (threadgroup_size > kernel->maxTotalThreadsPerThreadgroup()) {
+        std::ostringstream msg;
+        msg << "[vjp_layer_norm] Threadgroup size " << threadgroup_size
+            << " is larger than the maximum allowed threadgroup size "
+            << kernel->maxTotalThreadsPerThreadgroup();
+        throw std::runtime_error(msg.str());
+      }
       size_t n_threads = n_rows * threadgroup_size;
       grid_dims = MTL::Size(n_threads, 1, 1);
       group_dims = MTL::Size(threadgroup_size, 1, 1);
@@ -392,27 +410,24 @@ void LayerNormVJP::eval_gpu(
     }
 
     uint32_t w_stride = (w.ndim() == 1) ? w.strides()[0] : 0;
-    compute_encoder->setComputePipelineState(kernel);
-    compute_encoder.set_input_array(x_in_gx ? gx : x, 0);
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(x, 0);
     compute_encoder.set_input_array(w, 1);
-    compute_encoder.set_input_array(g_in_gx ? gx : (g_in_gw ? gw_temp : g), 2);
+    compute_encoder.set_input_array(g, 2);
     compute_encoder.set_output_array(gx, 3);
     compute_encoder.set_output_array(gw_temp, 4);
-    compute_encoder->setBytes(&eps_, sizeof(float), 5);
-    compute_encoder->setBytes(&axis_size, sizeof(int), 6);
-    compute_encoder->setBytes(&w_stride, sizeof(uint32_t), 7);
-    compute_encoder.dispatchThreads(grid_dims, group_dims);
+    compute_encoder.set_bytes(eps_, 5);
+    compute_encoder.set_bytes(axis_size, 6);
+    compute_encoder.set_bytes(w_stride, 7);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
   }
 
-  if (gw.ndim() == 1 && gw.size() == axis_size) {
+  if (has_w) {
     ReductionPlan plan(
         ReductionOpType::ContiguousStridedReduce, {n_rows}, {axis_size});
     strided_reduce_general_dispatch(
         gw_temp, gw, "sum", plan, {0}, compute_encoder, d, s);
   }
-
-  d.get_command_buffer(s.index)->addCompletedHandler(
-      [copies](MTL::CommandBuffer*) mutable { copies.clear(); });
 }
 
 } // namespace mlx::core::fast

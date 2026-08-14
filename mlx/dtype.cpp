@@ -1,17 +1,14 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <cstdint>
-#include <sstream>
-#include <vector>
 
 #include "mlx/dtype.h"
-#include "mlx/utils.h"
 
 namespace mlx::core {
 
 namespace {
 
-constexpr int num_types = 13;
+constexpr int num_types = 14;
 constexpr int num_cats = 8;
 
 constexpr Dtype::Kind type_kinds[num_types] = {
@@ -26,6 +23,7 @@ constexpr Dtype::Kind type_kinds[num_types] = {
     Dtype::Kind::i, // int64,
     Dtype::Kind::f, // float16,
     Dtype::Kind::f, // float32,
+    Dtype::Kind::f, // float64,
     Dtype::Kind::V, // bfloat16,
     Dtype::Kind::c // complex64,
 };
@@ -34,20 +32,21 @@ constexpr Dtype::Kind type_kinds[num_types] = {
 // https://jax.readthedocs.io/en/latest/type_promotion.html
 // clang-format off
 constexpr Dtype type_rules[num_types][num_types] = {
-// bool       uint8      uint16     uint32     uint64     int8       int16      int32      int64      float16    float32    bfloat16   complex64
-  {bool_,     uint8,     uint16,    uint32,    uint64,    int8,      int16,     int32,     int64,     float16,   float32,   bfloat16,  complex64}, // bool
-  {uint8,     uint8,     uint16,    uint32,    uint64,    int16,     int16,     int32,     int64,     float16,   float32,   bfloat16,  complex64}, // uint8
-  {uint16,    uint16,    uint16,    uint32,    uint64,    int32,     int32,     int32,     int64,     float16,   float32,   bfloat16,  complex64}, // uint16
-  {uint32,    uint32,    uint32,    uint32,    uint64,    int64,     int64,     int64,     int64,     float16,   float32,   bfloat16,  complex64}, // uint32
-  {uint64,    uint64,    uint64,    uint64,    uint64,    float32,   float32,   float32,   float32,   float16,   float32,   bfloat16,  complex64}, // uint64
-  {int8,      int16,     int32,     int64,     float32,   int8,      int16,     int32,     int64,     float16,   float32,   bfloat16,  complex64}, // int8
-  {int16,     int16,     int32,     int64,     float32,   int16,     int16,     int32,     int64,     float16,   float32,   bfloat16,  complex64}, // int16
-  {int32,     int32,     int32,     int64,     float32,   int32,     int32,     int32,     int64,     float16,   float32,   bfloat16,  complex64}, // int32
-  {int64,     int64,     int64,     int64,     float32,   int64,     int64,     int64,     int64,     float16,   float32,   bfloat16,  complex64}, // int64
-  {float16,   float16,   float16,   float16,   float16,   float16,   float16,   float16,   float16,   float16,   float32,   float32,   complex64}, // float16
-  {float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   complex64}, // float32
-  {bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  float32,   float32,   bfloat16,  complex64}, // bfloat16
-  {complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64}, // complex64
+// bool       uint8      uint16     uint32     uint64     int8       int16      int32      int64      float16    float32   float64    bfloat16   complex64
+  {bool_,     uint8,     uint16,    uint32,    uint64,    int8,      int16,     int32,     int64,     float16,   float32,  float64,   bfloat16,  complex64}, // bool
+  {uint8,     uint8,     uint16,    uint32,    uint64,    int16,     int16,     int32,     int64,     float16,   float32,  float64,   bfloat16,  complex64}, // uint8
+  {uint16,    uint16,    uint16,    uint32,    uint64,    int32,     int32,     int32,     int64,     float16,   float32,  float64,   bfloat16,  complex64}, // uint16
+  {uint32,    uint32,    uint32,    uint32,    uint64,    int64,     int64,     int64,     int64,     float16,   float32,  float64,   bfloat16,  complex64}, // uint32
+  {uint64,    uint64,    uint64,    uint64,    uint64,    float32,   float32,   float32,   float32,   float16,   float32,  float64,   bfloat16,  complex64}, // uint64
+  {int8,      int16,     int32,     int64,     float32,   int8,      int16,     int32,     int64,     float16,   float32,  float64,   bfloat16,  complex64}, // int8
+  {int16,     int16,     int32,     int64,     float32,   int16,     int16,     int32,     int64,     float16,   float32,  float64,   bfloat16,  complex64}, // int16
+  {int32,     int32,     int32,     int64,     float32,   int32,     int32,     int32,     int64,     float16,   float32,  float64,   bfloat16,  complex64}, // int32
+  {int64,     int64,     int64,     int64,     float32,   int64,     int64,     int64,     int64,     float16,   float32,  float64,   bfloat16,  complex64}, // int64
+  {float16,   float16,   float16,   float16,   float16,   float16,   float16,   float16,   float16,   float16,   float32,  float64,   float32,   complex64}, // float16
+  {float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,  float64,   float32,   complex64}, // float32
+  {float64,   float64,   float64,   float64,   float64,   float64,   float64,   float64,   float64,   float64,   float64,  float64,   float64,   complex64}, // float64
+  {bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  float32,   float32,  float64,   bfloat16,  complex64}, // bfloat16
+  {complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64,complex64, complex64, complex64}, // complex64
 };
 
 
@@ -75,6 +74,7 @@ constexpr Dtype::Category type_to_category[num_types] = {
     Dtype::Category::signedinteger, // int64,
     Dtype::Category::floating, // float16,
     Dtype::Category::floating, // float32,
+    Dtype::Category::floating, // float64,
     Dtype::Category::floating, // bfloat16,
     Dtype::Category::complexfloating, // complex64,
 };
@@ -84,12 +84,28 @@ constexpr Dtype::Category type_to_category[num_types] = {
 } // namespace
 
 Dtype promote_types(const Dtype& t1, const Dtype& t2) {
-  return Dtype(type_rules[static_cast<int>(t1.val)][static_cast<int>(t2.val)]);
+  return Dtype(
+      type_rules[static_cast<int>(t1.val())][static_cast<int>(t2.val())]);
 }
 
 Dtype::Kind kindof(const Dtype& t) {
-  return type_kinds[static_cast<int>(t.val)];
+  return type_kinds[static_cast<int>(t.val())];
 }
+
+template class MLX_API TypeToDtype<bool>;
+template class MLX_API TypeToDtype<uint8_t>;
+template class MLX_API TypeToDtype<uint16_t>;
+template class MLX_API TypeToDtype<uint32_t>;
+template class MLX_API TypeToDtype<uint64_t>;
+template class MLX_API TypeToDtype<int8_t>;
+template class MLX_API TypeToDtype<int16_t>;
+template class MLX_API TypeToDtype<int32_t>;
+template class MLX_API TypeToDtype<int64_t>;
+template class MLX_API TypeToDtype<float16_t>;
+template class MLX_API TypeToDtype<float>;
+template class MLX_API TypeToDtype<double>;
+template class MLX_API TypeToDtype<bfloat16_t>;
+template class MLX_API TypeToDtype<complex64_t>;
 
 template <>
 TypeToDtype<bool>::operator Dtype() {
@@ -170,75 +186,12 @@ bool issubdtype(const Dtype::Category& cat, const Dtype& type) {
 }
 
 bool issubdtype(const Dtype& type, const Dtype::Category& cat) {
-  return issubdtype(type_to_category[static_cast<uint32_t>(type.val)], cat);
+  return issubdtype(type_to_category[static_cast<uint32_t>(type.val())], cat);
 }
 
 bool issubdtype(const Dtype::Category& a, const Dtype::Category& b) {
   return subcategory_to_category[static_cast<uint32_t>(a)]
                                 [static_cast<uint32_t>(b)];
-}
-
-// Array protocol typestring for Dtype
-std::string dtype_to_array_protocol(const Dtype& t) {
-  std::ostringstream r;
-  if (size_of(t) > 1)
-    r << (is_big_endian() ? ">" : "<");
-  else
-    r << "|";
-  r << kindof(t) << (int)size_of(t);
-  return r.str();
-}
-
-// Dtype from array protocol type string
-Dtype dtype_from_array_protocol(std::string_view t) {
-  if (t.length() == 2 || t.length() == 3) {
-    std::string_view r = t.length() == 3 ? t.substr(1, 2) : t;
-
-    if (r == "V2") {
-      return bfloat16;
-    }
-
-    uint8_t size = r[1] - '0';
-
-    switch (r[0]) {
-      case 'b': {
-        if (size == 1)
-          return bool_;
-      }
-      case 'i': {
-        if (size == 1)
-          return int8;
-        else if (size == 2)
-          return int16;
-        else if (size == 4)
-          return int32;
-        else if (size == 8)
-          return int64;
-      }
-      case 'u': {
-        if (size == 1)
-          return uint8;
-        else if (size == 2)
-          return uint16;
-        else if (size == 4)
-          return uint32;
-        else if (size == 8)
-          return uint64;
-      }
-      case 'f': {
-        if (size == 2)
-          return float16;
-        else if (size == 4)
-          return float32;
-      }
-      case 'c': {
-        return complex64;
-      }
-    }
-  }
-
-  throw std::invalid_argument(
-      "[from_str] Invalid array protocol type-string: " + std::string(t));
 }
 
 } // namespace mlx::core

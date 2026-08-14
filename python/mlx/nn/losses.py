@@ -1,7 +1,7 @@
 # Copyright © 2023 Apple Inc.
 
 import math
-from typing import Literal
+from typing import Literal, Optional, get_args
 
 import mlx.core as mx
 
@@ -9,20 +9,21 @@ Reduction = Literal["none", "mean", "sum"]
 
 
 def _reduce(loss: mx.array, reduction: Reduction = "none"):
+    if reduction not in get_args(Reduction):
+        raise ValueError(f"Invalid reduction. Must be one of {get_args(Reduction)}.")
+
     if reduction == "mean":
         return mx.mean(loss)
     elif reduction == "sum":
         return mx.sum(loss)
     elif reduction == "none":
         return loss
-    else:
-        raise ValueError("Invalid reduction. Must be 'none', 'mean', or 'sum'.")
 
 
 def cross_entropy(
     logits: mx.array,
     targets: mx.array,
-    weights: mx.array = None,
+    weights: Optional[mx.array] = None,
     axis: int = -1,
     label_smoothing: float = 0.0,
     reduction: Reduction = "none",
@@ -64,7 +65,7 @@ def cross_entropy(
         array([0.348587, 0.348587], dtype=float32)
     """
     if label_smoothing < 0 or label_smoothing >= 1:
-        raise ValueError(f"Label smoothing must in [0, 1), got {label_smoothing}.")
+        raise ValueError(f"Label smoothing must be in [0, 1), got {label_smoothing}.")
 
     # Whether targets are class indices or probabilities
     targets_as_probs = targets.ndim == logits.ndim
@@ -82,10 +83,17 @@ def cross_entropy(
             f"Targets shape {targets.shape} does not match logits shape {logits.shape}."
         )
 
+    # Shift by the max first. The loss only depends on differences between
+    # logits, but subtracting the logsumexp of large logits loses the gap to
+    # rounding before the subtraction happens.
+    logits = logits - mx.stop_gradient(mx.max(logits, axis=axis, keepdims=True))
+
     if targets_as_probs:
         score = mx.sum(logits * targets, axis=axis)
     else:
-        score = mx.take_along_axis(logits, targets[..., None], axis).squeeze(-1)
+        score = mx.take_along_axis(logits, mx.expand_dims(targets, axis), axis).squeeze(
+            axis
+        )
 
     logsumexp_logits = mx.logsumexp(logits, axis=axis)
     if label_smoothing > 0:
@@ -117,19 +125,24 @@ def cross_entropy(
 def binary_cross_entropy(
     inputs: mx.array,
     targets: mx.array,
-    weights: mx.array = None,
+    weights: Optional[mx.array] = None,
     with_logits: bool = True,
     reduction: Reduction = "mean",
 ) -> mx.array:
     """
     Computes the binary cross entropy loss.
 
+    By default, this function takes the pre-sigmoid logits, which results in a faster
+    and more precise loss. For improved numerical stability when ``with_logits=False``,
+    the loss calculation clips the input probabilities (in log-space) to a minimum value
+    of ``-100``.
+
     Args:
         inputs (array): The predicted values. If ``with_logits`` is ``True``, then
             ``inputs`` are unnormalized logits. Otherwise, ``inputs`` are probabilities.
         targets (array): The binary target values in {0, 1}.
-        with_logits (bool, optional): Whether ``inputs`` are logits. Default: ``True``.
         weights (array, optional): Optional weights for each target. Default: ``None``.
+        with_logits (bool, optional): Whether ``inputs`` are logits. Default: ``True``.
         reduction (str, optional): Specifies the reduction to apply to the output:
           ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'mean'``.
 
@@ -159,7 +172,9 @@ def binary_cross_entropy(
     if with_logits:
         loss = mx.logaddexp(0.0, inputs) - inputs * targets
     else:
-        loss = -(targets * mx.log(inputs) + (1 - targets) * mx.log(1 - inputs))
+        log_inputs_clip = mx.clip(mx.log(inputs), a_min=-100, a_max=None)
+        log_inputs_inv_clip = mx.clip(mx.log(1 - inputs), a_min=-100, a_max=None)
+        loss = -(targets * log_inputs_clip + (1 - targets) * log_inputs_inv_clip)
 
     # Apply weights if provided
     if weights is not None:
@@ -239,7 +254,9 @@ def nll_loss(
     Returns:
         array: The computed NLL loss.
     """
-    loss = -mx.take_along_axis(inputs, targets[..., None], axis).squeeze(-1)
+    loss = -mx.take_along_axis(inputs, mx.expand_dims(targets, axis), axis).squeeze(
+        axis
+    )
 
     return _reduce(loss, reduction)
 
@@ -262,7 +279,7 @@ def gaussian_nll_loss(
         \ \epsilon\right)\right) + \frac{\left(\text{inputs} - \text{targets} \right)^2}
         {\max\left(\text{vars}, \ \epsilon \right)}\right) + \text{const.}
 
-    where ``inputs`` are the predicted means and ``vars`` are the the
+    where ``inputs`` are the predicted means and ``vars`` are the
     predicted variances.
 
     Args:
@@ -274,7 +291,7 @@ def gaussian_nll_loss(
         eps (float, optional): Small positive constant for numerical stability.
             Default: ``1e-6``.
         reduction (str, optional): Specifies the reduction to apply to the output:
-          ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'none'``.
+          ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'mean'``.
 
     Returns:
         array: The Gaussian NLL loss.
@@ -309,7 +326,7 @@ def kl_div_loss(
 
     .. code-block:: python
 
-        mx.exp(targets) * (targets - inputs).sum(axis)
+        (mx.exp(targets) * (targets - inputs)).sum(axis)
 
     Args:
         inputs (array): Log probabilities for the predicted distribution.
@@ -344,7 +361,7 @@ def smooth_l1_loss(
     .. math::
 
       l = \begin{cases}
-            0.5 (x - y)^2, & \text{if } (x - y) < \beta \\
+            0.5 (x - y)^2 / \beta, & \text{if } |x - y| < \beta \\
             |x - y| - 0.5 \beta, & \text{otherwise}
           \end{cases}
 
@@ -365,7 +382,7 @@ def smooth_l1_loss(
             f"targets shape {targets.shape}."
         )
 
-    diff = predictions - targets
+    diff = mx.abs(predictions - targets)
     loss = mx.where(
         diff < beta, 0.5 * mx.square(diff) / beta, mx.abs(diff) - 0.5 * beta
     )
@@ -398,20 +415,23 @@ def triplet_loss(
         axis (int, optional): The distribution axis. Default: ``-1``.
         p (int, optional): The norm degree for pairwise distance. Default: ``2``.
         margin (float, optional): Margin for the triplet loss. Defaults to ``1.0``.
-        eps (float, optional): Small positive constant to prevent numerical instability. Defaults to ``1e-6``.
+        eps (float, optional): Small positive constant added to the p-norm sum
+          before taking the ``1 / p`` power. Defaults to ``1e-6``.
         reduction (str, optional): Specifies the reduction to apply to the output:
           ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'none'``.
 
     Returns:
-        array: Computed triplet loss. If reduction is "none", returns a tensor of the same shape as input;
-                  if reduction is "mean" or "sum", returns a scalar tensor.
+        array: Computed triplet loss. If reduction is ``"none"``, returns a tensor with the
+          same shape as the inputs but with the ``axis`` dimension removed; if reduction
+          is ``"mean"`` or ``"sum"``, returns a scalar tensor.
     """
-    loss = mx.maximum(
-        mx.sqrt(mx.power(anchors - positives, p).sum(axis) + eps)
-        - mx.sqrt(mx.power(anchors - negatives, p).sum(axis) + eps)
-        + margin,
-        0,
+    pos_dist = mx.power(
+        mx.power(mx.abs(anchors - positives), p).sum(axis) + eps, 1.0 / p
     )
+    neg_dist = mx.power(
+        mx.power(mx.abs(anchors - negatives), p).sum(axis) + eps, 1.0 / p
+    )
+    loss = mx.maximum(pos_dist - neg_dist + margin, 0)
     return _reduce(loss, reduction)
 
 
@@ -490,8 +510,7 @@ def log_cosh_loss(
     .. math::
 
        \text{logcosh}(y_{\text{true}}, y_{\text{pred}}) =
-            \frac{1}{n} \sum_{i=1}^{n}
-            \log(\cosh(y_{\text{pred}}^{(i)} - y_{\text{true}}^{(i)}))
+            \log(\cosh(y_{\text{pred}} - y_{\text{true}}))
 
 
     Args:
@@ -526,8 +545,8 @@ def cosine_similarity_loss(
         \frac{x_1 \cdot x_2}{\max(\|x_1\|  \cdot \|x_2\|, \epsilon)}
 
     Args:
-        x1 (mx.array): The first set of inputs.
-        x2 (mx.array): The second set of inputs.
+        x1 (array): The first set of inputs.
+        x2 (array): The second set of inputs.
         axis (int, optional): The embedding axis. Default: ``1``.
         eps (float, optional): The minimum value of the denominator used for
           numerical stability. Default: ``1e-8``.
@@ -535,7 +554,7 @@ def cosine_similarity_loss(
           ``'none'`` | ``'mean'`` | ``'sum'``. Default: ``'none'``.
 
     Returns:
-        mx.array: The computed cosine similarity loss.
+        array: The computed cosine similarity loss.
     """
     x1_norm = mx.linalg.norm(x1, axis=axis)
     x2_norm = mx.linalg.norm(x2, axis=axis)
@@ -585,7 +604,7 @@ def margin_ranking_loss(
         >>> inputs2 = mx.array([0.75596, 0.225763, 0.256995])
         >>> loss = nn.losses.margin_ranking_loss(inputs1, inputs2, targets)
         >>> loss
-        array(0.773433, dtype=float32)
+        array([1.32937, 0.990929, 0], dtype=float32)
     """
     if not (inputs1.shape == inputs2.shape == targets.shape):
         raise ValueError(

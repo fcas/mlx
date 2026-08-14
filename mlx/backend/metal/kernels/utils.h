@@ -3,8 +3,22 @@
 #pragma once
 
 #include <metal_math>
+
 #include "mlx/backend/metal/kernels/bf16.h"
+#include "mlx/backend/metal/kernels/bf16_math.h"
 #include "mlx/backend/metal/kernels/complex.h"
+#include "mlx/backend/metal/kernels/defines.h"
+#include "mlx/backend/metal/kernels/logging.h"
+
+typedef half float16_t;
+
+// Work per thread values for different types. The values here are expected to
+// match get_work_per_thread in mlx/backend/metal/utils.h
+template <typename U>
+struct WorkPerThread {
+  static_assert(sizeof(U) <= 8, "Type too large");
+  static constexpr int constant n = 8 / sizeof(U);
+};
 
 ///////////////////////////////////////////////////////////////////////////////
 // Type limits utils
@@ -61,6 +75,16 @@ struct Limits<bool> {
   static constexpr constant bool min = false;
 };
 
+template <typename T>
+struct Limits<complex_t<T>> {
+  inline static constexpr constant complex_t<T> max = complex_t<T>(
+      metal::numeric_limits<T>::infinity(),
+      metal::numeric_limits<T>::infinity());
+  inline static constexpr constant complex_t<T> min = complex_t<T>(
+      -metal::numeric_limits<T>::infinity(),
+      -metal::numeric_limits<T>::infinity());
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 // Indexing utils
 ///////////////////////////////////////////////////////////////////////////////
@@ -70,44 +94,31 @@ struct Limits<bool> {
 ///////////////////////////////////////////////////////////////////////////////
 // Single Array with generic dims
 
-template <typename stride_t>
-METAL_FUNC stride_t elem_to_loc(
-    uint elem,
-    device const int* shape,
-    device const stride_t* strides,
-    int ndim) {
-  stride_t loc = 0;
-  for (int i = ndim - 1; i >= 0 && elem > 0; --i) {
-    loc += (elem % shape[i]) * strides[i];
-    elem /= shape[i];
-  }
-  return loc;
-}
-
-template <typename stride_t>
-METAL_FUNC stride_t elem_to_loc(
-    uint elem,
+template <typename IdxT = int64_t>
+METAL_FUNC IdxT elem_to_loc(
+    IdxT elem,
     constant const int* shape,
-    constant const stride_t* strides,
+    constant const int64_t* strides,
     int ndim) {
-  stride_t loc = 0;
+  IdxT loc = 0;
   for (int i = ndim - 1; i >= 0 && elem > 0; --i) {
-    loc += (elem % shape[i]) * strides[i];
+    loc += (elem % shape[i]) * IdxT(strides[i]);
     elem /= shape[i];
   }
   return loc;
 }
 
 // Non templated version to handle arbitrary dims
-template <typename stride_t>
-METAL_FUNC stride_t elem_to_loc(
+template <typename IdxT = int64_t>
+METAL_FUNC IdxT elem_to_loc(
     uint3 elem,
     constant const int* shape,
-    constant const stride_t* strides,
+    constant const int64_t* strides,
     int ndim) {
-  stride_t loc = elem.x * strides[ndim - 1] + elem.y * strides[ndim - 2];
+  IdxT loc =
+      elem.x * IdxT(strides[ndim - 1]) + elem.y * IdxT(strides[ndim - 2]);
   for (int d = ndim - 3; d >= 0; --d) {
-    loc += (elem.z % shape[d]) * strides[d];
+    loc += (elem.z % shape[d]) * IdxT(strides[d]);
     elem.z /= shape[d];
   }
   return loc;
@@ -116,181 +127,187 @@ METAL_FUNC stride_t elem_to_loc(
 ///////////////////////////////////////////////////////////////////////////////
 // Single Array with fixed N dims
 
-template <typename stride_t>
-METAL_FUNC stride_t elem_to_loc_1(uint elem, constant const stride_t& stride) {
-  return elem * stride;
+template <typename IdxT = int64_t>
+METAL_FUNC IdxT elem_to_loc_1(uint elem, constant const int64_t& stride) {
+  return elem * IdxT(stride);
 }
 
-template <typename stride_t>
-METAL_FUNC stride_t
-elem_to_loc_2(uint2 elem, constant const stride_t strides[2]) {
-  return elem.x * strides[1] + elem.y * strides[0];
+template <typename IdxT = int64_t>
+METAL_FUNC IdxT elem_to_loc_2(uint2 elem, constant const int64_t strides[2]) {
+  return elem.x * IdxT(strides[1]) + elem.y * IdxT(strides[0]);
 }
 
-template <typename stride_t>
-METAL_FUNC stride_t
-elem_to_loc_3(uint3 elem, constant const stride_t strides[3]) {
-  return elem.x * strides[2] + elem.y * strides[1] + elem.z * strides[0];
-}
-
-template <int NDIM>
-METAL_FUNC size_t elem_to_loc_nd(
-    uint elem,
-    device const int* shape,
-    device const size_t* strides) {
-  size_t loc = (elem % shape[NDIM - 1]) * strides[NDIM - 1];
-
-  MLX_MTL_PRAGMA_UNROLL
-  for (int d = NDIM - 2; d >= 0; --d) {
-    elem /= shape[d + 1];
-    loc += (elem % shape[d]) * strides[d];
-  }
-
-  return loc;
-}
-
-template <int NDIM>
-METAL_FUNC size_t elem_to_loc_nd(
-    uint3 elem,
-    constant const int shape[NDIM],
-    constant const size_t strides[NDIM]) {
-  size_t loc = elem.x * strides[NDIM - 1] + elem.y * strides[NDIM - 2];
-  for (int d = NDIM - 3; d >= 0; --d) {
-    loc += (elem.z % shape[d]) * strides[d];
-    elem.z /= shape[d];
-  }
-  return loc;
-}
-
-template <int NDIM>
-METAL_FUNC int64_t elem_to_loc_nd(
-    uint elem,
-    constant const int shape[NDIM],
-    constant const int64_t strides[NDIM]) {
-  int64_t loc = (elem % shape[NDIM - 1]) * strides[NDIM - 1];
-
-  MLX_MTL_PRAGMA_UNROLL
-  for (int d = NDIM - 2; d >= 0; --d) {
-    elem /= shape[d + 1];
-    loc += (elem % shape[d]) * strides[d];
-  }
-
-  return loc;
-}
-
-template <int NDIM>
-METAL_FUNC int64_t elem_to_loc_nd(
-    uint3 elem,
-    constant const int shape[NDIM],
-    constant const int64_t strides[NDIM]) {
-  int64_t loc = elem.x * strides[NDIM - 1] + elem.y * strides[NDIM - 2];
-  for (int d = NDIM - 3; d >= 0; --d) {
-    loc += (elem.z % shape[d]) * strides[d];
-    elem.z /= shape[d];
-  }
-  return loc;
+template <typename IdxT = int64_t>
+METAL_FUNC IdxT elem_to_loc_3(uint3 elem, constant const int64_t strides[3]) {
+  return elem.x * IdxT(strides[2]) + elem.y * IdxT(strides[1]) +
+      elem.z * IdxT(strides[0]);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 // Multiple Arrays with generic dims
 
-METAL_FUNC uint2 elem_to_loc_2_nd(
+template <typename IdxT = int64_t>
+METAL_FUNC vec<IdxT, 2> elem_to_loc_2_nd(
     uint3 elem,
     constant const int* shape,
-    constant const size_t* a_strides,
-    constant const size_t* b_strides,
+    constant const int64_t* a_strides,
+    constant const int64_t* b_strides,
     int ndim) {
-  uint2 loc = {
-      static_cast<uint>(
-          elem.x * a_strides[ndim - 1] + elem.y * a_strides[ndim - 2]),
-      static_cast<uint>(
-          elem.x * b_strides[ndim - 1] + elem.y * b_strides[ndim - 2])};
+  vec<IdxT, 2> loc = {
+      IdxT(
+          elem.x * IdxT(a_strides[ndim - 1]) +
+          IdxT(elem.y) * IdxT(a_strides[ndim - 2])),
+      IdxT(
+          elem.x * IdxT(b_strides[ndim - 1]) +
+          elem.y * IdxT(b_strides[ndim - 2]))};
   for (int d = ndim - 3; d >= 0; --d) {
     uint l = elem.z % shape[d];
-    loc.x += l * a_strides[d];
-    loc.y += l * b_strides[d];
+    loc.x += l * IdxT(a_strides[d]);
+    loc.y += l * IdxT(b_strides[d]);
     elem.z /= shape[d];
   }
   return loc;
 }
 
-METAL_FUNC uint3 elem_to_loc_3_nd(
+template <typename IdxT = int64_t>
+METAL_FUNC vec<IdxT, 3> elem_to_loc_3_nd(
     uint3 elem,
     constant const int* shape,
-    constant const size_t* a_strides,
-    constant const size_t* b_strides,
-    constant const size_t* c_strides,
+    constant const int64_t* a_strides,
+    constant const int64_t* b_strides,
+    constant const int64_t* c_strides,
     int ndim) {
-  uint3 loc = {
-      static_cast<uint>(
-          elem.x * a_strides[ndim - 1] + elem.y * a_strides[ndim - 2]),
-      static_cast<uint>(
-          elem.x * b_strides[ndim - 1] + elem.y * b_strides[ndim - 2]),
-      static_cast<uint>(
-          elem.x * c_strides[ndim - 1] + elem.y * c_strides[ndim - 2])};
+  vec<IdxT, 3> loc = {
+      IdxT(elem.x * IdxT(a_strides[ndim - 1])) +
+          IdxT(elem.y * IdxT(a_strides[ndim - 2])),
+      IdxT(elem.x * IdxT(b_strides[ndim - 1])) +
+          IdxT(elem.y * IdxT(b_strides[ndim - 2])),
+      IdxT(elem.x * IdxT(c_strides[ndim - 1])) +
+          IdxT(elem.y * IdxT(c_strides[ndim - 2]))};
   for (int d = ndim - 3; d >= 0; --d) {
     uint l = elem.z % shape[d];
-    loc.x += l * a_strides[d];
-    loc.y += l * b_strides[d];
-    loc.z += l * c_strides[d];
+    loc.x += l * IdxT(a_strides[d]);
+    loc.y += l * IdxT(b_strides[d]);
+    loc.z += l * IdxT(c_strides[d]);
     elem.z /= shape[d];
   }
   return loc;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// Multiple Arrays with fixed N dims
+// Elem to loc in a loop utils
+///////////////////////////////////////////////////////////////////////////////
 
-template <int NDIM>
-METAL_FUNC uint2 elem_to_loc_2_nd(
-    uint3 elem,
-    constant const int shape[NDIM],
-    constant const size_t a_strides[NDIM],
-    constant const size_t b_strides[NDIM]) {
-  uint2 loc = {
-      static_cast<uint>(
-          elem.x * a_strides[NDIM - 1] + elem.y * a_strides[NDIM - 2]),
-      static_cast<uint>(
-          elem.x * b_strides[NDIM - 1] + elem.y * b_strides[NDIM - 2])};
-  for (int d = NDIM - 3; d >= 0; --d) {
-    uint l = elem.z % shape[d];
-    loc.x += l * a_strides[d];
-    loc.y += l * b_strides[d];
-    elem.z /= shape[d];
-  }
-  return loc;
-}
+template <int DIM, typename OffsetT = size_t, bool General = true>
+struct LoopedElemToLoc {
+  int dim;
+  LoopedElemToLoc<DIM - 1, OffsetT, General> inner_looper;
+  OffsetT offset{0};
+  int index{0};
 
-template <int NDIM>
-METAL_FUNC uint3 elem_to_loc_3_nd(
-    uint3 elem,
-    constant const int shape[NDIM],
-    constant const size_t a_strides[NDIM],
-    constant const size_t b_strides[NDIM],
-    constant const size_t c_strides[NDIM]) {
-  uint3 loc = {
-      static_cast<uint>(
-          elem.x * a_strides[NDIM - 1] + elem.y * a_strides[NDIM - 2]),
-      static_cast<uint>(
-          elem.x * b_strides[NDIM - 1] + elem.y * b_strides[NDIM - 2]),
-      static_cast<uint>(
-          elem.x * c_strides[NDIM - 1] + elem.y * c_strides[NDIM - 2])};
-  for (int d = NDIM - 3; d >= 0; --d) {
-    uint l = elem.z % shape[d];
-    loc.x += l * a_strides[d];
-    loc.y += l * b_strides[d];
-    loc.z += l * c_strides[d];
-    elem.z /= shape[d];
+  LoopedElemToLoc(int dim) thread : dim(dim), inner_looper(dim - 1) {}
+
+  void next(const constant int* shape, const constant int64_t* strides) thread {
+    if (dim == 0) {
+      return;
+    }
+    index++;
+    offset += OffsetT(strides[dim - 1]);
+    if (index >= shape[dim - 1]) {
+      index = 0;
+      inner_looper.next(shape, strides);
+      offset = inner_looper.offset;
+    }
   }
-  return loc;
-}
+
+  void next(int n, const constant int* shape, const constant int64_t* strides)
+      thread {
+    if (dim == 0) {
+      return;
+    }
+    index += n;
+    offset += n * OffsetT(strides[dim - 1]);
+
+    if (index >= shape[dim - 1]) {
+      int extra = index - shape[dim - 1];
+      if (extra >= shape[dim - 1]) {
+        inner_looper.next(1 + extra / shape[dim - 1], shape, strides);
+        extra = extra % shape[dim - 1];
+      } else {
+        inner_looper.next(shape, strides);
+      }
+      index = 0;
+      offset = inner_looper.offset;
+      if (extra > 0) {
+        next(extra, shape, strides);
+      }
+    }
+  }
+
+  OffsetT location() thread {
+    return offset;
+  }
+};
+
+template <typename OffsetT>
+struct LoopedElemToLoc<1, OffsetT, true> {
+  int dim;
+  OffsetT offset{0};
+  uint index{0};
+
+  LoopedElemToLoc(int dim) thread : dim(dim) {}
+
+  void next(const constant int* shape, const constant int64_t* strides) thread {
+    index++;
+    if (dim > 1) {
+      offset = elem_to_loc<OffsetT>(index, shape, strides, dim);
+    } else {
+      offset += OffsetT(strides[0]);
+    }
+  }
+
+  void next(int n, const constant int* shape, const constant int64_t* strides)
+      thread {
+    index += n;
+    if (dim > 1) {
+      offset = elem_to_loc<OffsetT>(index, shape, strides, dim);
+    } else {
+      offset = index * OffsetT(strides[0]);
+    }
+  }
+
+  OffsetT location() thread {
+    return offset;
+  }
+};
+
+template <typename OffsetT>
+struct LoopedElemToLoc<1, OffsetT, false> {
+  OffsetT offset{0};
+
+  LoopedElemToLoc(int) thread {}
+
+  void next(const constant int*, const constant int64_t* strides) thread {
+    offset += OffsetT(strides[0]);
+  }
+
+  void next(int n, const constant int*, const constant int64_t* strides)
+      thread {
+    offset += n * OffsetT(strides[0]);
+  }
+
+  OffsetT location() thread {
+    return offset;
+  }
+};
 
 ///////////////////////////////////////////////////////////////////////////////
 // Calculation utils
 ///////////////////////////////////////////////////////////////////////////////
 
 /** Compute ceil((float)N/(float)M) */
-inline size_t ceildiv(size_t N, size_t M) {
+template <typename T, typename U>
+inline T ceildiv(T N, U M) {
   return (N + M - 1) / M;
 }
 
@@ -319,6 +336,23 @@ inline bfloat16_t log1p(bfloat16_t x) {
   return bfloat16_t(x * (metal::log(xp1) / (xp1 - 1.0f)));
 }
 
+inline complex64_t log1p(complex64_t in) {
+  float x = in.real;
+  float y = in.imag;
+  float zabs = metal::precise::sqrt(x * x + y * y);
+  float theta = metal::atan2(y, x + 1);
+  if (zabs < 0.5f) {
+    float r = x * (2 + x) + y * y;
+    if (r == 0) { // handle underflow
+      return {x, theta};
+    }
+    return {0.5f * log1p(r), theta};
+  } else {
+    auto z0 = metal::sqrt((x + 1) * (x + 1) + y * y);
+    return {metal::log(z0), theta};
+  }
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // SIMD shuffle ops
 ///////////////////////////////////////////////////////////////////////////////
@@ -336,3 +370,79 @@ inline int64_t simd_shuffle_down(int64_t data, uint16_t delta) {
 inline bool simd_shuffle_down(bool data, uint16_t delta) {
   return simd_shuffle_down(static_cast<uint32_t>(data), delta);
 }
+
+inline complex64_t simd_shuffle_down(complex64_t data, uint16_t delta) {
+  return complex64_t(
+      simd_shuffle_down(data.real, delta), simd_shuffle_down(data.imag, delta));
+}
+
+inline uint64_t simd_shuffle_up(uint64_t data, uint16_t delta) {
+  return as_type<uint64_t>(metal::simd_shuffle_up(as_type<uint2>(data), delta));
+}
+
+inline int64_t simd_shuffle_up(int64_t data, uint16_t delta) {
+  return as_type<int64_t>(metal::simd_shuffle_up(as_type<uint2>(data), delta));
+}
+
+inline bool simd_shuffle_up(bool data, uint16_t delta) {
+  return simd_shuffle_up(static_cast<uint32_t>(data), delta);
+}
+
+inline complex64_t simd_shuffle_up(complex64_t data, uint16_t delta) {
+  return complex64_t(
+      simd_shuffle_up(data.real, delta), simd_shuffle_up(data.imag, delta));
+}
+
+inline uint64_t
+simd_shuffle_and_fill_up(uint64_t data, uint64_t filling, uint16_t delta) {
+  return as_type<uint64_t>(metal::simd_shuffle_and_fill_up(
+      as_type<uint2>(data), as_type<uint2>(filling), delta));
+}
+
+inline int64_t
+simd_shuffle_and_fill_up(int64_t data, int64_t filling, uint16_t delta) {
+  return as_type<int64_t>(metal::simd_shuffle_and_fill_up(
+      as_type<uint2>(data), as_type<uint2>(filling), delta));
+}
+
+inline bool simd_shuffle_and_fill_up(bool data, bool filling, uint16_t delta) {
+  return simd_shuffle_and_fill_up(
+      static_cast<uint32_t>(data), static_cast<uint32_t>(filling), delta);
+}
+
+inline complex64_t simd_shuffle_and_fill_up(
+    complex64_t data,
+    complex64_t filling,
+    uint16_t delta) {
+  return complex64_t(
+      simd_shuffle_and_fill_up(data.real, filling.real, delta),
+      simd_shuffle_and_fill_up(data.imag, filling.imag, delta));
+}
+
+inline uint64_t simd_shuffle(uint64_t data, uint16_t lane) {
+  return as_type<uint64_t>(metal::simd_shuffle(as_type<uint2>(data), lane));
+}
+
+inline int64_t simd_shuffle(int64_t data, uint16_t lane) {
+  return as_type<int64_t>(metal::simd_shuffle(as_type<uint2>(data), lane));
+}
+
+inline bool simd_shuffle(bool data, uint16_t lane) {
+  return simd_shuffle(static_cast<uint32_t>(data), lane);
+}
+
+inline complex64_t simd_shuffle(complex64_t data, uint16_t lane) {
+  return complex64_t(
+      simd_shuffle(data.real, lane), simd_shuffle(data.imag, lane));
+}
+
+// std::conditional is not included with Metal
+template <bool condition, typename T, typename U>
+struct ConditionalType {
+  using type = U;
+};
+
+template <typename T, typename U>
+struct ConditionalType<true, T, U> {
+  using type = T;
+};

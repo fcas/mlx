@@ -10,21 +10,21 @@ import numpy as np
 
 class TestReduce(mlx_tests.MLXTestCase):
     def test_axis_permutation_sums(self):
-        x_npy = np.random.randn(5, 5, 5, 5, 5).astype(np.float32)
-        x_mlx = mx.array(x_npy)
-        for t in permutations(range(5)):
-            with self.subTest(t=t):
-                y_npy = np.transpose(x_npy, t)
-                y_mlx = mx.transpose(x_mlx, t)
-                for n in range(1, 6):
-                    for a in combinations(range(5), n):
-                        with self.subTest(a=a):
-                            z_npy = np.sum(y_npy, axis=a)
-                            z_mlx = mx.sum(y_mlx, axis=a)
-                            mx.eval(z_mlx)
-                            self.assertTrue(
-                                np.allclose(z_npy, np.array(z_mlx), atol=1e-4)
-                            )
+        for shape in [(5, 5, 1, 5, 5), (65, 65, 1, 65)]:
+            with self.subTest(shape=shape):
+                x_npy = (np.random.randn(*shape) * 128).astype(np.int32)
+                x_mlx = mx.array(x_npy)
+                for t in permutations(range(len(shape))):
+                    with self.subTest(t=t):
+                        y_npy = np.transpose(x_npy, t)
+                        y_mlx = mx.transpose(x_mlx, t)
+                        for n in range(1, len(shape) + 1):
+                            for a in combinations(range(len(shape)), n):
+                                with self.subTest(a=a):
+                                    z_npy = np.sum(y_npy, axis=a)
+                                    z_mlx = mx.sum(y_mlx, axis=a)
+                                    mx.eval(z_mlx)
+                                    self.assertTrue(np.all(z_npy == z_mlx))
 
     def test_expand_sums(self):
         x_npy = np.random.randn(5, 1, 5, 1, 5, 1).astype(np.float32)
@@ -57,6 +57,7 @@ class TestReduce(mlx_tests.MLXTestCase):
             "uint32",
             "int64",
             "uint64",
+            "complex64",
         ]
         float_dtypes = ["float32"]
 
@@ -114,6 +115,164 @@ class TestReduce(mlx_tests.MLXTestCase):
                     b = getattr(np, op)(data)
                     self.assertEqual(a.item(), b)
 
+    def test_edge_case(self):
+        x = (mx.random.normal((100, 1, 100, 100)) * 128).astype(mx.int32)
+        x = x.transpose(0, 3, 1, 2)
+
+        y = x.sum((0, 2, 3))
+        mx.eval(y)
+        z = np.array(x).sum((0, 2, 3))
+        self.assertTrue(np.all(z == y))
+
+    def test_zero_size(self):
+        # max and min have no identity, so they are only undefined when an axis
+        # being reduced is itself empty. An array that is empty because of some
+        # other axis reduces into an empty result.
+        for shape, axis in [
+            ((0, 2), -1),
+            ((2, 0), 0),
+            ((3, 0, 2), -1),
+            ((0, 3, 2), (1, 2)),
+        ]:
+            a_np = np.zeros(shape, dtype=np.float32)
+            a_mx = mx.array(a_np)
+            for op in ["max", "min"]:
+                out = getattr(mx, op)(
+                    a_mx, axis=list(axis) if isinstance(axis, tuple) else axis
+                )
+                mx.eval(out)
+                self.assertEqual(out.shape, getattr(np, op)(a_np, axis=axis).shape)
+
+        # Reducing an empty axis still raises, like numpy
+        for shape, axis in [((2, 0), -1), ((0, 2), 0), ((0, 0), -1)]:
+            a_mx = mx.zeros(shape)
+            for op in ["max", "min"]:
+                with self.assertRaises(ValueError):
+                    getattr(mx, op)(a_mx, axis=axis)
+
+    def test_sum_bool(self):
+        x = np.random.uniform(0, 1, size=(10, 10, 10)) > 0.5
+        y = mx.array(x)
+        npsum = x.sum().item()
+        mxsum = y.sum().item()
+        self.assertEqual(npsum, mxsum)
+
+    def test_many_reduction_axes(self):
+
+        def check(x, axes):
+            expected = x
+            for ax in axes:
+                expected = mx.sum(expected, axis=ax, keepdims=True)
+            out = mx.sum(x, axis=axes, keepdims=True)
+            self.assertTrue(mx.array_equal(out, expected))
+
+        x = mx.random.randint(0, 10, shape=(4, 4, 4, 4, 4))
+        check(x, (0, 2, 4))
+
+        x = mx.random.randint(0, 10, shape=(4, 4, 4, 4, 4, 4, 4))
+        check(x, (0, 2, 4, 6))
+
+        x = mx.random.randint(0, 10, shape=(4, 4, 4, 4, 4, 4, 4, 4, 4))
+        check(x, (0, 2, 4, 6, 8))
+
+        x = mx.random.randint(0, 10, shape=(4, 4, 4, 4, 4, 4, 4, 4, 4, 128))
+        x = x.transpose(1, 0, 2, 3, 4, 5, 6, 7, 8, 9)
+        check(x, (1, 3, 5, 7, 9))
+
+    def test_nan_propagation(self):
+        dtypes = [
+            "uint8",
+            "uint16",
+            "uint32",
+            "int8",
+            "int16",
+            "int32",
+            "float16",
+            "float32",
+        ]
+
+        for dtype in dtypes:
+            with self.subTest(dtype=dtype):
+                x = (mx.random.normal((4, 4)) * 10).astype(getattr(mx, dtype))
+                indices = mx.random.randint(0, 4, shape=(6,)).reshape(3, 2)
+                for idx in indices:
+                    x[idx[0], idx[1]] = mx.nan
+                x_np = np.array(x)
+
+                for op in ["max", "min"]:
+                    for axis in [0, 1]:
+                        out = getattr(mx, op)(x, axis=axis)
+                        ref = getattr(np, op)(x_np, axis=axis)
+                        self.assertTrue(np.array_equal(out, ref, equal_nan=True))
+
+    def test_nan_propagation_complex64(self):
+        complex_array_1 = mx.array(
+            [1 + 1j, 2 + 2j, 3 + 3j, mx.nan + 4j], dtype=mx.complex64
+        ).reshape(2, 2)
+        complex_array_2 = mx.array(
+            [1 + 1j, 2 + 2j, 3 + mx.nan * 1j, 4 + 4j], dtype=mx.complex64
+        ).reshape(2, 2)
+        complex_array_3 = mx.array(
+            [1 + 1j, 2 + mx.nan * 1j, 3 + 3j, 4 + 4j], dtype=mx.complex64
+        ).reshape(2, 2)
+        complex_array_4 = mx.array(
+            [mx.nan + 1j, 2 + 2j, 3 + 3j, 4 + 4j], dtype=mx.complex64
+        ).reshape(2, 2)
+
+        np_arrays = [
+            np.array(complex_array_1),
+            np.array(complex_array_2),
+            np.array(complex_array_3),
+            np.array(complex_array_4),
+        ]
+
+        for mx_arr, np_arr in zip(
+            [complex_array_1, complex_array_2, complex_array_3, complex_array_4],
+            np_arrays,
+        ):
+            for axis in [0, 1]:
+                for op in ["max", "min"]:
+                    out = getattr(mx, op)(mx_arr, axis=axis)
+                    ref = getattr(np, op)(np_arr, axis=axis)
+                    self.assertTrue(np.array_equal(out, ref, equal_nan=True))
+
+    def test_long_column(self):
+        a = (np.random.randn(8192, 64) * 32).astype(np.int32)
+        b = mx.array(a)
+
+        c1 = a.sum(0)
+        c2 = b.sum(0)
+        self.assertTrue(np.all(c1 == c2))
+
+    def test_and_or_negative_zero(self):
+        # -0.0 equals zero but has its sign bit set, so it must not be treated
+        # as truthy just because its bit pattern is nonzero
+        for dtype in ["float32", "float16", "float64"]:
+            with self.subTest(dtype=dtype):
+                for values in [
+                    [0.0, -0.0],
+                    [-0.0, -0.0],
+                    [-0.0] * 70,
+                    [-0.0, 0.0, 1.0],
+                    [0.5, 0.0],
+                ]:
+                    a_np = np.array(values, dtype=getattr(np, dtype))
+                    a_mx = mx.array(a_np)
+                    for op in ["any", "all"]:
+                        self.assertEqual(
+                            getattr(mx, op)(a_mx).item(),
+                            bool(getattr(np, op)(a_np)),
+                            msg=f"{op} {dtype} {values}",
+                        )
+
+        x_np = np.array([[0.0, -0.0], [1.0, 0.0], [-0.0, -0.0]], dtype=np.float32)
+        x_mx = mx.array(x_np)
+        for op in ["any", "all"]:
+            self.assertEqual(
+                getattr(mx, op)(x_mx, axis=1).tolist(),
+                getattr(np, op)(x_np, axis=1).tolist(),
+            )
+
 
 if __name__ == "__main__":
-    unittest.main(failfast=True)
+    mlx_tests.MLXTestRunner(failfast=True)

@@ -10,7 +10,16 @@ import mlx.nn as nn
 import mlx.optimizers as opt
 import mlx.utils
 import mlx_tests
-from mlx.utils import tree_flatten, tree_map
+import numpy as np
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
+
+try:
+    import torch
+    import torch.nn.functional as F
+
+    has_torch = True
+except ImportError as e:
+    has_torch = False
 
 
 def get_all_optimizers():
@@ -30,6 +39,7 @@ def tree_equal(fn, *args):
 
 
 optimizers_dict = get_all_optimizers()
+del optimizers_dict["MultiOptimizer"]
 
 
 class TestOptimizers(mlx_tests.MLXTestCase):
@@ -160,6 +170,16 @@ class TestOptimizers(mlx_tests.MLXTestCase):
             )
         )
 
+    def test_epsilon_validation(self):
+        # RMSprop/Adagrad/AdaDelta accumulators start at zero, so eps == 0 lets a
+        # zero gradient compute 0 / 0 (or sqrt(0) / sqrt(0)), producing NaN
+        # parameters. The guard must reject eps <= 0, and the message says ">0".
+        for optimizer in (opt.RMSprop, opt.Adagrad, opt.AdaDelta):
+            with self.assertRaisesRegex(ValueError, ">0"):
+                optimizer(learning_rate=1e-2, eps=-1.0)
+            with self.assertRaisesRegex(ValueError, ">0"):
+                optimizer(learning_rate=1e-2, eps=0.0)
+
     def test_adam(self):
         params = {
             "first": [mx.zeros((10,)), mx.zeros((1,))],
@@ -186,6 +206,58 @@ class TestOptimizers(mlx_tests.MLXTestCase):
                 )
             )
 
+        # Test for correct gradient type propagation
+        params = tree_map(lambda x: x.astype(mx.float16), params)
+        grads = tree_map(lambda x: x.astype(mx.float16), grads)
+        optim = opt.Adam(1e-2, bias_correction=True)
+        new_params = optim.apply_gradients(grads, params)
+        self.assertTrue(tree_equal(lambda p: p.dtype == mx.float16, new_params))
+
+    @unittest.skipIf(not has_torch, "requires Torch")
+    def test_adamw_matches_pytorch(self):
+        mx.random.seed(0)
+        np.random.seed(0)
+
+        model = nn.Linear(3, 1)
+        init_weight = np.array(model.weight.tolist())
+        init_bias = np.array(model.bias.tolist())
+
+        def loss_fn(model, x, y):
+            pred = model(x)
+            return nn.losses.mse_loss(pred, y)
+
+        x = np.random.rand(3, 3)
+        y = np.random.rand(3, 1)
+
+        optimizer = opt.AdamW(learning_rate=3e-4, bias_correction=True)
+        loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+        loss, grads = loss_and_grad_fn(model, mx.array(x), mx.array(y))
+        optimizer.update(model, grads)
+
+        # Equivalent torch code
+        torch_model = torch.nn.Linear(3, 1)
+
+        # copy over the parameters
+        torch_model.weight.data = torch.tensor(init_weight, dtype=torch.float32)
+        torch_model.bias.data = torch.tensor(init_bias, dtype=torch.float32)
+
+        torch_optimizer = torch.optim.AdamW(torch_model.parameters(), lr=3e-4)
+        torch_optimizer.zero_grad()
+        pred = torch_model(torch.tensor(x, dtype=torch.float32))
+        loss = torch.nn.MSELoss()(pred, torch.tensor(y, dtype=torch.float32))
+        loss.backward()
+        torch_optimizer.step()
+
+        for name, param in torch_model.named_parameters():
+            mlx_grad = np.array(grads[name])
+            torch_grad = param.grad.detach().numpy()
+            self.assertTrue(np.allclose(torch_grad, mlx_grad))
+
+        for name, param in torch_model.named_parameters():
+            mlx_param = np.array(model[name])
+            torch_param = param.data.detach().numpy()
+            self.assertTrue(np.allclose(torch_param, mlx_param))
+
     def test_lion(self):
         params = {
             "first": [mx.zeros((10,)), mx.zeros((1,))],
@@ -206,21 +278,91 @@ class TestOptimizers(mlx_tests.MLXTestCase):
 
     def test_adafactor(self):
         x = mx.zeros((5, 5))
-        grad = mx.ones_like(x)
+        params = {"x": x}
+        grad = {"x": mx.ones_like(x)}
         optimizer = opt.Adafactor()
         for _ in range(2):
-            xp = optimizer.apply_gradients(grad, x)
-            self.assertEqual(xp.dtype, x.dtype)
-            self.assertEqual(xp.shape, x.shape)
+            xp = optimizer.apply_gradients(grad, params)
+            self.assertEqual(xp["x"].dtype, x.dtype)
+            self.assertEqual(xp["x"].shape, x.shape)
 
         x = mx.zeros((5, 5), mx.float16)
-        grad = mx.ones_like(x)
+        params = {"x": x}
+        grad = {"x": mx.ones_like(x)}
         optimizer = opt.Adafactor()
         for _ in range(2):
-            xp = optimizer.apply_gradients(grad, x)
-            self.assertEqual(xp.dtype, x.dtype)
-            self.assertEqual(xp.shape, x.shape)
+            xp = optimizer.apply_gradients(grad, params)
+            self.assertEqual(xp["x"].dtype, x.dtype)
+            self.assertEqual(xp["x"].shape, x.shape)
         self.assertEqual(optimizer.state["step"], 2)
+
+        # Parameters with more than 2 dimensions also use the factored update
+        x = mx.zeros((2, 3, 4))
+        params = {"x": x}
+        grad = {"x": mx.ones_like(x)}
+        optimizer = opt.Adafactor()
+        for _ in range(2):
+            xp = optimizer.apply_gradients(grad, params)
+            self.assertEqual(xp["x"].shape, x.shape)
+            self.assertTrue(mx.isfinite(xp["x"]).all())
+            params = xp
+
+        # The factored estimate is a per-batch separable outer product
+        row = mx.array([[1.0, 4.0, 9.0], [16.0, 25.0, 36.0]])
+        col = mx.array([[1.0, 4.0, 9.0, 16.0], [25.0, 36.0, 49.0, 64.0]])
+        got = np.array(opt.Adafactor()._approximate_exp_moving_avg(row, col))
+        row_np, col_np = np.array(row), np.array(col)
+        r = 1.0 / np.sqrt(row_np / row_np.mean(axis=-1, keepdims=True))
+        c = 1.0 / np.sqrt(col_np)
+        expected = r[..., :, None] * c[..., None, :]
+        self.assertTrue(np.allclose(got, expected))
+
+    def test_muon(self):
+        params = {
+            "first": [mx.zeros((10, 5)), mx.zeros((1,))],
+            "second": mx.zeros((3, 3)),
+            "conv": mx.zeros((16, 8, 3, 3)),
+        }
+        grads = tree_map(lambda x: mx.ones_like(x), params)
+
+        # Explicit init
+        optim = opt.Muon(learning_rate=1e-2, momentum=0.95, nesterov=True)
+        optim.init(params)
+        self.assertTrue(
+            tree_equal(
+                lambda p, s: mx.array_equal(s["v"], mx.zeros_like(p)),
+                params,
+                optim.state,
+            )
+        )
+
+        # Test update
+        updated_params = optim.apply_gradients(grads, params)
+
+        # Check that shapes are preserved
+        self.assertTrue(
+            tree_equal(
+                lambda p, u: p.shape == u.shape,
+                params,
+                updated_params,
+            )
+        )
+
+        # Check that parameters actually changed
+        self.assertFalse(
+            tree_equal(
+                lambda p, u: mx.array_equal(p, u),
+                params,
+                updated_params,
+            )
+        )
+
+        # Test with different configurations
+        optim_no_nesterov = opt.Muon(learning_rate=1e-2, momentum=0.95, nesterov=False)
+        optim_no_nesterov.apply_gradients(grads, params)
+
+        optim_no_momentum = opt.Muon(learning_rate=1e-2, momentum=0.0)
+        optim_no_momentum.apply_gradients(grads, params)
 
     def test_compiled_optimizer(self):
         model = nn.Linear(10, 10)
@@ -296,7 +438,7 @@ class TestOptimizers(mlx_tests.MLXTestCase):
         self.assertTrue(mx.allclose(result["w"], mx.full((5, 5), 3.0)))
 
 
-class TestSchedulers(unittest.TestCase):
+class TestSchedulers(mlx_tests.MLXTestCase):
     def test_decay_lr(self):
         for optim_class in optimizers_dict.values():
             lr_schedule = opt.step_decay(1e-1, 0.9, 1)
@@ -329,9 +471,11 @@ class TestSchedulers(unittest.TestCase):
         self.assertAlmostEqual(lr, expected_lr, delta=1e-7)
 
         lr_schedule = opt.cosine_decay(0.1, 10, 0.05)
+        lr = lr_schedule(9)
+        expected_end_lr = 0.05
+        self.assertGreater(lr, expected_end_lr)
         lr = lr_schedule(20)
-        expected_lr = 0.05
-        self.assertEqual(lr, expected_lr)
+        self.assertEqual(lr, expected_end_lr)
 
     def test_schedule_joiner(self):
         boundaries = [2, 3, 4]
@@ -418,6 +562,78 @@ class TestSchedulers(unittest.TestCase):
             "Gradients were not scaled correctly during clipping.",
         )
 
+        with self.assertRaises(ValueError):
+            opt.clip_grad_norm(small_grads, -1.0)
+
+    def test_init_from_state(self):
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.l1 = nn.Linear(2, 2)
+                self.drop = nn.Dropout(p=0.5)
+                self.l2 = nn.Linear(2, 2)
+                self.vals = [nn.Linear(2, 2), nn.ReLU(), nn.ReLU()]
+
+        model = Model()
+        optimizer = opt.Adam(learning_rate=3e-4)
+        optimizer.init(model.trainable_parameters())
+
+        # Flatten the state for serialization
+        state = tree_flatten(optimizer.state)
+
+        # Make a new optimizer and load the state
+        optimizer = opt.Adam(learning_rate=3e-4)
+        optimizer.state = tree_unflatten(state)
+
+        # This should work without any errors
+        grads = model.trainable_parameters()
+        optimizer.update(model, grads)
+
+    def test_multi_optimizer(self):
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.l1 = nn.Linear(2, 2)
+                self.drop = nn.Dropout(p=0.5)
+                self.l2 = nn.Linear(2, 2)
+                self.vals = [nn.Linear(2, 2), nn.ReLU(), nn.ReLU()]
+
+        model = Model()
+        optimizer = opt.MultiOptimizer(
+            [opt.Adam(learning_rate=0.001), opt.SGD(learning_rate=0.1)],
+            [lambda name, weight: weight.ndim > 1],
+        )
+        optimizer.init(model.trainable_parameters())
+
+        self.assertEqual(len(optimizer.state["states"]), 2)
+
+        adam_states = tree_flatten(optimizer.state["states"][0])
+        sgd_states = tree_flatten(optimizer.state["states"][1])
+        self.assertEqual((len(sgd_states) - 2) * 2, len(adam_states) - 2)
+        self.assertFalse(any("bias" in k for k, v in adam_states))
+        self.assertFalse(any("weight" in k for k, v in sgd_states))
+
+    def test_multi_optimizer_with_parameterless_layers(self):
+        mx.random.seed(0)
+        # test a sequential that has a no parameter module like ReLU
+        model = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 4))
+        mx.eval(model.parameters())
+
+        optimizer = opt.MultiOptimizer(
+            [opt.Muon(learning_rate=0.01), opt.AdamW(learning_rate=0.01)],
+            [lambda _, w: w.ndim >= 2],
+        )
+
+        loss_and_grad = nn.value_and_grad(model, lambda m, x: m(x).sum())
+        _, grads = loss_and_grad(model, mx.ones((1, 4)))
+        optimizer.update(model, grads)
+
+        w, b = model.layers[0].weight, model.layers[0].bias
+        optimizer.update(model, grads)
+        mx.eval(model.parameters())
+        self.assertFalse(mx.array_equal(w, model.layers[0].weight))
+        self.assertFalse(mx.array_equal(b, model.layers[0].bias))
+
 
 if __name__ == "__main__":
-    unittest.main()
+    mlx_tests.MLXTestRunner()

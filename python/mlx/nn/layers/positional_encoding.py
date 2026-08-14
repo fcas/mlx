@@ -67,7 +67,7 @@ class SinusoidalPositionalEncoding(Module):
         max_freq (float, optional): The maximum frequency expected. Default:
             ``1``.
         scale (float, optional): A multiplicative scale for the embeddings.
-            Default: ``sqrt(dims//2)``.
+            Default: ``sqrt(2/dims)``.
         cos_first (bool, optional): If ``True`` embed using ``[cos(x); sin(x)]``
             instead of the reverse. Default: ``False``.
         full_turns (bool, optional): If ``True`` multiply the frequencies with
@@ -85,7 +85,19 @@ class SinusoidalPositionalEncoding(Module):
     ):
         super().__init__()
 
-        one_zero = 1 - mx.arange(0, dims // 2) / (dims // 2 - 1)
+        # Sinusoidal embeddings are constructed from sin/cos pairs, so the
+        # embedding dimension must be positive and even.
+        if dims <= 0 or dims % 2 != 0:
+            raise ValueError(
+                f"[SinusoidalPositionalEncoding] dims must be positive and even but got {dims}."
+            )
+
+        # Avoid division by zero when dims == 2 (one frequency pair).
+        if dims == 2:
+            one_zero = mx.array([1.0])
+        else:
+            one_zero = 1 - mx.arange(0, dims // 2) / (dims // 2 - 1)
+
         min_freq = math.log(min_freq)
         max_freq = math.log(max_freq)
 
@@ -95,7 +107,7 @@ class SinusoidalPositionalEncoding(Module):
             self._sigmas = self._sigmas * (2 * math.pi)
 
         # Save some constants that define the implementation
-        self.scale = scale or (2 / dims) ** 0.5
+        self.scale = scale if scale is not None else (2 / dims) ** 0.5
         self.cos_first = cos_first
 
     def __call__(self, x):
@@ -115,47 +127,38 @@ class SinusoidalPositionalEncoding(Module):
 
 
 class ALiBi(Module):
-    _alibi_mask_key = None
-    _alibi_mask = None
-
-    @classmethod
+    @staticmethod
     def create_alibi_matrix(
-        cls,
         q_sequence_length: int,
         k_sequence_length: int,
         num_heads: int,
         offset: int,
         dtype=mx.float32,
     ):
-        if (
-            q_sequence_length,
-            k_sequence_length,
-            num_heads,
-            offset,
-            dtype,
-        ) != cls._alibi_mask_key:
-            x1 = mx.arange(offset, q_sequence_length)
-            x2 = mx.arange(0, k_sequence_length)
-            distance_matrix = -mx.abs(
-                mx.expand_dims(x1[:, None] - x2[None, :], axis=(0, 1))
-            )
-            alibi_slope = ALiBi.create_alibi_slope(num_heads=num_heads)
-            alibi_mask = (distance_matrix * alibi_slope).astype(dtype)
-            cls._alibi_mask_key = (
-                q_sequence_length,
-                k_sequence_length,
-                num_heads,
-                offset,
-                dtype,
-            )
-            cls._alibi_mask = alibi_mask
-
-        return cls._alibi_mask
+        x1 = mx.arange(offset, q_sequence_length)
+        x2 = mx.arange(0, k_sequence_length)
+        distance_matrix = -mx.abs(
+            mx.expand_dims(x1[:, None] - x2[None, :], axis=(0, 1))
+        )
+        alibi_slope = ALiBi.create_alibi_slope(num_heads=num_heads, dtype=dtype)
+        alibi_mask = (distance_matrix * alibi_slope).astype(dtype)
+        return alibi_mask
 
     @staticmethod
-    def create_alibi_slope(num_heads):
-        x = (2**8) ** (1 / num_heads)
-        out = mx.power(x, -mx.arange(1, num_heads + 1))
+    def create_alibi_slope(num_heads, dtype):
+        def get_slopes(n: int):
+            if math.log2(n).is_integer():
+                start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+                return [start * start**i for i in range(n)]
+            else:
+                closest_power_of_2 = 2 ** math.floor(math.log2(n))
+                return (
+                    get_slopes(closest_power_of_2)
+                    + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+                )
+
+        slopes = get_slopes(num_heads)
+        out = mx.array(slopes, dtype=dtype)
         return mx.expand_dims(out, axis=(-1, -2))
 
     def __call__(self, attention_scores, offset=0, mask=None):

@@ -4,8 +4,8 @@
 #include <metal_simdgroup_matrix>
 #include <metal_stdlib>
 
-#include "mlx/backend/metal/kernels/bf16.h"
 #include "mlx/backend/metal/kernels/steel/conv/params.h"
+#include "mlx/backend/metal/kernels/utils.h"
 
 #define MLX_MTL_CONST static constant constexpr const
 
@@ -20,6 +20,7 @@ template <typename T, int N>
     const device T* in [[buffer(0)]],
     device T* out [[buffer(1)]],
     const constant MLXConvParams<N>* params [[buffer(2)]],
+    const constant int& row_offset [[buffer(3)]],
     uint3 gid [[thread_position_in_grid]]) {
   int filter_size = params->C;
   for (short i = 0; i < N; i++)
@@ -30,7 +31,7 @@ template <typename T, int N>
     out_pixels *= params->oS[i];
 
   // Set out
-  out += gid.z * filter_size + gid.y * (params->C);
+  out += (size_t)gid.z * filter_size + (size_t)gid.y * (params->C);
 
   // Coordinates in input
   int is[N] = {0};
@@ -39,8 +40,9 @@ template <typename T, int N>
   // gid.y: wS (Filter location to unfold input)
   // gid.x: C (channel)
 
-  int n = (gid.z) / out_pixels;
-  int oS = (gid.z) % out_pixels;
+  int global_row = row_offset + int(gid.z);
+  int n = global_row / out_pixels;
+  int oS = global_row % out_pixels;
   int wS = gid.y;
 
   bool valid = n < params->N;
@@ -83,6 +85,7 @@ template <typename T, int N>
     const device T* in [[buffer(0)]],
     device T* out [[buffer(1)]],
     const constant MLXConvParams<N>* params [[buffer(2)]],
+    const constant int& row_offset [[buffer(3)]],
     uint3 gid [[thread_position_in_grid]]) {
   int filter_size = params->C;
   for (short i = 0; i < N; i++)
@@ -93,7 +96,8 @@ template <typename T, int N>
     out_pixels *= params->oS[i];
 
   // Set out
-  out += gid.z * filter_size + gid.x * (filter_size / params->C);
+  out +=
+      (size_t)gid.z * filter_size + (size_t)gid.x * (filter_size / params->C);
 
   // Coordinates in input
   int is[N] = {0};
@@ -102,16 +106,19 @@ template <typename T, int N>
   // gid.y: wS (Filter location to unfold input)
   // gid.x: C (channel)
 
-  int n = (gid.z) / out_pixels;
-  int oS = (gid.z) % out_pixels;
+  int global_row = row_offset + int(gid.z);
+  int n = global_row / out_pixels;
+  int oS = global_row % out_pixels;
   int wS = gid.y;
 
   bool valid = n < params->N;
 
   // Unroll dimensions
+  int kernel_stride = 1;
   for (int i = N - 1; i >= 0; --i) {
     int os_ = (oS % params->oS[i]);
     int ws_ = (wS % params->wS[i]);
+    out += ws_ * kernel_stride;
 
     ws_ = params->flip ? params->wS[i] - ws_ - 1 : ws_;
 
@@ -125,7 +132,7 @@ template <typename T, int N>
     oS /= params->oS[i];
     wS /= params->wS[i];
 
-    out += ws_ * params->str[i];
+    kernel_stride *= params->wS[i];
   }
 
   if (valid) {
@@ -147,6 +154,7 @@ template <typename T, int N>
       const device itype* in [[buffer(0)]],                                    \
       device itype* out [[buffer(1)]],                                         \
       const constant MLXConvParams<n>* params [[buffer(2)]],                   \
+      const constant int& row_offset [[buffer(3)]],                            \
       uint3 gid [[thread_position_in_grid]]);                                  \
   template                                                                     \
       [[host_name("naive_unfold_transpose_nd_" #name "_" #n)]] [[kernel]] void \
@@ -154,6 +162,7 @@ template <typename T, int N>
           const device itype* in [[buffer(0)]],                                \
           device itype* out [[buffer(1)]],                                     \
           const constant MLXConvParams<n>* params [[buffer(2)]],               \
+          const constant int& row_offset [[buffer(3)]],                        \
           uint3 gid [[thread_position_in_grid]]);
 
 #define instantiate_naive_unfold_nd_dims(name, itype)                      \
@@ -165,113 +174,164 @@ instantiate_naive_unfold_nd_dims(float16, half);
 instantiate_naive_unfold_nd_dims(bfloat16, bfloat16_t);
 
 ///////////////////////////////////////////////////////////////////////////////
-/// Slow and naive conv2d kernels
+/// Depthwise convolution kernels
 ///////////////////////////////////////////////////////////////////////////////
 
-template <
-    typename T,
-    const int BM, /* Threadgroup rows (in threads) */
-    const int BN, /* Threadgroup cols (in threads) */
-    const int TM, /* Thread rows (in elements) */
-    const int TN, /* Thread cols (in elements) */
-    const int BC = 16>
-[[kernel]] void naive_conv_2d(
+constant int ker_h [[function_constant(00)]];
+constant int ker_w [[function_constant(01)]];
+constant int str_h [[function_constant(10)]];
+constant int str_w [[function_constant(11)]];
+constant int tgp_h [[function_constant(100)]];
+constant int tgp_w [[function_constant(101)]];
+constant bool do_flip [[function_constant(200)]];
+
+constant int span_h = tgp_h * str_h + ker_h - 1;
+constant int span_w = tgp_w * str_w + ker_w - 1;
+constant int span_hw = span_h * span_w;
+
+template <typename T>
+[[kernel]] void depthwise_conv_2d(
     const device T* in [[buffer(0)]],
     const device T* wt [[buffer(1)]],
     device T* out [[buffer(2)]],
     const constant MLXConvParams<2>& params [[buffer(3)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
+    uint3 gid [[thread_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  (void)simd_gid;
-  (void)simd_lid;
+  constexpr int tc = 8;
+  constexpr int tw = 8;
+  constexpr int th = 4;
 
-  out += tid.z * params.out_strides[0];
-  in += tid.z * params.in_strides[0];
+  constexpr int c_per_thr = 8;
 
-  int out_o = tid.y * BN * TN + lid.y * TN;
-  int out_hw = tid.x * BM * TM + lid.x * TM;
+  constexpr int TGH = th * 2 + 6;
+  constexpr int TGW = tw * 2 + 6;
+  constexpr int TGC = tc;
 
-  int out_h[TM];
-  int out_w[TN];
+  threadgroup T ins[TGH * TGW * TGC];
 
-  for (int m = 0; m < TM; ++m) {
-    int mm = (out_hw + m);
-    out_h[m] = mm / params.oS[1];
-    out_w[m] = mm % params.oS[1];
-  }
+  const int n_tgblocks_h = (params.oS[0] + th - 1) / th;
+  const int n = tid.z / n_tgblocks_h;
+  const int tghid = tid.z % n_tgblocks_h;
+  const int oh = tghid * th + lid.z;
+  const int ow = gid.y;
+  const int c = gid.x;
 
-  T in_local[TM];
-  T wt_local[TN];
-  T out_local[TM * TN] = {T(0)};
+  in += n * params.in_strides[0];
 
-  for (int h = 0; h < params.wS[0]; ++h) {
-    for (int w = 0; w < params.wS[1]; ++w) {
-      for (int c = 0; c < params.C; ++c) {
-        // Local in
-        for (int m = 0; m < TM; m++) {
-          int i = out_h[m] * params.str[0] - params.pad[0] + h * params.kdil[0];
-          int j = out_w[m] * params.str[1] - params.pad[1] + w * params.kdil[1];
+  // Load in
+  {
+    constexpr int n_threads = th * tw * tc;
+    const int tg_oh = (tghid * th) * str_h - params.pad[0];
+    const int tg_ow = (tid.y * tw) * str_w - params.pad[1];
+    const int tg_c = tid.x * tc;
 
-          bool valid = i >= 0 && i < params.iS[0] && j >= 0 && j < params.iS[1];
-          in_local[m] = valid
-              ? in[i * params.in_strides[1] + j * params.in_strides[2] + c]
-              : T(0);
+    const int thread_idx = simd_gid * 32 + simd_lid;
+    constexpr int thr_per_hw = tc / c_per_thr;
+    constexpr int hw_per_group = n_threads / thr_per_hw;
+
+    const int thr_c = thread_idx % thr_per_hw;
+    const int thr_hw = thread_idx / thr_per_hw;
+
+    for (int hw = thr_hw; hw < span_hw; hw += hw_per_group) {
+      const int h = hw / span_w;
+      const int w = hw % span_w;
+
+      const int ih = tg_oh + h;
+      const int iw = tg_ow + w;
+
+      const int in_s_offset = h * span_w * TGC + w * TGC;
+
+      if (ih >= 0 && ih < params.iS[0] && iw >= 0 && iw < params.iS[1]) {
+        const auto in_load =
+            in + ih * params.in_strides[1] + iw * params.in_strides[2] + tg_c;
+
+        MLX_MTL_PRAGMA_UNROLL
+        for (int cc = 0; cc < c_per_thr; ++cc) {
+          ins[in_s_offset + c_per_thr * thr_c + cc] =
+              in_load[c_per_thr * thr_c + cc];
         }
-
-        // Load weight
-        for (int n = 0; n < TN; ++n) {
-          int o = out_o + n;
-          wt_local[n] = o < params.O
-              ? wt[o * params.wt_strides[0] + h * params.wt_strides[1] +
-                   w * params.wt_strides[2] + c]
-              : T(0);
-        }
-
-        // Accumulate
-        for (int m = 0; m < TM; ++m) {
-          for (int n = 0; n < TN; ++n) {
-            out_local[m * TN + n] += in_local[m] * wt_local[n];
-          }
+      } else {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int cc = 0; cc < c_per_thr; ++cc) {
+          ins[in_s_offset + c_per_thr * thr_c + cc] = T(0);
         }
       }
     }
   }
 
-  for (int m = 0; m < TM; ++m) {
-    for (int n = 0; n < TN; ++n) {
-      if (out_h[m] < params.oS[0] && out_w[m] < params.oS[1] &&
-          (out_o + n) < params.O)
-        out[out_h[m] * params.out_strides[1] +
-            out_w[m] * params.out_strides[2] + out_o + n] =
-            out_local[m * TN + n];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  wt += c * params.wt_strides[0];
+
+  const auto ins_ptr =
+      &ins[lid.z * str_h * span_w * TGC + lid.y * str_w * TGC + lid.x];
+  float o = 0.;
+  for (int h = 0; h < ker_h; ++h) {
+    for (int w = 0; w < ker_w; ++w) {
+      int wt_h = h;
+      int wt_w = w;
+      if (do_flip) {
+        wt_h = ker_h - h - 1;
+        wt_w = ker_w - w - 1;
+      }
+      auto inv = ins_ptr[h * span_w * TGC + w * TGC];
+      auto wtv = wt[wt_h * ker_w + wt_w];
+      o += inv * wtv;
     }
   }
+  threadgroup_barrier(mem_flags::mem_none);
+
+  if (oh >= params.oS[0] || ow >= params.oS[1]) {
+    return;
+  }
+
+  out += n * params.out_strides[0] + oh * params.out_strides[1] +
+      ow * params.out_strides[2];
+  out[c] = static_cast<T>(o);
 }
 
-// Instantiations
+#define instantiate_depthconv2d(iname, itype) \
+  instantiate_kernel("depthwise_conv_2d_" #iname, depthwise_conv_2d, itype)
 
-#define instantiate_naive_conv_2d(name, itype, bm, bn, tm, tn)              \
-  template [[host_name("naive_conv_2d_" #name "_bm" #bm "_bn" #bn "_tm" #tm \
-                       "_tn" #tn)]] [[kernel]] void                         \
-  naive_conv_2d<itype, bm, bn, tm, tn>(                                     \
-      const device itype* in [[buffer(0)]],                                 \
-      const device itype* wt [[buffer(1)]],                                 \
-      device itype* out [[buffer(2)]],                                      \
-      const constant MLXConvParams<2>& params [[buffer(3)]],                \
-      uint3 tid [[threadgroup_position_in_grid]],                           \
-      uint3 lid [[thread_position_in_threadgroup]],                         \
-      uint simd_gid [[simdgroup_index_in_threadgroup]],                     \
-      uint simd_lid [[thread_index_in_simdgroup]]);
+instantiate_depthconv2d(float32, float);
+instantiate_depthconv2d(float16, half);
+instantiate_depthconv2d(bfloat16, bfloat16_t);
 
-#define instantiate_naive_conv_2d_blocks(name, itype) \
-  instantiate_naive_conv_2d(name, itype, 16, 8, 4, 4) \
-      instantiate_naive_conv_2d(name, itype, 16, 8, 2, 4)
+template <typename T, typename IdxT>
+[[kernel]] void depthwise_conv_1d(
+    const device T* in [[buffer(0)]],
+    const device T* w [[buffer(1)]],
+    device T* out [[buffer(2)]],
+    constant const IdxT strides[3],
+    constant const int& kernel_size,
+    uint3 tid [[thread_position_in_grid]],
+    uint3 grid_dim [[threads_per_grid]]) {
+  out += (tid.z * static_cast<IdxT>(grid_dim.y) + tid.y) * grid_dim.x + tid.x;
+  in += tid.z * strides[0] + tid.y * strides[1] + tid.x * strides[2];
+  w += tid.x * kernel_size;
 
-instantiate_naive_conv_2d_blocks(float32, float);
-instantiate_naive_conv_2d_blocks(float16, half);
-instantiate_naive_conv_2d_blocks(bfloat16, bfloat16_t);
+  float acc = 0.0;
+  for (int i = 0; i < kernel_size; ++i) {
+    acc += static_cast<float>(in[0]) * w[i];
+    in += strides[1];
+  }
+  *out = static_cast<T>(acc);
+}
+
+#define instantiate_depthconv1d(iname, itype)                         \
+  instantiate_kernel(                                                 \
+      "depthwise_conv_1d_" #iname, depthwise_conv_1d, itype, int32_t) \
+      instantiate_kernel(                                             \
+          "depthwise_conv_1d_" #iname "_large",                       \
+          depthwise_conv_1d,                                          \
+          itype,                                                      \
+          int64_t)
+
+instantiate_depthconv1d(float32, float);
+instantiate_depthconv1d(float16, half);
+instantiate_depthconv1d(bfloat16, bfloat16_t);
 
 ///////////////////////////////////////////////////////////////////////////////
 /// Winograd kernels
@@ -342,12 +402,12 @@ winograd_conv_2d_weight_transform(
   const short sn = (qid & 2) * 2 + (simd_lane_id % 2) * 2;
 
   // Initialize G matrix
-  simdgroup_matrix<T, 8, 8> G;
+  simdgroup_matrix<float, 8, 8> G;
   G.thread_elements()[0] = WGT::wt_transform[sm][sn];
   G.thread_elements()[1] = WGT::wt_transform[sm][sn + 1];
 
   // Initialize Gt matrix
-  simdgroup_matrix<T, 8, 8> Gt;
+  simdgroup_matrix<float, 8, 8> Gt;
   Gt.thread_elements()[0] = WGT::wt_transform[sn][sm];
   Gt.thread_elements()[1] = WGT::wt_transform[sn + 1][sm];
 
@@ -379,15 +439,15 @@ winograd_conv_2d_weight_transform(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Do transform and store the result
     for (int c = 0; c < BC; ++c) {
-      simdgroup_matrix<T, 8, 8> g;
+      simdgroup_matrix<float, 8, 8> g;
       g.thread_elements()[0] =
           sm < R && sn < R ? Ws[simd_group_id][sm][sn][c] : T(0);
       g.thread_elements()[1] =
           sm < R && sn + 1 < R ? Ws[simd_group_id][sm][sn + 1][c] : T(0);
 
-      simdgroup_matrix<T, 8, 8> g_out = (G * g) * Gt;
-      wt_out_0[c * O] = g_out.thread_elements()[0];
-      wt_out_1[c * O] = g_out.thread_elements()[1];
+      simdgroup_matrix<float, 8, 8> g_out = (G * g) * Gt;
+      wt_out_0[c * O] = static_cast<T>(g_out.thread_elements()[0]);
+      wt_out_1[c * O] = static_cast<T>(g_out.thread_elements()[1]);
     }
 
     wt_in += BC;
@@ -396,20 +456,20 @@ winograd_conv_2d_weight_transform(
   }
 }
 
-#define instantiate_winograd_conv_2d_weight_transform_base(name, itype, bc) \
-  template [[host_name("winograd_conv_2d_weight_transform_" #name           \
-                       "_bc" #bc)]] [[kernel]] void                         \
-  winograd_conv_2d_weight_transform<itype, bc>(                             \
-      const device itype* wt_in [[buffer(0)]],                              \
-      device itype* wt_out [[buffer(1)]],                                   \
-      const constant int& C [[buffer(2)]],                                  \
-      const constant int& O [[buffer(3)]],                                  \
-      uint tid [[threadgroup_position_in_grid]],                            \
-      uint simd_group_id [[simdgroup_index_in_threadgroup]],                \
+#define instantiate_winograd_conv_2d_weight_transform_base(name, itype, bc)   \
+  template [[host_name(                                                       \
+      "winograd_conv_2d_weight_transform_" #name "_bc" #bc)]] [[kernel]] void \
+  winograd_conv_2d_weight_transform<itype, bc>(                               \
+      const device itype* wt_in [[buffer(0)]],                                \
+      device itype* wt_out [[buffer(1)]],                                     \
+      const constant int& C [[buffer(2)]],                                    \
+      const constant int& O [[buffer(3)]],                                    \
+      uint tid [[threadgroup_position_in_grid]],                              \
+      uint simd_group_id [[simdgroup_index_in_threadgroup]],                  \
       uint simd_lane_id [[thread_index_in_simdgroup]]);
 
 template <typename T, int BC, int WM, int WN, int M = 6, int R = 3>
-[[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
 winograd_conv_2d_input_transform(
     const device T* inp_in [[buffer(0)]],
     device T* inp_out [[buffer(1)]],
@@ -431,12 +491,12 @@ winograd_conv_2d_input_transform(
   const short sn = (qid & 2) * 2 + (simd_lane_id % 2) * 2;
 
   // Initialize B matrix
-  simdgroup_matrix<T, 8, 8> B;
+  simdgroup_matrix<float, 8, 8> B;
   B.thread_elements()[0] = WGT::in_transform[sm][sn];
   B.thread_elements()[1] = WGT::in_transform[sm][sn + 1];
 
   // Initialize Bt matrix
-  simdgroup_matrix<T, 8, 8> Bt;
+  simdgroup_matrix<float, 8, 8> Bt;
   Bt.thread_elements()[0] = WGT::in_transform[sn][sm];
   Bt.thread_elements()[1] = WGT::in_transform[sn + 1][sm];
 
@@ -491,13 +551,13 @@ winograd_conv_2d_input_transform(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Do transform and store the result
     for (int c = simd_group_id; c < BC; c += N_SIMD_GROUPS) {
-      simdgroup_matrix<T, 8, 8> I;
+      simdgroup_matrix<float, 8, 8> I;
       I.thread_elements()[0] = Is[sm][sn][c];
       I.thread_elements()[1] = Is[sm][sn + 1][c];
 
-      simdgroup_matrix<T, 8, 8> I_out = (Bt * I) * B;
-      inp_out_0[c] = I_out.thread_elements()[0];
-      inp_out_1[c] = I_out.thread_elements()[1];
+      simdgroup_matrix<float, 8, 8> I_out = (Bt * I) * B;
+      inp_out_0[c] = static_cast<T>(I_out.thread_elements()[0]);
+      inp_out_1[c] = static_cast<T>(I_out.thread_elements()[1]);
     }
 
     inp_in += BC;
@@ -506,21 +566,21 @@ winograd_conv_2d_input_transform(
   }
 }
 
-#define instantiate_winograd_conv_2d_input_transform(name, itype, bc) \
-  template [[host_name("winograd_conv_2d_input_transform_" #name      \
-                       "_bc" #bc)]] [[kernel]] void                   \
-  winograd_conv_2d_input_transform<itype, bc, 2, 2>(                  \
-      const device itype* inp_in [[buffer(0)]],                       \
-      device itype* inp_out [[buffer(1)]],                            \
-      const constant MLXConvParams<2>& params [[buffer(2)]],          \
-      uint3 tid [[threadgroup_position_in_grid]],                     \
-      uint3 lid [[thread_position_in_threadgroup]],                   \
-      uint3 tgp_per_grid [[threadgroups_per_grid]],                   \
-      uint simd_group_id [[simdgroup_index_in_threadgroup]],          \
+#define instantiate_winograd_conv_2d_input_transform(name, itype, bc)        \
+  template [[host_name(                                                      \
+      "winograd_conv_2d_input_transform_" #name "_bc" #bc)]] [[kernel]] void \
+  winograd_conv_2d_input_transform<itype, bc, 2, 2>(                         \
+      const device itype* inp_in [[buffer(0)]],                              \
+      device itype* inp_out [[buffer(1)]],                                   \
+      const constant MLXConvParams<2>& params [[buffer(2)]],                 \
+      uint3 tid [[threadgroup_position_in_grid]],                            \
+      uint3 lid [[thread_position_in_threadgroup]],                          \
+      uint3 tgp_per_grid [[threadgroups_per_grid]],                          \
+      uint simd_group_id [[simdgroup_index_in_threadgroup]],                 \
       uint simd_lane_id [[thread_index_in_simdgroup]]);
 
 template <typename T, int BO, int WM, int WN, int M = 6, int R = 3>
-[[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void
 winograd_conv_2d_output_transform(
     const device T* out_in [[buffer(0)]],
     device T* out_out [[buffer(1)]],
@@ -541,12 +601,12 @@ winograd_conv_2d_output_transform(
   const short sn = (qid & 2) * 2 + (simd_lane_id % 2) * 2;
 
   // Initialize A matrix
-  simdgroup_matrix<T, 8, 8> B;
+  simdgroup_matrix<float, 8, 8> B;
   B.thread_elements()[0] = WGT::out_transform[sm][sn];
   B.thread_elements()[1] = WGT::out_transform[sm][sn + 1];
 
   // Initialize At matrix
-  simdgroup_matrix<T, 8, 8> Bt;
+  simdgroup_matrix<float, 8, 8> Bt;
   Bt.thread_elements()[0] = WGT::out_transform[sn][sm];
   Bt.thread_elements()[1] = WGT::out_transform[sn + 1][sm];
 
@@ -595,16 +655,16 @@ winograd_conv_2d_output_transform(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Do transform and store the result
     for (int c = simd_group_id; c < BO; c += N_SIMD_GROUPS) {
-      simdgroup_matrix<T, 8, 8> O_mat;
+      simdgroup_matrix<float, 8, 8> O_mat;
       O_mat.thread_elements()[0] = out_in_0[c];
       O_mat.thread_elements()[1] = out_in_1[c];
 
-      simdgroup_matrix<T, 8, 8> O_out = (Bt * (O_mat * B));
+      simdgroup_matrix<float, 8, 8> O_out = (Bt * (O_mat * B));
       if ((sm < M) && (sn < M)) {
-        Os[sm][sn][c] = O_out.thread_elements()[0];
+        Os[sm][sn][c] = static_cast<T>(O_out.thread_elements()[0]);
       }
       if ((sm < M) && ((sn + 1) < M)) {
-        Os[sm][sn + 1][c] = O_out.thread_elements()[1];
+        Os[sm][sn + 1][c] = static_cast<T>(O_out.thread_elements()[1]);
       }
     }
 
@@ -627,17 +687,17 @@ winograd_conv_2d_output_transform(
   }
 }
 
-#define instantiate_winograd_conv_2d_output_transform(name, itype, bo) \
-  template [[host_name("winograd_conv_2d_output_transform_" #name      \
-                       "_bo" #bo)]] [[kernel]] void                    \
-  winograd_conv_2d_output_transform<itype, bo, 2, 2>(                  \
-      const device itype* out_in [[buffer(0)]],                        \
-      device itype* out_out [[buffer(1)]],                             \
-      const constant MLXConvParams<2>& params [[buffer(2)]],           \
-      uint3 tid [[threadgroup_position_in_grid]],                      \
-      uint3 lid [[thread_position_in_threadgroup]],                    \
-      uint3 tgp_per_grid [[threadgroups_per_grid]],                    \
-      uint simd_group_id [[simdgroup_index_in_threadgroup]],           \
+#define instantiate_winograd_conv_2d_output_transform(name, itype, bo)        \
+  template [[host_name(                                                       \
+      "winograd_conv_2d_output_transform_" #name "_bo" #bo)]] [[kernel]] void \
+  winograd_conv_2d_output_transform<itype, bo, 2, 2>(                         \
+      const device itype* out_in [[buffer(0)]],                               \
+      device itype* out_out [[buffer(1)]],                                    \
+      const constant MLXConvParams<2>& params [[buffer(2)]],                  \
+      uint3 tid [[threadgroup_position_in_grid]],                             \
+      uint3 lid [[thread_position_in_threadgroup]],                           \
+      uint3 tgp_per_grid [[threadgroups_per_grid]],                           \
+      uint simd_group_id [[simdgroup_index_in_threadgroup]],                  \
       uint simd_lane_id [[thread_index_in_simdgroup]]);
 
 // clang-format off
@@ -648,4 +708,5 @@ winograd_conv_2d_output_transform(
 
 // clang-format off
 instantiate_winograd_conv_2d(float32, float);
+instantiate_winograd_conv_2d(bfloat16, bfloat16_t);
 instantiate_winograd_conv_2d(float16, half); // clang-format on

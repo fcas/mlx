@@ -2,397 +2,92 @@
 #include <cstdint>
 #include <cstring>
 #include <sstream>
+#include <tuple>
 
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/complex.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/typing.h>
 
+#include "mlx/backend/metal/metal.h"
+#include "mlx/utils.h"
 #include "python/src/buffer.h"
 #include "python/src/convert.h"
 #include "python/src/indexing.h"
+#include "python/src/small_vector.h"
 #include "python/src/utils.h"
 
-#include "mlx/ops.h"
-#include "mlx/transforms.h"
-#include "mlx/utils.h"
+#include "mlx/mlx.h"
 
+namespace mx = mlx::core;
 namespace nb = nanobind;
 using namespace nb::literals;
-using namespace mlx::core;
-
-enum PyScalarT {
-  pybool = 0,
-  pyint = 1,
-  pyfloat = 2,
-  pycomplex = 3,
-};
-
-template <typename T, typename U = T>
-nb::list to_list(array& a, size_t index, int dim) {
-  nb::list pl;
-  auto stride = a.strides()[dim];
-  for (int i = 0; i < a.shape(dim); ++i) {
-    if (dim == a.ndim() - 1) {
-      pl.append(static_cast<U>(a.data<T>()[index]));
-    } else {
-      pl.append(to_list<T, U>(a, index, dim + 1));
-    }
-    index += stride;
-  }
-  return pl;
-}
-
-auto to_scalar(array& a) {
-  {
-    nb::gil_scoped_release nogil;
-    a.eval();
-  }
-  switch (a.dtype()) {
-    case bool_:
-      return nb::cast(a.item<bool>());
-    case uint8:
-      return nb::cast(a.item<uint8_t>());
-    case uint16:
-      return nb::cast(a.item<uint16_t>());
-    case uint32:
-      return nb::cast(a.item<uint32_t>());
-    case uint64:
-      return nb::cast(a.item<uint64_t>());
-    case int8:
-      return nb::cast(a.item<int8_t>());
-    case int16:
-      return nb::cast(a.item<int16_t>());
-    case int32:
-      return nb::cast(a.item<int32_t>());
-    case int64:
-      return nb::cast(a.item<int64_t>());
-    case float16:
-      return nb::cast(static_cast<float>(a.item<float16_t>()));
-    case float32:
-      return nb::cast(a.item<float>());
-    case bfloat16:
-      return nb::cast(static_cast<float>(a.item<bfloat16_t>()));
-    case complex64:
-      return nb::cast(a.item<std::complex<float>>());
-  }
-}
-
-nb::object tolist(array& a) {
-  if (a.ndim() == 0) {
-    return to_scalar(a);
-  }
-  {
-    nb::gil_scoped_release nogil;
-    a.eval();
-  }
-  switch (a.dtype()) {
-    case bool_:
-      return to_list<bool>(a, 0, 0);
-    case uint8:
-      return to_list<uint8_t>(a, 0, 0);
-    case uint16:
-      return to_list<uint16_t>(a, 0, 0);
-    case uint32:
-      return to_list<uint32_t>(a, 0, 0);
-    case uint64:
-      return to_list<uint64_t>(a, 0, 0);
-    case int8:
-      return to_list<int8_t>(a, 0, 0);
-    case int16:
-      return to_list<int16_t>(a, 0, 0);
-    case int32:
-      return to_list<int32_t>(a, 0, 0);
-    case int64:
-      return to_list<int64_t>(a, 0, 0);
-    case float16:
-      return to_list<float16_t, float>(a, 0, 0);
-    case float32:
-      return to_list<float>(a, 0, 0);
-    case bfloat16:
-      return to_list<bfloat16_t, float>(a, 0, 0);
-    case complex64:
-      return to_list<std::complex<float>>(a, 0, 0);
-  }
-}
-
-template <typename T, typename U>
-void fill_vector(T list, std::vector<U>& vals) {
-  for (auto l : list) {
-    if (nb::isinstance<nb::list>(l)) {
-      fill_vector(nb::cast<nb::list>(l), vals);
-    } else if (nb::isinstance<nb::tuple>(*list.begin())) {
-      fill_vector(nb::cast<nb::tuple>(l), vals);
-    } else {
-      vals.push_back(nb::cast<U>(l));
-    }
-  }
-}
-
-template <typename T>
-PyScalarT validate_shape(
-    T list,
-    const std::vector<int>& shape,
-    int idx,
-    bool& all_python_primitive_elements) {
-  if (idx >= shape.size()) {
-    throw std::invalid_argument("Initialization encountered extra dimension.");
-  }
-  auto s = shape[idx];
-  if (nb::len(list) != s) {
-    throw std::invalid_argument(
-        "Initialization encountered non-uniform length.");
-  }
-
-  if (s == 0) {
-    return pyfloat;
-  }
-
-  PyScalarT type = pybool;
-  for (auto l : list) {
-    PyScalarT t;
-    if (nb::isinstance<nb::list>(l)) {
-      t = validate_shape(
-          nb::cast<nb::list>(l), shape, idx + 1, all_python_primitive_elements);
-    } else if (nb::isinstance<nb::tuple>(*list.begin())) {
-      t = validate_shape(
-          nb::cast<nb::tuple>(l),
-          shape,
-          idx + 1,
-          all_python_primitive_elements);
-    } else if (nb::isinstance<array>(l)) {
-      all_python_primitive_elements = false;
-      auto arr = nb::cast<array>(l);
-      if (arr.ndim() + idx + 1 == shape.size() &&
-          std::equal(
-              arr.shape().cbegin(),
-              arr.shape().cend(),
-              shape.cbegin() + idx + 1)) {
-        t = pybool;
-      } else {
-        throw std::invalid_argument(
-            "Initialization encountered non-uniform length.");
-      }
-    } else {
-      if (nb::isinstance<nb::bool_>(l)) {
-        t = pybool;
-      } else if (nb::isinstance<nb::int_>(l)) {
-        t = pyint;
-      } else if (nb::isinstance<nb::float_>(l)) {
-        t = pyfloat;
-      } else if (PyComplex_Check(l.ptr())) {
-        t = pycomplex;
-      } else {
-        std::ostringstream msg;
-        msg << "Invalid type  " << nb::type_name(l.type()).c_str()
-            << " received in array initialization.";
-        throw std::invalid_argument(msg.str());
-      }
-
-      if (idx + 1 != shape.size()) {
-        throw std::invalid_argument(
-            "Initialization encountered non-uniform length.");
-      }
-    }
-    type = std::max(type, t);
-  }
-  return type;
-}
-
-template <typename T>
-void get_shape(T list, std::vector<int>& shape) {
-  shape.push_back(check_shape_dim(nb::len(list)));
-  if (shape.back() > 0) {
-    auto l = list.begin();
-    if (nb::isinstance<nb::list>(*l)) {
-      return get_shape(nb::cast<nb::list>(*l), shape);
-    } else if (nb::isinstance<nb::tuple>(*l)) {
-      return get_shape(nb::cast<nb::tuple>(*l), shape);
-    } else if (nb::isinstance<array>(*l)) {
-      auto arr = nb::cast<array>(*l);
-      for (int i = 0; i < arr.ndim(); i++) {
-        shape.push_back(check_shape_dim(arr.shape(i)));
-      }
-      return;
-    }
-  }
-}
-
-using ArrayInitType = std::variant<
-    nb::bool_,
-    nb::int_,
-    nb::float_,
-    // Must be above ndarray
-    array,
-    // Must be above complex
-    nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>,
-    std::complex<float>,
-    nb::list,
-    nb::tuple,
-    nb::object>;
-
-// Forward declaration
-array create_array(ArrayInitType v, std::optional<Dtype> t);
-
-template <typename T>
-array array_from_list(
-    T pl,
-    const PyScalarT& inferred_type,
-    std::optional<Dtype> specified_type,
-    const std::vector<int>& shape) {
-  // Make the array
-  switch (inferred_type) {
-    case pybool: {
-      std::vector<bool> vals;
-      fill_vector(pl, vals);
-      return array(vals.begin(), shape, specified_type.value_or(bool_));
-    }
-    case pyint: {
-      auto dtype = specified_type.value_or(int32);
-      if (dtype == int64) {
-        std::vector<int64_t> vals;
-        fill_vector(pl, vals);
-        return array(vals.begin(), shape, dtype);
-      } else if (dtype == uint64) {
-        std::vector<uint64_t> vals;
-        fill_vector(pl, vals);
-        return array(vals.begin(), shape, dtype);
-      } else if (dtype == uint32) {
-        std::vector<uint32_t> vals;
-        fill_vector(pl, vals);
-        return array(vals.begin(), shape, dtype);
-      } else if (issubdtype(dtype, inexact)) {
-        std::vector<float> vals;
-        fill_vector(pl, vals);
-        return array(vals.begin(), shape, dtype);
-      } else {
-        std::vector<int> vals;
-        fill_vector(pl, vals);
-        return array(vals.begin(), shape, dtype);
-      }
-    }
-    case pyfloat: {
-      std::vector<float> vals;
-      fill_vector(pl, vals);
-      return array(vals.begin(), shape, specified_type.value_or(float32));
-    }
-    case pycomplex: {
-      std::vector<std::complex<float>> vals;
-      fill_vector(pl, vals);
-      return array(
-          reinterpret_cast<complex64_t*>(vals.data()),
-          shape,
-          specified_type.value_or(complex64));
-    }
-    default: {
-      std::ostringstream msg;
-      msg << "Should not happen, inferred: " << inferred_type
-          << " on subarray made of only python primitive types.";
-      throw std::runtime_error(msg.str());
-    }
-  }
-}
-
-template <typename T>
-array array_from_list(T pl, std::optional<Dtype> dtype) {
-  // Compute the shape
-  std::vector<int> shape;
-  get_shape(pl, shape);
-
-  // Validate the shape and type
-  bool all_python_primitive_elements = true;
-  auto type = validate_shape(pl, shape, 0, all_python_primitive_elements);
-
-  if (all_python_primitive_elements) {
-    // `pl` does not contain mlx arrays
-    return array_from_list(pl, type, dtype, shape);
-  }
-
-  // `pl` contains mlx arrays
-  std::vector<array> arrays;
-  for (auto l : pl) {
-    arrays.push_back(create_array(nb::cast<ArrayInitType>(l), dtype));
-  }
-  return stack(arrays);
-}
-
-///////////////////////////////////////////////////////////////////////////////
-// Module
-///////////////////////////////////////////////////////////////////////////////
-
-array create_array(ArrayInitType v, std::optional<Dtype> t) {
-  if (auto pv = std::get_if<nb::bool_>(&v); pv) {
-    return array(nb::cast<bool>(*pv), t.value_or(bool_));
-  } else if (auto pv = std::get_if<nb::int_>(&v); pv) {
-    return array(nb::cast<int>(*pv), t.value_or(int32));
-  } else if (auto pv = std::get_if<nb::float_>(&v); pv) {
-    return array(nb::cast<float>(*pv), t.value_or(float32));
-  } else if (auto pv = std::get_if<std::complex<float>>(&v); pv) {
-    return array(static_cast<complex64_t>(*pv), t.value_or(complex64));
-  } else if (auto pv = std::get_if<nb::list>(&v); pv) {
-    return array_from_list(*pv, t);
-  } else if (auto pv = std::get_if<nb::tuple>(&v); pv) {
-    return array_from_list(*pv, t);
-  } else if (auto pv = std::get_if<
-                 nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>>(&v);
-             pv) {
-    return nd_array_to_mlx(*pv, t);
-  } else if (auto pv = std::get_if<array>(&v); pv) {
-    return astype(*pv, t.value_or((*pv).dtype()));
-  } else {
-    auto arr = to_array_with_accessor(std::get<nb::object>(v));
-    return astype(arr, t.value_or(arr.dtype()));
-  }
-}
 
 class ArrayAt {
  public:
-  ArrayAt(array x) : x_(std::move(x)) {}
+  ArrayAt(mx::array x) : x_(std::move(x)) {}
   ArrayAt& set_indices(nb::object indices) {
+    initialized_ = true;
     indices_ = indices;
     return *this;
   }
-  array add(const ScalarOrArray& v) {
+  void check_initialized() {
+    if (!initialized_) {
+      throw std::invalid_argument(
+          "Must give indices to array.at (e.g. `x.at[0].add(4)`).");
+    }
+  }
+
+  mx::array add(const ScalarOrArray& v) {
+    check_initialized();
     return mlx_add_item(x_, indices_, v);
   }
-  array subtract(const ScalarOrArray& v) {
+  mx::array subtract(const ScalarOrArray& v) {
+    check_initialized();
     return mlx_subtract_item(x_, indices_, v);
   }
-  array multiply(const ScalarOrArray& v) {
+  mx::array multiply(const ScalarOrArray& v) {
+    check_initialized();
     return mlx_multiply_item(x_, indices_, v);
   }
-  array divide(const ScalarOrArray& v) {
+  mx::array divide(const ScalarOrArray& v) {
+    check_initialized();
     return mlx_divide_item(x_, indices_, v);
   }
-  array maximum(const ScalarOrArray& v) {
+  mx::array maximum(const ScalarOrArray& v) {
+    check_initialized();
     return mlx_maximum_item(x_, indices_, v);
   }
-  array minimum(const ScalarOrArray& v) {
+  mx::array minimum(const ScalarOrArray& v) {
+    check_initialized();
     return mlx_minimum_item(x_, indices_, v);
   }
 
  private:
-  array x_;
+  mx::array x_;
+  bool initialized_{false};
   nb::object indices_;
 };
 
 class ArrayPythonIterator {
  public:
-  ArrayPythonIterator(array x) : idx_(0), x_(std::move(x)) {
+  ArrayPythonIterator(mx::array x) : idx_(0), x_(std::move(x)) {
     if (x_.shape(0) > 0 && x_.shape(0) < 10) {
-      splits_ = split(x_, x_.shape(0));
+      splits_ = mx::split(x_, x_.shape(0));
     }
   }
 
-  array next() {
+  mx::array next() {
     if (idx_ >= x_.shape(0)) {
       throw nb::stop_iteration();
     }
 
     if (idx_ >= 0 && idx_ < splits_.size()) {
-      return squeeze(splits_[idx_++], 0);
+      return mx::squeeze(splits_[idx_++], 0);
     }
 
     return *(x_.begin() + idx_++);
@@ -400,16 +95,13 @@ class ArrayPythonIterator {
 
  private:
   int idx_;
-  array x_;
-  std::vector<array> splits_;
+  mx::array x_;
+  std::vector<mx::array> splits_;
 };
 
 void init_array(nb::module_& m) {
-  // Set Python print formatting options
-  mlx::core::global_formatter.capitalize_bool = true;
-
   // Types
-  nb::class_<Dtype>(
+  nb::class_<mx::Dtype>(
       m,
       "Dtype",
       R"pbdoc(
@@ -418,10 +110,11 @@ void init_array(nb::module_& m) {
       See the :ref:`list of types <data_types>` for more details
       on available data types.
       )pbdoc")
-      .def_ro("size", &Dtype::size, R"pbdoc(Size of the type in bytes.)pbdoc")
+      .def_prop_ro(
+          "size", &mx::Dtype::size, R"pbdoc(Size of the type in bytes.)pbdoc")
       .def(
           "__repr__",
-          [](const Dtype& t) {
+          [](const mx::Dtype& t) {
             std::ostringstream os;
             os << "mlx.core.";
             os << t;
@@ -429,26 +122,29 @@ void init_array(nb::module_& m) {
           })
       .def(
           "__eq__",
-          [](const Dtype& t, const nb::object& other) {
-            return nb::isinstance<Dtype>(other) && t == nb::cast<Dtype>(other);
+          [](const mx::Dtype& t, const nb::object& other) {
+            return nb::isinstance<mx::Dtype>(other) &&
+                t == nb::cast<mx::Dtype>(other);
           })
-      .def("__hash__", [](const Dtype& t) {
-        return static_cast<int64_t>(t.val);
+      .def("__hash__", [](const mx::Dtype& t) {
+        return static_cast<int64_t>(t.val());
       });
-  m.attr("bool_") = nb::cast(bool_);
-  m.attr("uint8") = nb::cast(uint8);
-  m.attr("uint16") = nb::cast(uint16);
-  m.attr("uint32") = nb::cast(uint32);
-  m.attr("uint64") = nb::cast(uint64);
-  m.attr("int8") = nb::cast(int8);
-  m.attr("int16") = nb::cast(int16);
-  m.attr("int32") = nb::cast(int32);
-  m.attr("int64") = nb::cast(int64);
-  m.attr("float16") = nb::cast(float16);
-  m.attr("float32") = nb::cast(float32);
-  m.attr("bfloat16") = nb::cast(bfloat16);
-  m.attr("complex64") = nb::cast(complex64);
-  nb::class_<Dtype::Category>(
+
+  m.attr("bool_") = nb::cast(mx::bool_);
+  m.attr("uint8") = nb::cast(mx::uint8);
+  m.attr("uint16") = nb::cast(mx::uint16);
+  m.attr("uint32") = nb::cast(mx::uint32);
+  m.attr("uint64") = nb::cast(mx::uint64);
+  m.attr("int8") = nb::cast(mx::int8);
+  m.attr("int16") = nb::cast(mx::int16);
+  m.attr("int32") = nb::cast(mx::int32);
+  m.attr("int64") = nb::cast(mx::int64);
+  m.attr("float16") = nb::cast(mx::float16);
+  m.attr("float32") = nb::cast(mx::float32);
+  m.attr("float64") = nb::cast(mx::float64);
+  m.attr("bfloat16") = nb::cast(mx::bfloat16);
+  m.attr("complex64") = nb::cast(mx::complex64);
+  nb::enum_<mx::Dtype::Category>(
       m,
       "DtypeCategory",
       R"pbdoc(
@@ -481,32 +177,94 @@ void init_array(nb::module_& m) {
               * :ref:`float16 <data_types>`
               * :ref:`bfloat16 <data_types>`
               * :ref:`float32 <data_types>`
+              * :ref:`float64 <data_types>`
 
             * :attr:`~mlx.core.complexfloating`
 
-              * :ref:`complex128 <data_types>`
+              * :ref:`complex64 <data_types>`
 
       See also :func:`~mlx.core.issubdtype`.
-      )pbdoc");
-  m.attr("complexfloating") = nb::cast(complexfloating);
-  m.attr("floating") = nb::cast(floating);
-  m.attr("inexact") = nb::cast(inexact);
-  m.attr("signedinteger") = nb::cast(signedinteger);
-  m.attr("unsignedinteger") = nb::cast(unsignedinteger);
-  m.attr("integer") = nb::cast(integer);
-  m.attr("number") = nb::cast(number);
-  m.attr("generic") = nb::cast(generic);
+      )pbdoc")
+      .value("complexfloating", mx::complexfloating)
+      .value("floating", mx::floating)
+      .value("inexact", mx::inexact)
+      .value("signedinteger", mx::signedinteger)
+      .value("unsignedinteger", mx::unsignedinteger)
+      .value("integer", mx::integer)
+      .value("number", mx::number)
+      .value("generic", mx::generic)
+      .export_values();
+
+  nb::class_<mx::finfo>(
+      m,
+      "finfo",
+      R"pbdoc(
+      Get information on floating-point types.
+      )pbdoc")
+      .def(nb::init<mx::Dtype>())
+      .def_ro(
+          "bits",
+          &mx::finfo::bits,
+          R"pbdoc(The number of bits occupied by the type.)pbdoc")
+      .def_ro(
+          "min",
+          &mx::finfo::min,
+          R"pbdoc(The smallest representable number.)pbdoc")
+      .def_ro(
+          "max",
+          &mx::finfo::max,
+          R"pbdoc(The largest representable number.)pbdoc")
+      .def_ro(
+          "eps",
+          &mx::finfo::eps,
+          R"pbdoc(
+            The difference between 1.0 and the next smallest
+            representable number larger than 1.0.
+          )pbdoc")
+      .def_ro(
+          "smallest_normal",
+          &mx::finfo::smallest_normal,
+          R"pbdoc(The smallest positive normal number.)pbdoc")
+      .def_ro("dtype", &mx::finfo::dtype, R"pbdoc(The :obj:`Dtype`.)pbdoc")
+      .def("__repr__", [](const mx::finfo& f) {
+        std::ostringstream os;
+        os << "finfo("
+           << "min=" << f.min << ", max=" << f.max << ", dtype=" << f.dtype
+           << ")";
+        return os.str();
+      });
+
+  nb::class_<mx::iinfo>(
+      m,
+      "iinfo",
+      R"pbdoc(
+      Get information on integer types.
+      )pbdoc")
+      .def(nb::init<mx::Dtype>())
+      .def_ro(
+          "min",
+          &mx::iinfo::min,
+          R"pbdoc(The smallest representable number.)pbdoc")
+      .def_ro(
+          "max",
+          &mx::iinfo::max,
+          R"pbdoc(The largest representable number.)pbdoc")
+      .def_ro("dtype", &mx::iinfo::dtype, R"pbdoc(The :obj:`Dtype`.)pbdoc")
+      .def("__repr__", [](const mx::iinfo& i) {
+        std::ostringstream os;
+        os << "iinfo("
+           << "min=" << i.min << ", max=" << i.max << ", dtype=" << i.dtype
+           << ")";
+        return os.str();
+      });
 
   nb::class_<ArrayAt>(
       m,
-      "_ArrayAt",
+      "ArrayAt",
       R"pbdoc(
       A helper object to apply updates at specific indices.
-      )pbdoc")
-      .def(
-          nb::init<const array&>(),
-          "x"_a,
-          nb::sig("def __init__(self, x: array)"))
+      )pbdoc",
+      nb::pooled(/* capacity = */ 128))
       .def("__getitem__", &ArrayAt::set_indices, "indices"_a.none())
       .def("add", &ArrayAt::add, "value"_a)
       .def("subtract", &ArrayAt::subtract, "value"_a)
@@ -515,16 +273,21 @@ void init_array(nb::module_& m) {
       .def("maximum", &ArrayAt::maximum, "value"_a)
       .def("minimum", &ArrayAt::minimum, "value"_a);
 
+  nb::class_<ArrayLike>(
+      m,
+      "ArrayLike",
+      R"pbdoc(
+        Any Python object which has an ``__mlx__array__`` method that
+        returns an :obj:`array`.
+      )pbdoc")
+      .def(nb::init_implicit<nb::object>());
+
   nb::class_<ArrayPythonIterator>(
       m,
-      "_ArrayIterator",
+      "ArrayIterator",
       R"pbdoc(
       A helper object to iterate over the 1st dimension of an array.
       )pbdoc")
-      .def(
-          nb::init<const array&>(),
-          "x"_a,
-          nb::sig("def __init__(self, x: array)"))
       .def("__next__", &ArrayPythonIterator::next)
       .def("__iter__", [](const ArrayPythonIterator& it) { return it; });
 
@@ -534,35 +297,40 @@ void init_array(nb::module_& m) {
       {Py_bf_releasebuffer, (void*)releasebuffer},
       {0, nullptr}};
 
-  nb::class_<array>(
+  nb::class_<mx::array>(
       m,
       "array",
       R"pbdoc(An N-dimensional array object.)pbdoc",
       nb::type_slots(array_slots),
-      nb::is_weak_referenceable())
+      nb::is_weak_referenceable(),
+      nb::pooled(/* capacity = */ 128))
       .def(
           "__init__",
-          [](array* aptr, ArrayInitType v, std::optional<Dtype> t) {
-            new (aptr) array(create_array(v, t));
+          [](mx::array* aptr, nb::object v, std::optional<mx::Dtype> t) {
+            new (aptr) mx::array(create_array(v, t, true));
           },
           "val"_a,
           "dtype"_a = nb::none(),
           nb::sig(
-              "def __init__(self: array, val: Union[scalar, list, tuple, numpy.ndarray, array], dtype: Optional[Dtype] = None)"))
+              "def __init__(self: array, val: scalar | list | tuple | DLPackCompatible | array, dtype: Dtype | None = None)"))
       .def_prop_ro(
-          "size", &array::size, R"pbdoc(Number of elements in the array.)pbdoc")
-      .def_prop_ro("ndim", &array::ndim, R"pbdoc(The array's dimension.)pbdoc")
+          "size",
+          &mx::array::size,
+          R"pbdoc(Number of elements in the array.)pbdoc")
+      .def_prop_ro(
+          "ndim", &mx::array::ndim, R"pbdoc(The array's dimension.)pbdoc")
       .def_prop_ro(
           "itemsize",
-          &array::itemsize,
+          &mx::array::itemsize,
           R"pbdoc(The size of the array's datatype in bytes.)pbdoc")
       .def_prop_ro(
           "nbytes",
-          &array::nbytes,
+          &mx::array::nbytes,
           R"pbdoc(The number of bytes in the array.)pbdoc")
       .def_prop_ro(
           "shape",
-          [](const array& a) { return nb::tuple(nb::cast(a.shape())); },
+          [](const mx::array& a) { return nb::cast(a.shape()); },
+          nb::sig("def shape(self) -> tuple[int, ...]"),
           R"pbdoc(
           The shape of the array as a Python tuple.
 
@@ -571,13 +339,26 @@ void init_array(nb::module_& m) {
         )pbdoc")
       .def_prop_ro(
           "dtype",
-          &array::dtype,
+          &mx::array::dtype,
           R"pbdoc(
             The array's :class:`Dtype`.
+          )pbdoc")
+      .def_prop_ro(
+          "real",
+          [](const mx::array& a) { return mx::real(a); },
+          R"pbdoc(
+            The real part of a complex array.
+          )pbdoc")
+      .def_prop_ro(
+          "imag",
+          [](const mx::array& a) { return mx::imag(a); },
+          R"pbdoc(
+            The imaginary part of a complex array.
           )pbdoc")
       .def(
           "item",
           &to_scalar,
+          nb::sig("def item(self) -> scalar"),
           R"pbdoc(
             Access the value of a scalar array.
 
@@ -587,6 +368,7 @@ void init_array(nb::module_& m) {
       .def(
           "tolist",
           &tolist,
+          nb::sig("def tolist(self) -> list_or_scalar"),
           R"pbdoc(
             Convert the array to a Python :class:`list`.
 
@@ -603,7 +385,9 @@ void init_array(nb::module_& m) {
           )pbdoc")
       .def(
           "astype",
-          &astype,
+          [](const mx::array& a, mx::Dtype dtype, mx::StreamOrDevice s) {
+            return mx::astype(a, dtype, s);
+          },
           "dtype"_a,
           "stream"_a = nb::none(),
           R"pbdoc(
@@ -616,11 +400,35 @@ void init_array(nb::module_& m) {
             Returns:
                 array: The array with type ``dtype``.
           )pbdoc")
+      .def(
+          "__array_namespace__",
+          [](const mx::array& a,
+             const std::optional<std::string>& api_version) {
+            if (api_version) {
+              throw std::invalid_argument(
+                  "Explicitly specifying api_version is not yet implemented.");
+            }
+            return nb::module_::import_("mlx.core");
+          },
+          "api_version"_a = nb::none(),
+          R"pbdoc(
+            Returns an object that has all the array API functions on it.
+
+            See the `Python array API <https://data-apis.org/array-api/latest/index.html>`_
+            for more information.
+
+            Args:
+                api_version (str, optional): String representing the version
+                  of the array API spec to return. Default: ``None``.
+
+            Returns:
+                out (Any): An object representing the array API namespace.
+          )pbdoc")
       .def("__getitem__", mlx_get_item, nb::arg().none())
       .def("__setitem__", mlx_set_item, nb::arg().none(), nb::arg())
       .def_prop_ro(
           "at",
-          [](const array& a) { return ArrayAt(a); },
+          [](const mx::array& a) { return ArrayAt(a); },
           R"pbdoc(
             Used to apply updates at the given indices.
 
@@ -662,130 +470,188 @@ void init_array(nb::module_& m) {
           )pbdoc")
       .def(
           "__len__",
-          [](const array& a) {
+          [](const mx::array& a) {
             if (a.ndim() == 0) {
               throw nb::type_error("len() 0-dimensional array.");
             }
             return a.shape(0);
           })
-      .def("__iter__", [](const array& a) { return ArrayPythonIterator(a); })
-      .def("__getstate__", &mlx_to_np_array)
+      .def(
+          "__iter__", [](const mx::array& a) { return ArrayPythonIterator(a); })
+      .def(
+          "__getstate__",
+          [](const mx::array& a) {
+            auto nd = (a.dtype() == mx::bfloat16)
+                ? mlx_to_np_array(mx::view(a, mx::uint16))
+                : mlx_to_np_array(a);
+            return nb::make_tuple(nd, static_cast<uint8_t>(a.dtype().val()));
+          })
       .def(
           "__setstate__",
-          [](array& arr,
-             const nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>& state) {
-            new (&arr) array(nd_array_to_mlx(state, std::nullopt));
+          [](mx::array& arr, const nb::tuple& state) {
+            if (nb::len(state) != 2) {
+              throw std::invalid_argument(
+                  "Invalid pickle state: expected (ndarray, Dtype::Val)");
+            }
+            using ND = nb::ndarray<nb::ro>;
+            ND nd = nb::cast<ND>(state[0]);
+            auto val = static_cast<mx::Dtype::Val>(nb::cast<uint8_t>(state[1]));
+            if (val == mx::Dtype::Val::bfloat16) {
+              auto owner = nb::handle(state[0].ptr());
+              new (&arr) mx::array(nd_array_to_mlx(
+                  ND(nd.data(),
+                     nd.ndim(),
+                     reinterpret_cast<const size_t*>(nd.shape_ptr()),
+                     owner,
+                     nullptr,
+                     nb::dtype<mx::bfloat16_t>()),
+                  mx::bfloat16));
+            } else {
+              new (&arr) mx::array(nd_array_to_mlx(nd, std::nullopt));
+            }
           })
-      .def("__dlpack__", [](const array& a) { return mlx_to_dlpack(a); })
-      .def("__copy__", [](const array& self) { return array(self); })
+      .def(
+          "__dlpack__",
+          [](const mx::array& a,
+             nb::object,
+             nb::object,
+             std::optional<std::tuple<int, int>> dl_device,
+             std::optional<bool> copy) {
+            return mlx_to_dlpack(a, copy.value_or(false), dl_device);
+          },
+          nb::kw_only(),
+          "stream"_a = nb::none(),
+          "max_version"_a = nb::none(),
+          "dl_device"_a = nb::none(),
+          "copy"_a = nb::none())
+      .def(
+          "__dlpack_device__",
+          [](const mx::array& a) {
+            // See
+            // https://github.com/dmlc/dlpack/blob/5c210da409e7f1e51ddf445134a4376fdbd70d7d/include/dlpack/dlpack.h#L74
+            if (mx::metal::is_available()) {
+              return nb::make_tuple(8, 0);
+            } else {
+              // CPU device
+              return nb::make_tuple(1, 0);
+            }
+          })
+      .def(
+          "__array__",
+          [](const mx::array& self, nb::object dtype, nb::object copy) {
+            return mlx_to_np_array(self);
+          },
+          "dtype"_a = nb::none(),
+          "copy"_a = nb::none())
+      .def("__copy__", [](const mx::array& self) { return mx::array(self); })
       .def(
           "__deepcopy__",
-          [](const array& self, nb::dict) { return array(self); },
+          [](const mx::array& self, nb::dict) { return mx::array(self); },
           "memo"_a)
       .def(
           "__add__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("addition", v);
             }
             auto b = to_array(v, a.dtype());
-            return add(a, b);
+            return mx::add(a, b);
           },
           "other"_a)
       .def(
           "__iadd__",
-          [](array& a, const ScalarOrArray v) -> array& {
+          [](mx::array& a, const ScalarOrArray v) -> mx::array& {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("inplace addition", v);
             }
-            a.overwrite_descriptor(add(a, to_array(v, a.dtype())));
+            a.overwrite_descriptor(mx::add(a, to_array(v, a.dtype())));
             return a;
           },
           "other"_a,
           nb::rv_policy::none)
       .def(
           "__radd__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("addition", v);
             }
-            return add(a, to_array(v, a.dtype()));
+            return mx::add(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__sub__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("subtraction", v);
             }
-            return subtract(a, to_array(v, a.dtype()));
+            return mx::subtract(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__isub__",
-          [](array& a, const ScalarOrArray v) -> array& {
+          [](mx::array& a, const ScalarOrArray v) -> mx::array& {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("inplace subtraction", v);
             }
-            a.overwrite_descriptor(subtract(a, to_array(v, a.dtype())));
+            a.overwrite_descriptor(mx::subtract(a, to_array(v, a.dtype())));
             return a;
           },
           "other"_a,
           nb::rv_policy::none)
       .def(
           "__rsub__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("subtraction", v);
             }
-            return subtract(to_array(v, a.dtype()), a);
+            return mx::subtract(to_array(v, a.dtype()), a);
           },
           "other"_a)
       .def(
           "__mul__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("multiplication", v);
             }
-            return multiply(a, to_array(v, a.dtype()));
+            return mx::multiply(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__imul__",
-          [](array& a, const ScalarOrArray v) -> array& {
+          [](mx::array& a, const ScalarOrArray v) -> mx::array& {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("inplace multiplication", v);
             }
-            a.overwrite_descriptor(multiply(a, to_array(v, a.dtype())));
+            a.overwrite_descriptor(mx::multiply(a, to_array(v, a.dtype())));
             return a;
           },
           "other"_a,
           nb::rv_policy::none)
       .def(
           "__rmul__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("multiplication", v);
             }
-            return multiply(a, to_array(v, a.dtype()));
+            return mx::multiply(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__truediv__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("division", v);
             }
-            return divide(a, to_array(v, a.dtype()));
+            return mx::divide(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__itruediv__",
-          [](array& a, const ScalarOrArray v) -> array& {
+          [](mx::array& a, const ScalarOrArray v) -> mx::array& {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("inplace division", v);
             }
-            if (!issubdtype(a.dtype(), inexact)) {
+            if (!mx::issubdtype(a.dtype(), mx::inexact)) {
               throw std::invalid_argument(
                   "In place division cannot cast to non-floating point type.");
             }
@@ -796,151 +662,151 @@ void init_array(nb::module_& m) {
           nb::rv_policy::none)
       .def(
           "__rtruediv__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("division", v);
             }
-            return divide(to_array(v, a.dtype()), a);
+            return mx::divide(to_array(v, a.dtype()), a);
           },
           "other"_a)
       .def(
           "__div__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("division", v);
             }
-            return divide(a, to_array(v, a.dtype()));
+            return mx::divide(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__rdiv__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("division", v);
             }
-            return divide(to_array(v, a.dtype()), a);
+            return mx::divide(to_array(v, a.dtype()), a);
           },
           "other"_a)
       .def(
           "__floordiv__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("floor division", v);
             }
-            return floor_divide(a, to_array(v, a.dtype()));
+            return mx::floor_divide(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__ifloordiv__",
-          [](array& a, const ScalarOrArray v) -> array& {
+          [](mx::array& a, const ScalarOrArray v) -> mx::array& {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("inplace floor division", v);
             }
-            a.overwrite_descriptor(floor_divide(a, to_array(v, a.dtype())));
+            a.overwrite_descriptor(mx::floor_divide(a, to_array(v, a.dtype())));
             return a;
           },
           "other"_a,
           nb::rv_policy::none)
       .def(
           "__rfloordiv__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("floor division", v);
             }
             auto b = to_array(v, a.dtype());
-            return floor_divide(b, a);
+            return mx::floor_divide(b, a);
           },
           "other"_a)
       .def(
           "__mod__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("modulus", v);
             }
-            return remainder(a, to_array(v, a.dtype()));
+            return mx::remainder(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__imod__",
-          [](array& a, const ScalarOrArray v) -> array& {
+          [](mx::array& a, const ScalarOrArray v) -> mx::array& {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("inplace modulus", v);
             }
-            a.overwrite_descriptor(remainder(a, to_array(v, a.dtype())));
+            a.overwrite_descriptor(mx::remainder(a, to_array(v, a.dtype())));
             return a;
           },
           "other"_a,
           nb::rv_policy::none)
       .def(
           "__rmod__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("modulus", v);
             }
-            return remainder(to_array(v, a.dtype()), a);
+            return mx::remainder(to_array(v, a.dtype()), a);
           },
           "other"_a)
       .def(
           "__eq__",
-          [](const array& a,
-             const ScalarOrArray& v) -> std::variant<array, bool> {
+          [](const mx::array& a,
+             const ScalarOrArray& v) -> std::variant<mx::array, bool> {
             if (!is_comparable_with_array(v)) {
               return false;
             }
-            return equal(a, to_array(v, a.dtype()));
+            return mx::equal(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__lt__",
-          [](const array& a, const ScalarOrArray v) -> array {
+          [](const mx::array& a, const ScalarOrArray v) -> mx::array {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("less than", v);
             }
-            return less(a, to_array(v, a.dtype()));
+            return mx::less(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__le__",
-          [](const array& a, const ScalarOrArray v) -> array {
+          [](const mx::array& a, const ScalarOrArray v) -> mx::array {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("less than or equal", v);
             }
-            return less_equal(a, to_array(v, a.dtype()));
+            return mx::less_equal(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__gt__",
-          [](const array& a, const ScalarOrArray v) -> array {
+          [](const mx::array& a, const ScalarOrArray v) -> mx::array {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("greater than", v);
             }
-            return greater(a, to_array(v, a.dtype()));
+            return mx::greater(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__ge__",
-          [](const array& a, const ScalarOrArray v) -> array {
+          [](const mx::array& a, const ScalarOrArray v) -> mx::array {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("greater than or equal", v);
             }
-            return greater_equal(a, to_array(v, a.dtype()));
+            return mx::greater_equal(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__ne__",
-          [](const array& a,
-             const ScalarOrArray v) -> std::variant<array, bool> {
+          [](const mx::array& a,
+             const ScalarOrArray v) -> std::variant<mx::array, bool> {
             if (!is_comparable_with_array(v)) {
               return true;
             }
-            return not_equal(a, to_array(v, a.dtype()));
+            return mx::not_equal(a, to_array(v, a.dtype()));
           },
           "other"_a)
-      .def("__neg__", [](const array& a) { return -a; })
-      .def("__bool__", [](array& a) { return nb::bool_(to_scalar(a)); })
+      .def("__neg__", [](const mx::array& a) { return -a; })
+      .def("__bool__", [](mx::array& a) { return nb::bool_(to_scalar(a)); })
       .def(
           "__repr__",
-          [](array& a) {
+          [](mx::array& a) {
             nb::gil_scoped_release nogil;
             std::ostringstream os;
             os << a;
@@ -948,193 +814,250 @@ void init_array(nb::module_& m) {
           })
       .def(
           "__matmul__",
-          [](const array& a, array& other) { return matmul(a, other); },
+          [](const mx::array& a, mx::array& other) {
+            return mx::matmul(a, other);
+          },
           "other"_a)
       .def(
           "__imatmul__",
-          [](array& a, array& other) -> array& {
-            a.overwrite_descriptor(matmul(a, other));
+          [](mx::array& a, mx::array& other) -> mx::array& {
+            a.overwrite_descriptor(mx::matmul(a, other));
             return a;
           },
           "other"_a,
           nb::rv_policy::none)
       .def(
           "__pow__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("power", v);
             }
-            return power(a, to_array(v, a.dtype()));
+            return mx::power(a, to_array(v, a.dtype()));
           },
           "other"_a)
       .def(
           "__rpow__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("power", v);
             }
-            return power(to_array(v, a.dtype()), a);
+            return mx::power(to_array(v, a.dtype()), a);
           },
           "other"_a)
       .def(
           "__ipow__",
-          [](array& a, const ScalarOrArray v) -> array& {
+          [](mx::array& a, const ScalarOrArray v) -> mx::array& {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("inplace power", v);
             }
-            a.overwrite_descriptor(power(a, to_array(v, a.dtype())));
+            a.overwrite_descriptor(mx::power(a, to_array(v, a.dtype())));
             return a;
           },
           "other"_a,
           nb::rv_policy::none)
       .def(
           "__invert__",
-          [](const array& a) {
-            if (issubdtype(a.dtype(), inexact)) {
+          [](const mx::array& a) {
+            if (mx::issubdtype(a.dtype(), mx::inexact)) {
               throw std::invalid_argument(
-                  "Floating point types not allowed with or bitwise inversion.");
+                  "Floating point types not allowed with bitwise inversion.");
             }
-            if (a.dtype() != bool_) {
-              throw std::invalid_argument(
-                  "Bitwise inversion not yet supported for integer types.");
+            if (a.dtype() == mx::bool_) {
+              return mx::logical_not(a);
             }
-            return logical_not(a);
+            return mx::bitwise_invert(a);
           })
       .def(
           "__and__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("bitwise and", v);
             }
             auto b = to_array(v, a.dtype());
-            if (issubdtype(a.dtype(), inexact) ||
-                issubdtype(b.dtype(), inexact)) {
+            if (mx::issubdtype(a.dtype(), mx::inexact) ||
+                mx::issubdtype(b.dtype(), mx::inexact)) {
               throw std::invalid_argument(
                   "Floating point types not allowed with bitwise and.");
             }
-            return bitwise_and(a, b);
+            return mx::bitwise_and(a, b);
           },
           "other"_a)
       .def(
           "__iand__",
-          [](array& a, const ScalarOrArray v) -> array& {
+          [](mx::array& a, const ScalarOrArray v) -> mx::array& {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("inplace bitwise and", v);
             }
             auto b = to_array(v, a.dtype());
-            if (issubdtype(a.dtype(), inexact) ||
-                issubdtype(b.dtype(), inexact)) {
+            if (mx::issubdtype(a.dtype(), mx::inexact) ||
+                mx::issubdtype(b.dtype(), mx::inexact)) {
               throw std::invalid_argument(
                   "Floating point types not allowed with bitwise and.");
             }
-            a.overwrite_descriptor(bitwise_and(a, b));
+            a.overwrite_descriptor(mx::bitwise_and(a, b));
             return a;
           },
           "other"_a,
           nb::rv_policy::none)
       .def(
           "__or__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("bitwise or", v);
             }
             auto b = to_array(v, a.dtype());
-            if (issubdtype(a.dtype(), inexact) ||
-                issubdtype(b.dtype(), inexact)) {
+            if (mx::issubdtype(a.dtype(), mx::inexact) ||
+                mx::issubdtype(b.dtype(), mx::inexact)) {
               throw std::invalid_argument(
-                  "Floating point types not allowed with or bitwise or.");
+                  "Floating point types not allowed with bitwise or.");
             }
-            return bitwise_or(a, b);
+            return mx::bitwise_or(a, b);
           },
           "other"_a)
       .def(
           "__ior__",
-          [](array& a, const ScalarOrArray v) -> array& {
+          [](mx::array& a, const ScalarOrArray v) -> mx::array& {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("inplace bitwise or", v);
             }
             auto b = to_array(v, a.dtype());
-            if (issubdtype(a.dtype(), inexact) ||
-                issubdtype(b.dtype(), inexact)) {
+            if (mx::issubdtype(a.dtype(), mx::inexact) ||
+                mx::issubdtype(b.dtype(), mx::inexact)) {
               throw std::invalid_argument(
-                  "Floating point types not allowed with or bitwise or.");
+                  "Floating point types not allowed with bitwise or.");
             }
-            a.overwrite_descriptor(bitwise_or(a, b));
+            a.overwrite_descriptor(mx::bitwise_or(a, b));
             return a;
           },
           "other"_a,
           nb::rv_policy::none)
       .def(
           "__lshift__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("left shift", v);
             }
             auto b = to_array(v, a.dtype());
-            if (issubdtype(a.dtype(), inexact) ||
-                issubdtype(b.dtype(), inexact)) {
+            if (mx::issubdtype(a.dtype(), mx::inexact) ||
+                mx::issubdtype(b.dtype(), mx::inexact)) {
               throw std::invalid_argument(
                   "Floating point types not allowed with left shift.");
             }
-            return left_shift(a, b);
+            return mx::left_shift(a, b);
           },
           "other"_a)
       .def(
           "__ilshift__",
-          [](array& a, const ScalarOrArray v) -> array& {
+          [](mx::array& a, const ScalarOrArray v) -> mx::array& {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("inplace left shift", v);
             }
             auto b = to_array(v, a.dtype());
-            if (issubdtype(a.dtype(), inexact) ||
-                issubdtype(b.dtype(), inexact)) {
+            if (mx::issubdtype(a.dtype(), mx::inexact) ||
+                mx::issubdtype(b.dtype(), mx::inexact)) {
               throw std::invalid_argument(
-                  "Floating point types not allowed with or left shift.");
+                  "Floating point types not allowed with left shift.");
             }
-            a.overwrite_descriptor(left_shift(a, b));
+            a.overwrite_descriptor(mx::left_shift(a, b));
             return a;
           },
           "other"_a,
           nb::rv_policy::none)
       .def(
           "__rshift__",
-          [](const array& a, const ScalarOrArray v) {
+          [](const mx::array& a, const ScalarOrArray v) {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("right shift", v);
             }
             auto b = to_array(v, a.dtype());
-            if (issubdtype(a.dtype(), inexact) ||
-                issubdtype(b.dtype(), inexact)) {
+            if (mx::issubdtype(a.dtype(), mx::inexact) ||
+                mx::issubdtype(b.dtype(), mx::inexact)) {
               throw std::invalid_argument(
                   "Floating point types not allowed with right shift.");
             }
-            return right_shift(a, b);
+            return mx::right_shift(a, b);
           },
           "other"_a)
       .def(
           "__irshift__",
-          [](array& a, const ScalarOrArray v) -> array& {
+          [](mx::array& a, const ScalarOrArray v) -> mx::array& {
             if (!is_comparable_with_array(v)) {
               throw_invalid_operation("inplace right shift", v);
             }
             auto b = to_array(v, a.dtype());
-            if (issubdtype(a.dtype(), inexact) ||
-                issubdtype(b.dtype(), inexact)) {
+            if (mx::issubdtype(a.dtype(), mx::inexact) ||
+                mx::issubdtype(b.dtype(), mx::inexact)) {
               throw std::invalid_argument(
-                  "Floating point types not allowed with or right shift.");
+                  "Floating point types not allowed with right shift.");
             }
-            a.overwrite_descriptor(right_shift(a, b));
+            a.overwrite_descriptor(mx::right_shift(a, b));
             return a;
           },
           "other"_a,
           nb::rv_policy::none)
       .def(
+          "__xor__",
+          [](const mx::array& a, const ScalarOrArray v) {
+            if (!is_comparable_with_array(v)) {
+              throw_invalid_operation("bitwise xor", v);
+            }
+            auto b = to_array(v, a.dtype());
+            if (mx::issubdtype(a.dtype(), mx::inexact) ||
+                mx::issubdtype(b.dtype(), mx::inexact)) {
+              throw std::invalid_argument(
+                  "Floating point types not allowed with bitwise xor.");
+            }
+            return mx::bitwise_xor(a, b);
+          },
+          "other"_a)
+      .def(
+          "__ixor__",
+          [](mx::array& a, const ScalarOrArray v) -> mx::array& {
+            if (!is_comparable_with_array(v)) {
+              throw_invalid_operation("inplace bitwise xor", v);
+            }
+            auto b = to_array(v, a.dtype());
+            if (mx::issubdtype(a.dtype(), mx::inexact) ||
+                mx::issubdtype(b.dtype(), mx::inexact)) {
+              throw std::invalid_argument(
+                  "Floating point types not allowed bitwise xor.");
+            }
+            a.overwrite_descriptor(mx::bitwise_xor(a, b));
+            return a;
+          },
+          "other"_a,
+          nb::rv_policy::none)
+      .def("__int__", [](mx::array& a) { return nb::int_(to_scalar(a)); })
+      .def("__float__", [](mx::array& a) { return nb::float_(to_scalar(a)); })
+      .def(
+          "__complex__",
+          [](mx::array& a) {
+            return nb::cast<std::complex<double>>(to_scalar(a));
+          })
+      .def(
+          "__format__",
+          [](mx::array& a, nb::object format_spec) {
+            if (nb::len(nb::str(format_spec)) > 0 && a.ndim() > 0) {
+              throw nb::type_error(
+                  "unsupported format string passed to mx.array.__format__");
+            } else if (a.ndim() == 0) {
+              auto obj = to_scalar(a);
+              return nb::cast<std::string>(
+                  nb::handle(PyObject_Format(obj.ptr(), format_spec.ptr())));
+            } else {
+              nb::gil_scoped_release nogil;
+              std::ostringstream os;
+              os << a;
+              return os.str();
+            }
+          })
+      .def(
           "flatten",
-          [](const array& a,
+          [](const mx::array& a,
              int start_axis,
              int end_axis,
-             const StreamOrDevice& s) {
-            return flatten(a, start_axis, end_axis, s);
+             const mx::StreamOrDevice& s) {
+            return mx::flatten(a, start_axis, end_axis, s);
           },
           "start_axis"_a = 0,
           "end_axis"_a = -1,
@@ -1145,14 +1068,14 @@ void init_array(nb::module_& m) {
           )pbdoc")
       .def(
           "reshape",
-          [](const array& a, nb::args shape_, StreamOrDevice s) {
-            std::vector<int> shape;
+          [](const mx::array& a, nb::args shape_, mx::StreamOrDevice s) {
+            mx::Shape shape;
             if (!nb::isinstance<int>(shape_[0])) {
-              shape = nb::cast<std::vector<int>>(shape_[0]);
+              shape = nb::cast<mx::Shape>(shape_[0]);
             } else {
-              shape = nb::cast<std::vector<int>>(shape_);
+              shape = nb::cast<mx::Shape>(shape_);
             }
-            return reshape(a, shape, s);
+            return mx::reshape(a, std::move(shape), s);
           },
           "shape"_a,
           "stream"_a = nb::none(),
@@ -1164,13 +1087,15 @@ void init_array(nb::module_& m) {
           )pbdoc")
       .def(
           "squeeze",
-          [](const array& a, const IntOrVec& v, const StreamOrDevice& s) {
+          [](const mx::array& a,
+             const IntOrVec& v,
+             const mx::StreamOrDevice& s) {
             if (std::holds_alternative<std::monostate>(v)) {
-              return squeeze(a, s);
+              return mx::squeeze(a, s);
             } else if (auto pv = std::get_if<int>(&v); pv) {
-              return squeeze(a, *pv, s);
+              return mx::squeeze(a, *pv, s);
             } else {
-              return squeeze(a, std::get<std::vector<int>>(v), s);
+              return mx::squeeze(a, std::get<std::vector<int>>(v), s);
             }
           },
           "axis"_a = nb::none(),
@@ -1181,85 +1106,87 @@ void init_array(nb::module_& m) {
           )pbdoc")
       .def(
           "abs",
-          &mlx::core::abs,
+          &mx::abs,
           nb::kw_only(),
           "stream"_a = nb::none(),
           "See :func:`abs`.")
       .def(
-          "__abs__", [](const array& a) { return abs(a); }, "See :func:`abs`.")
+          "__abs__",
+          [](const mx::array& a) { return mx::abs(a); },
+          "See :func:`abs`.")
       .def(
           "square",
-          &square,
+          &mx::square,
           nb::kw_only(),
           "stream"_a = nb::none(),
           "See :func:`square`.")
       .def(
           "sqrt",
-          &mlx::core::sqrt,
+          &mx::sqrt,
           nb::kw_only(),
           "stream"_a = nb::none(),
           "See :func:`sqrt`.")
       .def(
           "rsqrt",
-          &rsqrt,
+          &mx::rsqrt,
           nb::kw_only(),
           "stream"_a = nb::none(),
           "See :func:`rsqrt`.")
       .def(
           "reciprocal",
-          &reciprocal,
+          &mx::reciprocal,
           nb::kw_only(),
           "stream"_a = nb::none(),
           "See :func:`reciprocal`.")
       .def(
           "exp",
-          &mlx::core::exp,
+          &mx::exp,
           nb::kw_only(),
           "stream"_a = nb::none(),
           "See :func:`exp`.")
       .def(
           "log",
-          &mlx::core::log,
+          &mx::log,
           nb::kw_only(),
           "stream"_a = nb::none(),
           "See :func:`log`.")
       .def(
           "log2",
-          &mlx::core::log2,
+          &mx::log2,
           nb::kw_only(),
           "stream"_a = nb::none(),
           "See :func:`log2`.")
       .def(
           "log10",
-          &mlx::core::log10,
+          &mx::log10,
           nb::kw_only(),
           "stream"_a = nb::none(),
           "See :func:`log10`.")
       .def(
           "sin",
-          &mlx::core::sin,
+          &mx::sin,
           nb::kw_only(),
           "stream"_a = nb::none(),
           "See :func:`sin`.")
       .def(
           "cos",
-          &mlx::core::cos,
+          &mx::cos,
           nb::kw_only(),
           "stream"_a = nb::none(),
           "See :func:`cos`.")
       .def(
           "log1p",
-          &mlx::core::log1p,
+          &mx::log1p,
           nb::kw_only(),
           "stream"_a = nb::none(),
           "See :func:`log1p`.")
       .def(
           "all",
-          [](const array& a,
+          [](const mx::array& a,
              const IntOrVec& axis,
              bool keepdims,
-             StreamOrDevice s) {
-            return all(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
+             mx::StreamOrDevice s) {
+            return mx::all(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
           },
           "axis"_a = nb::none(),
           "keepdims"_a = false,
@@ -1268,11 +1195,11 @@ void init_array(nb::module_& m) {
           "See :func:`all`.")
       .def(
           "any",
-          [](const array& a,
+          [](const mx::array& a,
              const IntOrVec& axis,
              bool keepdims,
-             StreamOrDevice s) {
-            return any(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
+             mx::StreamOrDevice s) {
+            return mx::any(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
           },
           "axis"_a = nb::none(),
           "keepdims"_a = false,
@@ -1281,7 +1208,7 @@ void init_array(nb::module_& m) {
           "See :func:`any`.")
       .def(
           "moveaxis",
-          &moveaxis,
+          &mx::moveaxis,
           "source"_a,
           "destination"_a,
           nb::kw_only(),
@@ -1289,7 +1216,7 @@ void init_array(nb::module_& m) {
           "See :func:`moveaxis`.")
       .def(
           "swapaxes",
-          &swapaxes,
+          &mx::swapaxes,
           "axis1"_a,
           "axis2"_a,
           nb::kw_only(),
@@ -1297,9 +1224,9 @@ void init_array(nb::module_& m) {
           "See :func:`swapaxes`.")
       .def(
           "transpose",
-          [](const array& a, nb::args axes_, StreamOrDevice s) {
+          [](const mx::array& a, nb::args axes_, mx::StreamOrDevice s) {
             if (axes_.size() == 0) {
-              return transpose(a, s);
+              return mx::transpose(a, s);
             }
             std::vector<int> axes;
             if (!nb::isinstance<int>(axes_[0])) {
@@ -1307,7 +1234,7 @@ void init_array(nb::module_& m) {
             } else {
               axes = nb::cast<std::vector<int>>(axes_);
             }
-            return transpose(a, axes, s);
+            return mx::transpose(a, axes, s);
           },
           "axes"_a,
           "stream"_a = nb::none(),
@@ -1319,15 +1246,15 @@ void init_array(nb::module_& m) {
           )pbdoc")
       .def_prop_ro(
           "T",
-          [](const array& a) { return transpose(a); },
+          [](const mx::array& a) { return mx::transpose(a); },
           "Equivalent to calling ``self.transpose()`` with no arguments.")
       .def(
           "sum",
-          [](const array& a,
+          [](const mx::array& a,
              const IntOrVec& axis,
              bool keepdims,
-             StreamOrDevice s) {
-            return sum(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
+             mx::StreamOrDevice s) {
+            return mx::sum(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
           },
           "axis"_a = nb::none(),
           "keepdims"_a = false,
@@ -1336,11 +1263,11 @@ void init_array(nb::module_& m) {
           "See :func:`sum`.")
       .def(
           "prod",
-          [](const array& a,
+          [](const mx::array& a,
              const IntOrVec& axis,
              bool keepdims,
-             StreamOrDevice s) {
-            return prod(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
+             mx::StreamOrDevice s) {
+            return mx::prod(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
           },
           "axis"_a = nb::none(),
           "keepdims"_a = false,
@@ -1349,11 +1276,11 @@ void init_array(nb::module_& m) {
           "See :func:`prod`.")
       .def(
           "min",
-          [](const array& a,
+          [](const mx::array& a,
              const IntOrVec& axis,
              bool keepdims,
-             StreamOrDevice s) {
-            return min(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
+             mx::StreamOrDevice s) {
+            return mx::min(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
           },
           "axis"_a = nb::none(),
           "keepdims"_a = false,
@@ -1362,11 +1289,11 @@ void init_array(nb::module_& m) {
           "See :func:`min`.")
       .def(
           "max",
-          [](const array& a,
+          [](const mx::array& a,
              const IntOrVec& axis,
              bool keepdims,
-             StreamOrDevice s) {
-            return max(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
+             mx::StreamOrDevice s) {
+            return mx::max(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
           },
           "axis"_a = nb::none(),
           "keepdims"_a = false,
@@ -1374,12 +1301,32 @@ void init_array(nb::module_& m) {
           "stream"_a = nb::none(),
           "See :func:`max`.")
       .def(
+          "logcumsumexp",
+          [](const mx::array& a,
+             std::optional<int> axis,
+             bool reverse,
+             bool inclusive,
+             mx::StreamOrDevice s) {
+            if (axis) {
+              return mx::logcumsumexp(a, *axis, reverse, inclusive, s);
+            } else {
+              return mx::logcumsumexp(a, reverse, inclusive, s);
+            }
+          },
+          "axis"_a = nb::none(),
+          nb::kw_only(),
+          "reverse"_a = false,
+          "inclusive"_a = true,
+          "stream"_a = nb::none(),
+          "See :func:`logcumsumexp`.")
+      .def(
           "logsumexp",
-          [](const array& a,
+          [](const mx::array& a,
              const IntOrVec& axis,
              bool keepdims,
-             StreamOrDevice s) {
-            return logsumexp(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
+             mx::StreamOrDevice s) {
+            return mx::logsumexp(
+                a, get_reduce_axes(axis, a.ndim()), keepdims, s);
           },
           "axis"_a = nb::none(),
           "keepdims"_a = false,
@@ -1388,11 +1335,11 @@ void init_array(nb::module_& m) {
           "See :func:`logsumexp`.")
       .def(
           "mean",
-          [](const array& a,
+          [](const mx::array& a,
              const IntOrVec& axis,
              bool keepdims,
-             StreamOrDevice s) {
-            return mean(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
+             mx::StreamOrDevice s) {
+            return mx::mean(a, get_reduce_axes(axis, a.ndim()), keepdims, s);
           },
           "axis"_a = nb::none(),
           "keepdims"_a = false,
@@ -1400,13 +1347,30 @@ void init_array(nb::module_& m) {
           "stream"_a = nb::none(),
           "See :func:`mean`.")
       .def(
-          "var",
-          [](const array& a,
+          "std",
+          [](const mx::array& a,
              const IntOrVec& axis,
              bool keepdims,
              int ddof,
-             StreamOrDevice s) {
-            return var(a, get_reduce_axes(axis, a.ndim()), keepdims, ddof, s);
+             mx::StreamOrDevice s) {
+            return mx::std(
+                a, get_reduce_axes(axis, a.ndim()), keepdims, ddof, s);
+          },
+          "axis"_a = nb::none(),
+          "keepdims"_a = false,
+          "ddof"_a = 0,
+          nb::kw_only(),
+          "stream"_a = nb::none(),
+          "See :func:`std`.")
+      .def(
+          "var",
+          [](const mx::array& a,
+             const IntOrVec& axis,
+             bool keepdims,
+             int ddof,
+             mx::StreamOrDevice s) {
+            return mx::var(
+                a, get_reduce_axes(axis, a.ndim()), keepdims, ddof, s);
           },
           "axis"_a = nb::none(),
           "keepdims"_a = false,
@@ -1416,15 +1380,15 @@ void init_array(nb::module_& m) {
           "See :func:`var`.")
       .def(
           "split",
-          [](const array& a,
-             const std::variant<int, std::vector<int>>& indices_or_sections,
+          [](const mx::array& a,
+             const std::variant<int, mx::Shape>& indices_or_sections,
              int axis,
-             StreamOrDevice s) {
+             mx::StreamOrDevice s) {
             if (auto pv = std::get_if<int>(&indices_or_sections); pv) {
-              return split(a, *pv, axis, s);
+              return mx::split(a, *pv, axis, s);
             } else {
-              return split(
-                  a, std::get<std::vector<int>>(indices_or_sections), axis, s);
+              return mx::split(
+                  a, std::get<mx::Shape>(indices_or_sections), axis, s);
             }
           },
           "indices_or_sections"_a,
@@ -1434,14 +1398,14 @@ void init_array(nb::module_& m) {
           "See :func:`split`.")
       .def(
           "argmin",
-          [](const array& a,
+          [](const mx::array& a,
              std::optional<int> axis,
              bool keepdims,
-             StreamOrDevice s) {
+             mx::StreamOrDevice s) {
             if (axis) {
-              return argmin(a, *axis, keepdims, s);
+              return mx::argmin(a, *axis, keepdims, s);
             } else {
-              return argmin(a, keepdims, s);
+              return mx::argmin(a, keepdims, s);
             }
           },
           "axis"_a = std::nullopt,
@@ -1451,14 +1415,14 @@ void init_array(nb::module_& m) {
           "See :func:`argmin`.")
       .def(
           "argmax",
-          [](const array& a,
+          [](const mx::array& a,
              std::optional<int> axis,
              bool keepdims,
-             StreamOrDevice s) {
+             mx::StreamOrDevice s) {
             if (axis) {
-              return argmax(a, *axis, keepdims, s);
+              return mx::argmax(a, *axis, keepdims, s);
             } else {
-              return argmax(a, keepdims, s);
+              return mx::argmax(a, keepdims, s);
             }
           },
           "axis"_a = nb::none(),
@@ -1468,17 +1432,15 @@ void init_array(nb::module_& m) {
           "See :func:`argmax`.")
       .def(
           "cumsum",
-          [](const array& a,
+          [](const mx::array& a,
              std::optional<int> axis,
              bool reverse,
              bool inclusive,
-             StreamOrDevice s) {
+             mx::StreamOrDevice s) {
             if (axis) {
-              return cumsum(a, *axis, reverse, inclusive, s);
+              return mx::cumsum(a, *axis, reverse, inclusive, s);
             } else {
-              // TODO: Implement that in the C++ API as well. See concatenate
-              // above.
-              return cumsum(reshape(a, {-1}, s), 0, reverse, inclusive, s);
+              return mx::cumsum(a, reverse, inclusive, s);
             }
           },
           "axis"_a = nb::none(),
@@ -1489,17 +1451,15 @@ void init_array(nb::module_& m) {
           "See :func:`cumsum`.")
       .def(
           "cumprod",
-          [](const array& a,
+          [](const mx::array& a,
              std::optional<int> axis,
              bool reverse,
              bool inclusive,
-             StreamOrDevice s) {
+             mx::StreamOrDevice s) {
             if (axis) {
-              return cumprod(a, *axis, reverse, inclusive, s);
+              return mx::cumprod(a, *axis, reverse, inclusive, s);
             } else {
-              // TODO: Implement that in the C++ API as well. See concatenate
-              // above.
-              return cumprod(reshape(a, {-1}, s), 0, reverse, inclusive, s);
+              return mx::cumprod(a, reverse, inclusive, s);
             }
           },
           "axis"_a = nb::none(),
@@ -1510,17 +1470,15 @@ void init_array(nb::module_& m) {
           "See :func:`cumprod`.")
       .def(
           "cummax",
-          [](const array& a,
+          [](const mx::array& a,
              std::optional<int> axis,
              bool reverse,
              bool inclusive,
-             StreamOrDevice s) {
+             mx::StreamOrDevice s) {
             if (axis) {
-              return cummax(a, *axis, reverse, inclusive, s);
+              return mx::cummax(a, *axis, reverse, inclusive, s);
             } else {
-              // TODO: Implement that in the C++ API as well. See concatenate
-              // above.
-              return cummax(reshape(a, {-1}, s), 0, reverse, inclusive, s);
+              return mx::cummax(a, reverse, inclusive, s);
             }
           },
           "axis"_a = nb::none(),
@@ -1531,17 +1489,15 @@ void init_array(nb::module_& m) {
           "See :func:`cummax`.")
       .def(
           "cummin",
-          [](const array& a,
+          [](const mx::array& a,
              std::optional<int> axis,
              bool reverse,
              bool inclusive,
-             StreamOrDevice s) {
+             mx::StreamOrDevice s) {
             if (axis) {
-              return cummin(a, *axis, reverse, inclusive, s);
+              return mx::cummin(a, *axis, reverse, inclusive, s);
             } else {
-              // TODO: Implement that in the C++ API as well. See concatenate
-              // above.
-              return cummin(reshape(a, {-1}, s), 0, reverse, inclusive, s);
+              return mx::cummin(a, reverse, inclusive, s);
             }
           },
           "axis"_a = nb::none(),
@@ -1552,8 +1508,8 @@ void init_array(nb::module_& m) {
           "See :func:`cummin`.")
       .def(
           "round",
-          [](const array& a, int decimals, StreamOrDevice s) {
-            return round(a, decimals, s);
+          [](const mx::array& a, int decimals, mx::StreamOrDevice s) {
+            return mx::round(a, decimals, s);
           },
           "decimals"_a = 0,
           nb::kw_only(),
@@ -1561,11 +1517,13 @@ void init_array(nb::module_& m) {
           "See :func:`round`.")
       .def(
           "diagonal",
-          [](const array& a,
+          [](const mx::array& a,
              int offset,
              int axis1,
              int axis2,
-             StreamOrDevice s) { return diagonal(a, offset, axis1, axis2, s); },
+             mx::StreamOrDevice s) {
+            return mx::diagonal(a, offset, axis1, axis2, s);
+          },
           "offset"_a = 0,
           "axis1"_a = 0,
           "axis2"_a = 1,
@@ -1573,7 +1531,9 @@ void init_array(nb::module_& m) {
           "See :func:`diagonal`.")
       .def(
           "diag",
-          [](const array& a, int k, StreamOrDevice s) { return diag(a, k, s); },
+          [](const mx::array& a, int k, mx::StreamOrDevice s) {
+            return mx::diag(a, k, s);
+          },
           "k"_a = 0,
           nb::kw_only(),
           "stream"_a = nb::none(),
@@ -1582,10 +1542,19 @@ void init_array(nb::module_& m) {
         )pbdoc")
       .def(
           "conj",
-          [](const array& a, StreamOrDevice s) {
-            return mlx::core::conjugate(to_array(a), s);
+          [](const mx::array& a, mx::StreamOrDevice s) {
+            return mx::conjugate(to_array(a), s);
           },
           nb::kw_only(),
           "stream"_a = nb::none(),
-          "See :func:`conj`.");
+          "See :func:`conj`.")
+      .def(
+          "view",
+          [](const ScalarOrArray& a,
+             const mx::Dtype& dtype,
+             mx::StreamOrDevice s) { return mx::view(to_array(a), dtype, s); },
+          "dtype"_a,
+          nb::kw_only(),
+          "stream"_a = nb::none(),
+          "See :func:`view`.");
 }

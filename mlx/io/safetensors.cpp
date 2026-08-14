@@ -1,12 +1,16 @@
 // Copyright © 2023 Apple Inc.
-//
+
 #include <json.hpp>
+#include <memory>
+#include <sstream>
 #include <stack>
 
+#include "mlx/backend/cuda/cuda.h"
 #include "mlx/io.h"
 #include "mlx/io/load.h"
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
+#include "mlx/transforms.h"
 
 using json = nlohmann::json;
 
@@ -23,6 +27,8 @@ using json = nlohmann::json;
 #define ST_U16 "U16"
 #define ST_U32 "U32"
 #define ST_U64 "U64"
+#define ST_F8_E4M3 "F8_E4M3"
+#define ST_F8_E8M0 "F8_E8M0"
 
 // Note: Complex numbers aren't in the spec yet so this could change -
 // https://github.com/huggingface/safetensors/issues/389
@@ -58,6 +64,8 @@ std::string dtype_to_safetensor_str(Dtype t) {
       return ST_BOOL;
     case complex64:
       return ST_C64;
+    default:
+      throw std::runtime_error("[save_safetensors] received invalid dtype.");
   }
 }
 
@@ -88,9 +96,14 @@ Dtype dtype_from_safetensor_str(std::string_view str) {
     return bool_;
   } else if (str == ST_C64) {
     return complex64;
+  } else if (str == ST_F8_E4M3) {
+    return uint8;
+  } else if (str == ST_F8_E8M0) {
+    return uint8;
   } else {
-    throw std::runtime_error(
-        "[safetensor] unsupported dtype " + std::string(str));
+    std::ostringstream msg;
+    msg << "[safetensor] unsupported dtype " << str;
+    throw std::runtime_error(msg.str());
   }
 }
 
@@ -101,26 +114,49 @@ SafetensorsLoad load_safetensors(
   ////////////////////////////////////////////////////////
   // Open and check file
   if (!in_stream->good() || !in_stream->is_open()) {
-    throw std::runtime_error(
-        "[load_safetensors] Failed to open " + in_stream->label());
+    std::ostringstream msg;
+    msg << "[load_safetensors] Failed to open " << in_stream->label();
+    throw std::runtime_error(msg.str());
   }
 
+  auto stream = cu::is_available() ? to_stream(s) : to_stream(s, Device::cpu);
+
   uint64_t jsonHeaderLength = 0;
+  // This is the same limit as in the original Rust Safetensors code.
+  constexpr uint64_t kMaxJsonHeaderLength = 100000000;
   in_stream->read(reinterpret_cast<char*>(&jsonHeaderLength), 8);
-  if (jsonHeaderLength <= 0) {
-    throw std::runtime_error(
-        "[load_safetensors] Invalid json header length " + in_stream->label());
+  if (jsonHeaderLength <= 0 || jsonHeaderLength >= kMaxJsonHeaderLength) {
+    std::ostringstream msg;
+    msg << "[load_safetensors] Invalid json header length "
+        << in_stream->label();
+    throw std::runtime_error(msg.str());
   }
+
+  // Determine file size to be able to validate that reads are within the
+  // bounds of the file (at least at creation time)
+  in_stream->seek(0, std::ios_base::end);
+  size_t file_size = in_stream->tell();
+  in_stream->seek(8, std::ios_base::beg);
+
   // Load the json metadata
-  char rawJson[jsonHeaderLength];
-  in_stream->read(rawJson, jsonHeaderLength);
-  auto metadata = json::parse(rawJson, rawJson + jsonHeaderLength);
+  if (file_size < jsonHeaderLength + 8) {
+    std::ostringstream msg;
+    msg << "[load_safetensors] The JSON header is " << jsonHeaderLength
+        << " bytes long but the file is only " << file_size << " bytes. "
+        << "Perhaps an incomplete download or corrupt file?";
+    throw std::runtime_error(msg.str());
+  }
+  auto rawJson = std::make_unique<char[]>(jsonHeaderLength);
+  in_stream->read(rawJson.get(), jsonHeaderLength);
+  auto metadata = json::parse(rawJson.get(), rawJson.get() + jsonHeaderLength);
   // Should always be an object on the top-level
   if (!metadata.is_object()) {
-    throw std::runtime_error(
-        "[load_safetensors] Invalid json metadata " + in_stream->label());
+    std::ostringstream msg;
+    msg << "[load_safetensors] Invalid json metadata " << in_stream->label();
+    throw std::runtime_error(msg.str());
   }
   size_t offset = jsonHeaderLength + 8;
+
   // Load the arrays using metadata
   std::unordered_map<std::string, array> res;
   std::unordered_map<std::string, std::string> metadata_map;
@@ -132,22 +168,53 @@ SafetensorsLoad load_safetensors(
       continue;
     }
     const std::string& dtype = item.value().at("dtype");
-    const std::vector<int>& shape = item.value().at("shape");
+    const Shape& shape = item.value().at("shape");
     const std::vector<size_t>& data_offsets = item.value().at("data_offsets");
     Dtype type = dtype_from_safetensor_str(dtype);
-    auto loaded_array = array(
-        shape,
-        type,
-        std::make_shared<Load>(
-            to_stream(s), in_stream, offset + data_offsets.at(0), false),
-        std::vector<array>{});
-    res.insert({item.key(), loaded_array});
+    if (data_offsets.size() != 2) {
+      std::ostringstream msg;
+      msg << "[load_safetensors] Tensor '" << item.key()
+          << "' data_offsets must have exactly 2 entries but has "
+          << data_offsets.size();
+      throw std::runtime_error(msg.str());
+    }
+    {
+      size_t expected_nbytes = type.size();
+      for (auto dim : shape) {
+        expected_nbytes *= static_cast<size_t>(dim);
+      }
+      if (data_offsets[1] < data_offsets[0] ||
+          data_offsets[1] - data_offsets[0] != expected_nbytes) {
+        std::ostringstream msg;
+        msg << "[load_safetensors] Tensor '" << item.key()
+            << "' invalid data offsets (" << data_offsets[0] << ", "
+            << data_offsets[1] << "). Expecting " << expected_nbytes
+            << " bytes.";
+        throw std::runtime_error(msg.str());
+      }
+    }
+    if (offset + data_offsets[1] > file_size) {
+      std::ostringstream msg;
+      msg << "[load_safetensors] Tensor '" << item.key()
+          << "' invalid data offsets (" << data_offsets[0] << ", "
+          << data_offsets[1] << ") exceeding the size of the file. "
+          << "Perhaps an incomplete download or corrupt file?";
+      throw std::runtime_error(msg.str());
+    }
+    res.insert(
+        {item.key(),
+         array(
+             shape,
+             type,
+             std::make_shared<Load>(
+                 stream, in_stream, offset + data_offsets.at(0), false),
+             std::vector<array>{})});
   }
   return {res, metadata_map};
 }
 
 SafetensorsLoad load_safetensors(const std::string& file, StreamOrDevice s) {
-  return load_safetensors(std::make_shared<io::FileReader>(file), s);
+  return load_safetensors(std::make_shared<io::ParallelFileReader>(file), s);
 }
 
 void save_safetensors(
@@ -157,8 +224,9 @@ void save_safetensors(
   ////////////////////////////////////////////////////////
   // Check file
   if (!out_stream->good() || !out_stream->is_open()) {
-    throw std::runtime_error(
-        "[save_safetensors] Failed to open " + out_stream->label());
+    std::ostringstream msg;
+    msg << "[save_safetensors] Failed to open " << out_stream->label();
+    throw std::runtime_error(msg.str());
   }
 
   ////////////////////////////////////////////////////////
@@ -169,27 +237,19 @@ void save_safetensors(
     _metadata[key] = value;
   }
   parent["__metadata__"] = _metadata;
+
+  {
+    std::vector<array> to_eval;
+    to_eval.reserve(a.size());
+    for (auto& p : a) {
+      p.second = contiguous(p.second);
+      to_eval.push_back(p.second);
+    }
+    eval(std::move(to_eval));
+  }
+
   size_t offset = 0;
   for (auto& [key, arr] : a) {
-    arr.eval();
-    if (arr.nbytes() == 0) {
-      throw std::invalid_argument(
-          "[save_safetensors] cannot serialize an empty array key: " + key);
-    }
-
-    // Try to make it row contiguous
-    if (!arr.flags().row_contiguous) {
-      arr = reshape(flatten(arr), arr.shape());
-      arr.eval();
-    }
-
-    // Has to be row-major now but, check one more time in case
-    // any of the above change in the future
-    if (!arr.flags().row_contiguous) {
-      throw std::invalid_argument(
-          "[save_safetensors] can only serialize row-major arrays");
-    }
-
     json child;
     child["dtype"] = dtype_to_safetensor_str(arr.dtype());
     child["shape"] = arr.shape();
@@ -203,7 +263,11 @@ void save_safetensors(
   out_stream->write(reinterpret_cast<char*>(&header_len), 8);
   out_stream->write(header.c_str(), header_len);
   for (auto& [key, arr] : a) {
-    out_stream->write(arr.data<char>(), arr.nbytes());
+    // An empty tensor contributes a zero length span and has no data pointer
+    // worth asking for.
+    if (arr.nbytes() > 0) {
+      out_stream->write(arr.data<char>(), arr.nbytes());
+    }
   }
 }
 

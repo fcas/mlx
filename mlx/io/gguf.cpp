@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <numeric>
 
 #include "mlx/io/gguf.h"
@@ -46,8 +47,8 @@ std::optional<Dtype> gguf_type_to_dtype(const uint32_t& gguf_type) {
   }
 }
 
-std::vector<int> get_shape(const gguf_tensor& tensor) {
-  std::vector<int> shape;
+Shape get_shape(const gguf_tensor& tensor) {
+  Shape shape;
   // The dimension order in GGML is the reverse of the order used in MLX.
   for (int i = tensor.ndim - 1; i >= 0; i--) {
     shape.push_back(tensor.dim[i]);
@@ -56,14 +57,21 @@ std::vector<int> get_shape(const gguf_tensor& tensor) {
 }
 
 std::tuple<allocator::Buffer, Dtype> extract_tensor_data(gguf_tensor* tensor) {
+  if (tensor == nullptr) {
+    throw std::invalid_argument(
+        "[extract_tensor_data] Input tensor pointer is null.");
+  }
   std::optional<Dtype> equivalent_dtype = gguf_type_to_dtype(tensor->type);
   // If there's an equivalent type, we can simply copy.
   if (equivalent_dtype.has_value()) {
+    if (tensor->weights_data == nullptr) {
+      throw std::runtime_error("[load_gguf] NULL tensor data pointer");
+    }
     allocator::Buffer buffer = allocator::malloc(tensor->bsize);
     memcpy(
         buffer.raw_ptr(),
         tensor->weights_data,
-        tensor->num_weights * equivalent_dtype.value().size);
+        tensor->num_weights * equivalent_dtype.value().size());
     return {buffer, equivalent_dtype.value()};
   }
   // Otherwise, we convert to float16.
@@ -153,7 +161,7 @@ void set_mx_value_from_gguf(
           value = array(reinterpret_cast<uint64_t*>(data), {size}, uint64);
           break;
         case GGUF_VALUE_TYPE_INT64:
-          value = array(reinterpret_cast<uint64_t*>(data), {size}, int64);
+          value = array(reinterpret_cast<int64_t*>(data), {size}, int64);
           break;
         case GGUF_VALUE_TYPE_FLOAT32:
           value = array(reinterpret_cast<float*>(data), {size}, float32);
@@ -203,6 +211,28 @@ std::unordered_map<std::string, GGUFMetaData> load_metadata(gguf_ctx* ctx) {
   return metadata;
 }
 
+// gguflib computes weights_data as ctx->data + ctx->data_off + the tensor's
+// offset field in unsigned arithmetic, without comparing the result against the
+// mapping, so a crafted offset can point outside the file or -- if the addition
+// wraps -- back inside it at the wrong bytes.
+void check_tensor_in_file(const gguf_ctx* ctx, const gguf_tensor& tensor) {
+  auto fail = [&tensor](const std::string& what) {
+    std::ostringstream msg;
+    msg << "[load_gguf] Tensor '" << std::string(tensor.name, tensor.namelen)
+        << "' " << what << ". Perhaps an incomplete download or corrupt file?";
+    throw std::runtime_error(msg.str());
+  };
+  if (tensor.offset < ctx->data_off) {
+    fail("has a data offset that overflows the data section");
+  }
+  if (tensor.offset > ctx->size) {
+    fail("has a data offset past the end of the file");
+  }
+  if (tensor.bsize > ctx->size - tensor.offset) {
+    fail("extends past the end of the file");
+  }
+}
+
 std::unordered_map<std::string, array> load_arrays(gguf_ctx* ctx) {
   std::unordered_map<std::string, array> array_map;
   gguf_tensor tensor;
@@ -217,13 +247,12 @@ std::unordered_map<std::string, array> load_arrays(gguf_ctx* ctx) {
   };
 
   while (gguf_get_tensor(ctx, &tensor)) {
-    std::string name(tensor.name, tensor.namelen);
+    check_tensor_in_file(ctx, tensor);
     if (tensor.type == GGUF_TYPE_Q4_0 || tensor.type == GGUF_TYPE_Q4_1 ||
         tensor.type == GGUF_TYPE_Q8_0) {
       gguf_load_quantized(array_map, tensor);
     } else {
-      std::string name = std::string(tensor.name, tensor.namelen);
-
+      std::string name(tensor.name, tensor.namelen);
       const auto& [data, dtype] = extract_tensor_data(&tensor);
       array loaded_array = array(data, get_shape(tensor), dtype);
       check_insert(array_map.insert({name, loaded_array}));
@@ -233,13 +262,22 @@ std::unordered_map<std::string, array> load_arrays(gguf_ctx* ctx) {
 }
 
 GGUFLoad load_gguf(const std::string& file, StreamOrDevice s) {
-  gguf_ctx* ctx = gguf_open(file.data());
+  bool exists;
+  {
+    std::ifstream f(file.c_str());
+    exists = f.good();
+  }
+  if (!exists) {
+    throw std::invalid_argument("[load_gguf] Failed to open " + file);
+  }
+
+  std::unique_ptr<gguf_ctx, decltype(&gguf_close)> ctx(
+      gguf_open(file.data()), gguf_close);
   if (!ctx) {
     throw std::runtime_error("[load_gguf] gguf_init failed");
   }
-  auto metadata = load_metadata(ctx);
-  auto arrays = load_arrays(ctx);
-  gguf_close(ctx);
+  auto metadata = load_metadata(ctx.get());
+  auto arrays = load_arrays(ctx.get());
   return {arrays, metadata};
 }
 
@@ -285,7 +323,8 @@ void save_gguf(
     file += ".gguf";
   }
 
-  gguf_ctx* ctx = gguf_create(file.c_str(), GGUF_OVERWRITE);
+  std::unique_ptr<gguf_ctx, decltype(&gguf_close)> ctx(
+      gguf_create(file.c_str(), GGUF_OVERWRITE), gguf_close);
   if (!ctx) {
     throw std::runtime_error("[save_gguf] gguf_create failed");
   }
@@ -304,7 +343,7 @@ void save_gguf(
       std::vector<char> val_vec(size);
       string_to_gguf(val_vec.data(), str);
       gguf_append_kv(
-          ctx,
+          ctx.get(),
           key.c_str(),
           key.length(),
           GGUF_VALUE_TYPE_STRING,
@@ -327,7 +366,7 @@ void save_gguf(
         str_ptr += str.length() + sizeof(gguf_string);
       }
       gguf_append_kv(
-          ctx,
+          ctx.get(),
           key.c_str(),
           key.length(),
           GGUF_VALUE_TYPE_ARRAY,
@@ -353,34 +392,34 @@ void save_gguf(
       }
       switch (v.dtype()) {
         case float32:
-          append_kv_array(ctx, key, v, GGUF_VALUE_TYPE_FLOAT32);
+          append_kv_array(ctx.get(), key, v, GGUF_VALUE_TYPE_FLOAT32);
           break;
         case int64:
-          append_kv_array(ctx, key, v, GGUF_VALUE_TYPE_INT64);
+          append_kv_array(ctx.get(), key, v, GGUF_VALUE_TYPE_INT64);
           break;
         case int32:
-          append_kv_array(ctx, key, v, GGUF_VALUE_TYPE_INT32);
+          append_kv_array(ctx.get(), key, v, GGUF_VALUE_TYPE_INT32);
           break;
         case int16:
-          append_kv_array(ctx, key, v, GGUF_VALUE_TYPE_INT16);
+          append_kv_array(ctx.get(), key, v, GGUF_VALUE_TYPE_INT16);
           break;
         case int8:
-          append_kv_array(ctx, key, v, GGUF_VALUE_TYPE_INT8);
+          append_kv_array(ctx.get(), key, v, GGUF_VALUE_TYPE_INT8);
           break;
         case uint64:
-          append_kv_array(ctx, key, v, GGUF_VALUE_TYPE_UINT64);
+          append_kv_array(ctx.get(), key, v, GGUF_VALUE_TYPE_UINT64);
           break;
         case uint32:
-          append_kv_array(ctx, key, v, GGUF_VALUE_TYPE_UINT32);
+          append_kv_array(ctx.get(), key, v, GGUF_VALUE_TYPE_UINT32);
           break;
         case uint16:
-          append_kv_array(ctx, key, v, GGUF_VALUE_TYPE_UINT16);
+          append_kv_array(ctx.get(), key, v, GGUF_VALUE_TYPE_UINT16);
           break;
         case uint8:
-          append_kv_array(ctx, key, v, GGUF_VALUE_TYPE_UINT8);
+          append_kv_array(ctx.get(), key, v, GGUF_VALUE_TYPE_UINT8);
           break;
         case bool_:
-          append_kv_array(ctx, key, v, GGUF_VALUE_TYPE_BOOL);
+          append_kv_array(ctx.get(), key, v, GGUF_VALUE_TYPE_BOOL);
           break;
         default:
           std::ostringstream msg;
@@ -425,16 +464,16 @@ void save_gguf(
     const char* tensorname = key.c_str();
     const uint64_t namelen = key.length();
     const uint32_t num_dim = arr.ndim();
-    uint64_t dim[num_dim];
+    std::vector<uint64_t> dim(num_dim);
     for (int i = 0; i < num_dim; i++) {
       dim[i] = arr.shape()[num_dim - 1 - i];
     }
     if (!gguf_append_tensor_info(
-            ctx,
+            ctx.get(),
             tensorname,
             namelen,
             num_dim,
-            dim,
+            dim.data(),
             gguf_type.value(),
             tensor_offset)) {
       throw std::runtime_error("[save_gguf] gguf_append_tensor_info failed");
@@ -444,11 +483,11 @@ void save_gguf(
 
   // Then, append the tensor weights
   for (const auto& [key, arr] : array_map) {
-    if (!gguf_append_tensor_data(ctx, (void*)arr.data<void>(), arr.nbytes())) {
+    if (!gguf_append_tensor_data(
+            ctx.get(), (void*)arr.data<void>(), arr.nbytes())) {
       throw std::runtime_error("[save_gguf] gguf_append_tensor_data failed");
     }
   }
-  gguf_close(ctx);
 }
 
 } // namespace mlx::core

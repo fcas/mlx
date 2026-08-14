@@ -1,9 +1,13 @@
 // Copyright © 2023-2024 Apple Inc.
+
+// Required for using M_PI_2 in MSVC.
+#define _USE_MATH_DEFINES
 #include <cmath>
 #include <numeric>
 
 #include "doctest/doctest.h"
 
+#include "mlx/backend/cuda/cuda.h"
 #include "mlx/mlx.h"
 
 using namespace mlx::core;
@@ -11,13 +15,13 @@ using namespace mlx::core;
 TEST_CASE("test copy") {
   array x(1.0);
   auto y = copy(x);
-  CHECK_EQ(y.shape(), std::vector<int>{});
+  CHECK_EQ(y.shape(), Shape{});
   CHECK_NE(y.id(), x.id());
   CHECK_EQ(y.item<float>(), 1.0f);
 
   x = array({1, 2}, {2, 1});
   y = copy(x);
-  CHECK_EQ(y.shape(), std::vector<int>{2, 1});
+  CHECK_EQ(y.shape(), Shape{2, 1});
   CHECK_EQ(y.dtype(), int32);
   CHECK_NE(y.id(), x.id());
   CHECK(array_equal(y, x).item<bool>());
@@ -25,37 +29,37 @@ TEST_CASE("test copy") {
 
 TEST_CASE("test reshape") {
   array x(1.0);
-  CHECK_EQ(reshape(x, {}).shape(), std::vector<int>{});
+  CHECK_EQ(reshape(x, {}).shape(), Shape{});
   CHECK_THROWS_AS(reshape(x, {2}), std::invalid_argument);
   auto y = reshape(x, {1, 1, 1});
-  CHECK_EQ(y.shape(), std::vector<int>{1, 1, 1});
+  CHECK_EQ(y.shape(), Shape{1, 1, 1});
   y = reshape(x, {-1, 1, 1});
-  CHECK_EQ(y.shape(), std::vector<int>{1, 1, 1});
+  CHECK_EQ(y.shape(), Shape{1, 1, 1});
   y = reshape(x, {1, 1, -1});
-  CHECK_EQ(y.shape(), std::vector<int>{1, 1, 1});
+  CHECK_EQ(y.shape(), Shape{1, 1, 1});
   CHECK_THROWS_AS(reshape(x, {1, -1, -1}), std::invalid_argument);
   CHECK_THROWS_AS(reshape(x, {2, -1}), std::invalid_argument);
 
   x = zeros({2, 2, 2});
   y = reshape(x, {8});
-  CHECK_EQ(y.shape(), std::vector<int>{8});
+  CHECK_EQ(y.shape(), Shape{8});
   CHECK_THROWS_AS(reshape(x, {7}), std::invalid_argument);
   y = reshape(x, {-1});
-  CHECK_EQ(y.shape(), std::vector<int>{8});
+  CHECK_EQ(y.shape(), Shape{8});
   y = reshape(x, {-1, 2});
-  CHECK_EQ(y.shape(), std::vector<int>{4, 2});
+  CHECK_EQ(y.shape(), Shape{4, 2});
   CHECK_THROWS_AS(reshape(x, {-1, 7}), std::invalid_argument);
 
   // Works with empty array
   x = array({});
   y = reshape(x, {0, 0, 0});
-  CHECK_EQ(y.shape(), std::vector<int>{0, 0, 0});
+  CHECK_EQ(y.shape(), Shape{0, 0, 0});
   y.eval();
   CHECK_EQ(y.size(), 0);
   CHECK_THROWS_AS(reshape(x, {}), std::invalid_argument);
   CHECK_THROWS_AS(reshape(x, {1}), std::invalid_argument);
   y = reshape(x, {1, 5, 0});
-  CHECK_EQ(y.shape(), std::vector<int>{1, 5, 0});
+  CHECK_EQ(y.shape(), Shape{1, 5, 0});
 
   // Check that reshaping a transposed array doesn't result in a copy
   x = reshape(arange(64), {2, 4, 8});
@@ -100,19 +104,49 @@ TEST_CASE("test reshape") {
   CHECK_EQ(y.strides()[4], 8);
   // y.strides()[5] can be anything since y.shape()[5] == 1
   CHECK_EQ(x.data<int32_t>(), y.data<int32_t>());
+
+  // Check contiguity preservation
+  x = ones({10, 10});
+  eval(x);
+  CHECK(x.flags().row_contiguous);
+  CHECK(!x.flags().col_contiguous);
+  y = reshape(x, {2, 5, 10});
+  eval(y);
+  CHECK(y.flags().row_contiguous);
+  CHECK(!y.flags().col_contiguous);
+  y = reshape(x, {10, 1, 10, 1});
+  eval(y);
+  CHECK(y.flags().row_contiguous);
+  CHECK(!y.flags().col_contiguous);
+  x = transpose(x, {1, 0});
+  eval(x);
+  CHECK(!x.flags().row_contiguous);
+  CHECK(x.flags().col_contiguous);
+  y = reshape(x, {2, 5, 10});
+  eval(y);
+  CHECK(!y.flags().row_contiguous);
+  CHECK(y.flags().col_contiguous);
+  y = reshape(x, {2, 50});
+  eval(y);
+  CHECK(y.flags().row_contiguous);
+  CHECK(!y.flags().col_contiguous);
+  y = reshape(x, {10, 1, 10, 1});
+  eval(y);
+  CHECK(!y.flags().row_contiguous);
+  CHECK(y.flags().col_contiguous);
 }
 
 TEST_CASE("test flatten") {
   array x = zeros({2, 3, 4});
-  CHECK_EQ(flatten(x).shape(), std::vector<int>({2 * 3 * 4}));
+  CHECK_EQ(flatten(x).shape(), Shape({2 * 3 * 4}));
 
-  CHECK_EQ(flatten(x, 1, 1).shape(), std::vector<int>({2, 3, 4}));
-  CHECK_EQ(flatten(x, 1, 2).shape(), std::vector<int>({2, 3 * 4}));
-  CHECK_EQ(flatten(x, 1, 3).shape(), std::vector<int>({2, 3 * 4}));
-  CHECK_EQ(flatten(x, 1, -1).shape(), std::vector<int>({2, 3 * 4}));
-  CHECK_EQ(flatten(x, -2, -1).shape(), std::vector<int>({2, 3 * 4}));
-  CHECK_EQ(flatten(x, -3, -1).shape(), std::vector<int>({2 * 3 * 4}));
-  CHECK_EQ(flatten(x, -4, -1).shape(), std::vector<int>({2 * 3 * 4}));
+  CHECK_EQ(flatten(x, 1, 1).shape(), Shape({2, 3, 4}));
+  CHECK_EQ(flatten(x, 1, 2).shape(), Shape({2, 3 * 4}));
+  CHECK_EQ(flatten(x, 1, 3).shape(), Shape({2, 3 * 4}));
+  CHECK_EQ(flatten(x, 1, -1).shape(), Shape({2, 3 * 4}));
+  CHECK_EQ(flatten(x, -2, -1).shape(), Shape({2, 3 * 4}));
+  CHECK_EQ(flatten(x, -3, -1).shape(), Shape({2 * 3 * 4}));
+  CHECK_EQ(flatten(x, -4, -1).shape(), Shape({2 * 3 * 4}));
 
   // Check start > end throws
   CHECK_THROWS(flatten(x, 2, 1));
@@ -125,36 +159,71 @@ TEST_CASE("test flatten") {
 
   // Check scalar flattens to 1D
   x = array(1);
-  CHECK_EQ(flatten(x, -3, -1).shape(), std::vector<int>({1}));
-  CHECK_EQ(flatten(x, 0, 0).shape(), std::vector<int>({1}));
+  CHECK_EQ(flatten(x, -3, -1).shape(), Shape({1}));
+  CHECK_EQ(flatten(x, 0, 0).shape(), Shape({1}));
+}
+
+TEST_CASE("test unflatten") {
+  array x = array(1);
+  CHECK_THROWS(unflatten(x, 0, {1, 1}));
+
+  x = array({1});
+  auto out = unflatten(x, 0, {1, 1});
+  CHECK_EQ(out.shape(), Shape({1, 1}));
+  CHECK_THROWS(unflatten(x, 1, {1, 1}));
+  CHECK_THROWS(unflatten(x, 0, {-1, -1}));
+  CHECK_THROWS(unflatten(x, 0, {-1, 2}));
+  CHECK_THROWS(unflatten(x, 0, {}));
+
+  x = zeros({4, 8});
+  out = unflatten(x, 1, {2, 2, 2});
+  CHECK_EQ(out.shape(), Shape({4, 2, 2, 2}));
 }
 
 TEST_CASE("test squeeze and expand") {
   array x = zeros({2, 1, 2, 1, 2, 1});
-  CHECK_EQ(squeeze(x).shape(), std::vector<int>{2, 2, 2});
-  CHECK_EQ(squeeze(x, {1, 3, 5}).shape(), std::vector<int>{2, 2, 2});
-  CHECK_EQ(squeeze(x, {-1, -3, -5}).shape(), std::vector<int>{2, 2, 2});
-  CHECK_EQ(squeeze(x, 1).shape(), std::vector<int>{2, 2, 1, 2, 1});
-  CHECK_EQ(squeeze(x, -1).shape(), std::vector<int>{2, 1, 2, 1, 2});
+  CHECK_EQ(squeeze(x).shape(), Shape{2, 2, 2});
+  CHECK_EQ(squeeze(x, {1, 3, 5}).shape(), Shape{2, 2, 2});
+  CHECK_EQ(squeeze(x, {-1, -3, -5}).shape(), Shape{2, 2, 2});
+  CHECK_EQ(squeeze(x, 1).shape(), Shape{2, 2, 1, 2, 1});
+  CHECK_EQ(squeeze(x, -1).shape(), Shape{2, 1, 2, 1, 2});
 
   CHECK_THROWS(squeeze(x, 0));
   CHECK_THROWS(squeeze(x, 2));
   CHECK_THROWS(squeeze(x, {1, 3, 1}));
   CHECK_THROWS(squeeze(x, {1, 3, -3}));
 
+  // Out of bounds negative axes must throw and not wrap around
+  x = zeros({1, 1, 1});
+  CHECK_THROWS(squeeze(x, std::vector<int>{-4}));
+  CHECK_THROWS(squeeze(x, {-5, 0}));
+  CHECK_THROWS(squeeze(x, {0, 4}));
+
   x = zeros({2, 2});
-  CHECK_EQ(expand_dims(x, 0).shape(), std::vector<int>{1, 2, 2});
-  CHECK_EQ(expand_dims(x, -1).shape(), std::vector<int>{2, 2, 1});
-  CHECK_EQ(expand_dims(x, 1).shape(), std::vector<int>{2, 1, 2});
-  CHECK_EQ(expand_dims(x, {0, 1, 2}).shape(), std::vector<int>{1, 1, 1, 2, 2});
+  CHECK_EQ(expand_dims(x, 0).shape(), Shape{1, 2, 2});
+  CHECK_EQ(expand_dims(x, -1).shape(), Shape{2, 2, 1});
+  CHECK_EQ(expand_dims(x, 1).shape(), Shape{2, 1, 2});
+  CHECK_EQ(expand_dims(x, {0, 1, 2}).shape(), Shape{1, 1, 1, 2, 2});
   CHECK_EQ(
       expand_dims(x, {0, 1, 2, 5, 6, 7}).shape(),
-      std::vector<int>{1, 1, 1, 2, 2, 1, 1, 1});
+      Shape{1, 1, 1, 2, 2, 1, 1, 1});
 
   CHECK_THROWS(expand_dims(x, 3));
   CHECK_THROWS(expand_dims(x, -4));
   CHECK_THROWS(expand_dims(x, {0, 1, 0}));
   CHECK_THROWS(expand_dims(x, {0, 1, -4}));
+
+  // Negative axes are resolved against the output shape and sorted
+  CHECK_EQ(expand_dims(x, {3, -4}).shape(), Shape{1, 2, 2, 1});
+  CHECK_EQ(expand_dims(x, {-1, -4}).shape(), Shape{1, 2, 2, 1});
+
+  // Out of bounds negative axes must throw and not wrap around
+  CHECK_THROWS(expand_dims(x, {-5, -4}));
+  CHECK_THROWS(expand_dims(x, {-6, 0}));
+
+  x = zeros({});
+  CHECK_EQ(expand_dims(x, {-2, -1}).shape(), Shape{1, 1});
+  CHECK_THROWS(expand_dims(x, {-3, -2}));
 }
 
 TEST_CASE("test slice") {
@@ -176,7 +245,7 @@ TEST_CASE("test slice") {
 
   out = slice(x, {1}, {0});
   eval(out);
-  CHECK_EQ(out.shape(), std::vector<int>{0});
+  CHECK_EQ(out.shape(), Shape{0});
 
   out = slice(x, {0}, {1}, {1});
   CHECK_EQ(out.item<int>(), 3);
@@ -196,6 +265,99 @@ TEST_CASE("test slice") {
 
   out = slice(x, {0, 0}, {2, 4}, {1, 2});
   CHECK(array_equal(out, array({0, 2, 4, 6}, {2, 2})).item<bool>());
+
+  // Check contiguity preservation
+  x = ones({10, 10});
+  eval(x);
+  CHECK(x.flags().row_contiguous);
+  CHECK(!x.flags().col_contiguous);
+  out = slice(x, {0, 0}, {10, 5});
+  eval(out);
+  CHECK(!out.flags().row_contiguous);
+  CHECK(!out.flags().col_contiguous);
+  out = slice(x, {0, 0}, {5, 10});
+  eval(out);
+  CHECK(out.flags().row_contiguous);
+  CHECK(!out.flags().col_contiguous);
+  x = transpose(x, {1, 0});
+  eval(x);
+  CHECK(!x.flags().row_contiguous);
+  CHECK(x.flags().col_contiguous);
+  out = slice(x, {0, 0}, {10, 5});
+  eval(out);
+  CHECK(!out.flags().row_contiguous);
+  CHECK(out.flags().col_contiguous);
+  out = slice(x, {0, 0}, {5, 10});
+  eval(out);
+  CHECK(!out.flags().row_contiguous);
+  CHECK(!out.flags().col_contiguous);
+
+  x = ones({6, 4, 10});
+  out = slice(x, {0, 0, 0}, {6, 4, 10}, {2, 1, 2});
+  eval(out);
+  CHECK(!out.flags().contiguous);
+  CHECK(!out.flags().row_contiguous);
+  CHECK(!out.flags().col_contiguous);
+
+  // Check data size correctness
+  x = ones({4});
+  out = slice(x, {0}, {2});
+  eval(out);
+  CHECK_EQ(out.data_size(), 2);
+
+  out = slice(x, {2}, {4});
+  eval(out);
+  CHECK_EQ(out.data_size(), 2);
+
+  out = slice(x, {0}, {4}, {2});
+  eval(out);
+  CHECK_EQ(out.data_size(), 3);
+
+  x = ones({4, 4});
+  out = slice(x, {0, 0}, {2, 4});
+  eval(out);
+  CHECK_EQ(out.data_size(), 8);
+
+  out = slice(x, {0, 0}, {1, 2});
+  eval(out);
+  CHECK_EQ(out.data_size(), 2);
+
+  out = slice(x, {0, 1}, {4, 4});
+  eval(out);
+  CHECK_EQ(out.data_size(), 15);
+
+  out = slice(x, {1, 2}, {3, 4});
+  eval(out);
+  CHECK_EQ(out.data_size(), 6);
+
+  x = ones({4, 4, 4});
+  out = slice(x, {0, 0, 0}, {4, 2, 2});
+  eval(out);
+  CHECK_EQ(out.data_size(), 54);
+
+  x = ones({4, 4, 4});
+  out = slice(x, {2, 2, 2}, {3, 3, 3});
+  eval(out);
+  CHECK_EQ(out.data_size(), 1);
+
+  x = ones({4, 4, 4});
+  out = slice(x, {2, 2, 2}, {3, 4, 3});
+  eval(out);
+  CHECK_EQ(out.data_size(), 5);
+
+  x = ones({8});
+  out = slice(x, {7}, {-9}, {-1});
+  eval(out);
+  CHECK_EQ(out.data_size(), 8);
+
+  out = slice(x, {7}, {-9}, {-1});
+  eval(out);
+  CHECK_EQ(out.data_size(), 8);
+
+  x = ones({4, 2});
+  out = slice(x, {3, 0}, {-5, 2}, {-1, 1});
+  eval(out);
+  CHECK_EQ(out.data_size(), 8);
 }
 
 TEST_CASE("test slice update") {
@@ -223,9 +385,155 @@ TEST_CASE("test slice update") {
   CHECK(array_equal(slice(out, {4}, {8}, {1}), y).item<bool>());
 }
 
+TEST_CASE("test slice update add") {
+  // Basic slice update add
+  auto x = zeros({8}, float32);
+  auto y = ones({4}, float32);
+  auto out = slice_update_add(x, y, {2}, {6}, {1});
+  auto expected = array({0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f});
+  CHECK(array_equal(out, expected).item<bool>());
+
+  // Overlapping slice update add
+  x = zeros({8}, float32);
+  y = ones({4}, float32);
+  out = slice_update_add(x, y, {2}, {6}, {1});
+  out = slice_update_add(out, y, {4}, {8}, {1});
+  expected = array({0.0f, 0.0f, 1.0f, 1.0f, 2.0f, 2.0f, 1.0f, 1.0f});
+  CHECK(array_equal(out, expected).item<bool>());
+
+  // Slice update add with stride
+  x = zeros({10}, float32);
+  y = ones({3}, float32);
+  out = slice_update_add(x, y, {1}, {7}, {2});
+  expected =
+      array({0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f});
+  CHECK(array_equal(out, expected).item<bool>());
+
+  // 2D slice update add
+  x = zeros({4, 4}, float32);
+  y = ones({2, 2}, float32);
+  out = slice_update_add(x, y, {1, 1}, {3, 3}, {1, 1});
+  expected = reshape(
+      array(
+          {0.0f,
+           0.0f,
+           0.0f,
+           0.0f,
+           0.0f,
+           1.0f,
+           1.0f,
+           0.0f,
+           0.0f,
+           1.0f,
+           1.0f,
+           0.0f,
+           0.0f,
+           0.0f,
+           0.0f,
+           0.0f},
+          {4, 4}),
+      {4, 4});
+  CHECK(array_equal(out, expected).item<bool>());
+
+  // Overlapping 2D slice update add
+  x = zeros({4, 4}, float32);
+  y = ones({2, 2}, float32);
+  out = slice_update_add(x, y, {0, 0}, {2, 2}, {1, 1});
+  out = slice_update_add(out, y, {1, 1}, {3, 3}, {1, 1});
+  expected = reshape(
+      array(
+          {1.0f,
+           1.0f,
+           0.0f,
+           0.0f,
+           1.0f,
+           2.0f,
+           1.0f,
+           0.0f,
+           0.0f,
+           1.0f,
+           1.0f,
+           0.0f,
+           0.0f,
+           0.0f,
+           0.0f,
+           0.0f},
+          {4, 4}),
+      {4, 4});
+  CHECK(array_equal(out, expected).item<bool>());
+
+  // Slice update add with different dtypes
+  x = zeros({4}, int32);
+  y = ones({2}, int32);
+  out = slice_update_add(x, y, {1}, {3}, {1});
+  expected = array({0, 1, 1, 0});
+  CHECK(array_equal(out, expected).item<bool>());
+
+  // Empty slice update add
+  x = arange(4, float32);
+  y = array({});
+  out = slice_update_add(x, y, {0}, {0}, {1});
+  CHECK(array_equal(out, x).item<bool>());
+
+  // Full array slice update add
+  x = ones({4}, float32);
+  y = full({4}, 2.0f, float32);
+  out = slice_update_add(x, y, {0}, {4}, {1});
+  expected = array({3.0f, 3.0f, 3.0f, 3.0f});
+  CHECK(array_equal(out, expected).item<bool>());
+}
+
+TEST_CASE("test dynamic slice") {
+  auto src = reshape(arange(6), {2, 3});
+  CHECK_THROWS(slice(src, array({1, 0, 0}), {0, 0, 0}, {1, 1}));
+  CHECK_THROWS(slice(src, array({1, 0}), {0}, {1, 1}));
+  CHECK_THROWS(slice(src, array({1}), {3}, {1, 1}));
+  CHECK_THROWS(slice(src, array({1, 0}), {0, 0}, {1, 1}));
+
+  CHECK_THROWS(slice(src, array({1}), {0}, {2, 4}));
+  CHECK_THROWS(slice(src, array({1.0f}, float32), {0}, {1, 1}));
+
+  auto out = slice(src, array({1}), {0}, {1, 2});
+  auto expected = array({3, 4}, {1, 2});
+  CHECK(array_equal(out, expected).item<bool>());
+
+  out = slice(src, array({1, 1}), {0, 1}, {1, 2});
+  expected = array({4, 5}, {1, 2});
+  CHECK(array_equal(out, expected).item<bool>());
+}
+
+TEST_CASE("test dynamic slice update") {
+  auto src = zeros({2, 3}, int32);
+  auto upd = ones({1, 2}, int32);
+  CHECK_THROWS(slice_update(src, upd, array({1, 0, 0}), {0, 0, 0}));
+  CHECK_THROWS(slice_update(src, upd, array({1, 0}), {0}));
+  CHECK_THROWS(slice_update(src, upd, array({1}), {3}));
+  CHECK_THROWS(slice_update(src, upd, array({1, 0}), {0, 0}));
+
+  upd = ones({4}, int32);
+  CHECK_THROWS(slice_update(src, upd, array({1}), {0}));
+  upd = ones({1, 4}, int32);
+  CHECK_THROWS(slice_update(src, upd, array({1}), {0}));
+  CHECK_THROWS(slice_update(src, upd, array({1.0f}, float32), {0}));
+
+  upd = ones({1, 2}, int32);
+  auto out = slice_update(src, upd, array({1}), {0});
+  auto expected = reshape(array({0, 0, 0, 1, 1, 0}), {2, 3});
+  CHECK(array_equal(out, expected).item<bool>());
+
+  upd = ones({1, 2}, int32);
+  out = slice_update(src, upd, array({1, 1}), {0, 1});
+  expected = reshape(array({0, 0, 0, 0, 1, 1}), {2, 3});
+  CHECK(array_equal(out, expected).item<bool>());
+}
+
 TEST_CASE("test split") {
   array x = array(1);
   CHECK_THROWS(split(x, 0));
+
+  // Regression: non-scalar split with num_splits <= 0
+  CHECK_THROWS(split(array({0, 1, 2, 3, 4, 5}), 0));
+  CHECK_THROWS(split(array({0, 1, 2, 3, 4, 5}), -1));
 
   x = array({3});
   CHECK_EQ(split(x, 1)[0].item<int>(), 3);
@@ -240,7 +548,7 @@ TEST_CASE("test split") {
   out = split(x, 3, -1);
   CHECK_EQ(out.size(), 3);
   for (auto i = 0; i < 3; ++i) {
-    CHECK_EQ(out[i].shape(), std::vector<int>{1});
+    CHECK_EQ(out[i].shape(), Shape{1});
     CHECK_EQ(out[i].dtype(), int32);
     CHECK_EQ(out[i].item<int>(), i);
   }
@@ -257,47 +565,87 @@ TEST_CASE("test split") {
   x = zeros({8, 12});
   out = split(x, 2);
   CHECK_EQ(out.size(), 2);
-  CHECK_EQ(out[0].shape(), std::vector<int>{4, 12});
-  CHECK_EQ(out[1].shape(), std::vector<int>{4, 12});
+  CHECK_EQ(out[0].shape(), Shape{4, 12});
+  CHECK_EQ(out[1].shape(), Shape{4, 12});
   out = split(x, 3, 1);
   CHECK_EQ(out.size(), 3);
-  CHECK_EQ(out[0].shape(), std::vector<int>{8, 4});
-  CHECK_EQ(out[1].shape(), std::vector<int>{8, 4});
-  CHECK_EQ(out[2].shape(), std::vector<int>{8, 4});
+  CHECK_EQ(out[0].shape(), Shape{8, 4});
+  CHECK_EQ(out[1].shape(), Shape{8, 4});
+  CHECK_EQ(out[2].shape(), Shape{8, 4});
 
-  out = split(x, std::vector<int>{});
+  out = split(x, Shape{});
   CHECK_EQ(out.size(), 1);
   CHECK_EQ(out[0].shape(), x.shape());
 
   out = split(x, {3, 7});
   CHECK_EQ(out.size(), 3);
-  CHECK_EQ(out[0].shape(), std::vector<int>{3, 12});
-  CHECK_EQ(out[1].shape(), std::vector<int>{4, 12});
-  CHECK_EQ(out[2].shape(), std::vector<int>{1, 12});
+  CHECK_EQ(out[0].shape(), Shape{3, 12});
+  CHECK_EQ(out[1].shape(), Shape{4, 12});
+  CHECK_EQ(out[2].shape(), Shape{1, 12});
 
-  out = split(x, std::vector<int>{20});
+  out = split(x, Shape{20});
   CHECK_EQ(out.size(), 2);
-  CHECK_EQ(out[0].shape(), std::vector<int>{8, 12});
-  CHECK_EQ(out[1].shape(), std::vector<int>{0, 12});
+  CHECK_EQ(out[0].shape(), Shape{8, 12});
+  CHECK_EQ(out[1].shape(), Shape{0, 12});
 
   // Negative indices
-  out = split(x, std::vector<int>{-5});
-  CHECK_EQ(out[0].shape(), std::vector<int>{3, 12});
-  CHECK_EQ(out[1].shape(), std::vector<int>{5, 12});
+  out = split(x, Shape{-5});
+  CHECK_EQ(out[0].shape(), Shape{3, 12});
+  CHECK_EQ(out[1].shape(), Shape{5, 12});
 
   // Different axis
-  out = split(x, std::vector<int>{2, 8}, 1);
-  CHECK_EQ(out[0].shape(), std::vector<int>{8, 2});
-  CHECK_EQ(out[1].shape(), std::vector<int>{8, 6});
-  CHECK_EQ(out[2].shape(), std::vector<int>{8, 4});
+  out = split(x, {2, 8}, 1);
+  CHECK_EQ(out[0].shape(), Shape{8, 2});
+  CHECK_EQ(out[1].shape(), Shape{8, 6});
+  CHECK_EQ(out[2].shape(), Shape{8, 4});
 
   // Out of order indices
   x = arange(5);
-  out = split(x, std::vector<int>{2, 1, 2});
+  out = split(x, {2, 1, 2});
   CHECK(array_equal(out[0], array({0, 1})).item<bool>());
   CHECK(array_equal(out[1], array({})).item<bool>());
   CHECK(array_equal(out[2], array({1})).item<bool>());
   CHECK(array_equal(out[3], array({2, 3, 4})).item<bool>());
+}
+
+TEST_CASE("test flip") {
+  array x = array({1, 2, 3, 4});
+  CHECK(array_equal(flip(x), array({4, 3, 2, 1})).item<bool>());
+
+  x = array({0, 1, 2, 3, 4, 5}, {2, 3});
+  CHECK(
+      array_equal(flip(x, 0), array({3, 4, 5, 0, 1, 2}, {2, 3})).item<bool>());
+  CHECK(
+      array_equal(flip(x, 1), array({2, 1, 0, 5, 4, 3}, {2, 3})).item<bool>());
+  CHECK(
+      array_equal(flip(x, -1), array({2, 1, 0, 5, 4, 3}, {2, 3})).item<bool>());
+  // No axes -> flip all.
+  CHECK(array_equal(flip(x), array({5, 4, 3, 2, 1, 0}, {2, 3})).item<bool>());
+  CHECK(array_equal(
+            flip(x, std::vector<int>{0, 1}), array({5, 4, 3, 2, 1, 0}, {2, 3}))
+            .item<bool>());
+
+  CHECK_THROWS(flip(x, 2));
+}
+
+TEST_CASE("test unstack") {
+  array x = array({0, 1, 2, 3, 4, 5}, {3, 2});
+  auto out = unstack(x);
+  CHECK_EQ(out.size(), 3);
+  CHECK(array_equal(out[0], array({0, 1})).item<bool>());
+  CHECK(array_equal(out[1], array({2, 3})).item<bool>());
+  CHECK(array_equal(out[2], array({4, 5})).item<bool>());
+  CHECK_EQ(out[0].shape(), Shape{2});
+
+  out = unstack(x, 1);
+  CHECK_EQ(out.size(), 2);
+  CHECK(array_equal(out[0], array({0, 2, 4})).item<bool>());
+  CHECK(array_equal(out[1], array({1, 3, 5})).item<bool>());
+
+  // stack is the inverse of unstack.
+  CHECK(array_equal(stack(unstack(x, 1), 1), x).item<bool>());
+
+  CHECK_THROWS(unstack(x, 2));
 }
 
 TEST_CASE("test swap and move axes") {
@@ -307,18 +655,18 @@ TEST_CASE("test swap and move axes") {
 
   a = zeros({2});
   CHECK_THROWS(swapaxes(a, 0, 1));
-  CHECK_EQ(swapaxes(a, 0, 0).shape(), std::vector<int>{2});
-  CHECK_EQ(swapaxes(a, -1, -1).shape(), std::vector<int>{2});
+  CHECK_EQ(swapaxes(a, 0, 0).shape(), Shape{2});
+  CHECK_EQ(swapaxes(a, -1, -1).shape(), Shape{2});
 
   a = zeros({2, 3, 4});
   CHECK_THROWS(swapaxes(a, 0, -4));
   CHECK_THROWS(swapaxes(a, 0, 3));
   CHECK_THROWS(swapaxes(a, 3, 0));
   CHECK_THROWS(swapaxes(a, -4, 0));
-  CHECK_EQ(swapaxes(a, 0, 2).shape(), std::vector<int>{4, 3, 2});
-  CHECK_EQ(swapaxes(a, 0, 1).shape(), std::vector<int>{3, 2, 4});
-  CHECK_EQ(swapaxes(a, 0, -1).shape(), std::vector<int>{4, 3, 2});
-  CHECK_EQ(swapaxes(a, -2, 2).shape(), std::vector<int>{2, 4, 3});
+  CHECK_EQ(swapaxes(a, 0, 2).shape(), Shape{4, 3, 2});
+  CHECK_EQ(swapaxes(a, 0, 1).shape(), Shape{3, 2, 4});
+  CHECK_EQ(swapaxes(a, 0, -1).shape(), Shape{4, 3, 2});
+  CHECK_EQ(swapaxes(a, -2, 2).shape(), Shape{2, 4, 3});
 
   // Test moveaxis
   a = array(0.0);
@@ -326,36 +674,36 @@ TEST_CASE("test swap and move axes") {
 
   a = zeros({2});
   CHECK_THROWS(moveaxis(a, 0, 1));
-  CHECK_EQ(moveaxis(a, 0, 0).shape(), std::vector<int>{2});
-  CHECK_EQ(moveaxis(a, -1, -1).shape(), std::vector<int>{2});
+  CHECK_EQ(moveaxis(a, 0, 0).shape(), Shape{2});
+  CHECK_EQ(moveaxis(a, -1, -1).shape(), Shape{2});
 
   a = zeros({2, 3, 4});
   CHECK_THROWS(moveaxis(a, 0, -4));
   CHECK_THROWS(moveaxis(a, 0, 3));
   CHECK_THROWS(moveaxis(a, 3, 0));
   CHECK_THROWS(moveaxis(a, -4, 0));
-  CHECK_EQ(moveaxis(a, 0, 2).shape(), std::vector<int>{3, 4, 2});
-  CHECK_EQ(moveaxis(a, 0, 1).shape(), std::vector<int>{3, 2, 4});
-  CHECK_EQ(moveaxis(a, 0, -1).shape(), std::vector<int>{3, 4, 2});
-  CHECK_EQ(moveaxis(a, -2, 2).shape(), std::vector<int>{2, 4, 3});
+  CHECK_EQ(moveaxis(a, 0, 2).shape(), Shape{3, 4, 2});
+  CHECK_EQ(moveaxis(a, 0, 1).shape(), Shape{3, 2, 4});
+  CHECK_EQ(moveaxis(a, 0, -1).shape(), Shape{3, 4, 2});
+  CHECK_EQ(moveaxis(a, -2, 2).shape(), Shape{2, 4, 3});
 }
 
 TEST_CASE("test transpose") {
   array x(1);
   auto y = transpose(x);
-  CHECK_EQ(y.shape(), std::vector<int>{});
+  CHECK_EQ(y.shape(), Shape{});
   CHECK_EQ(y.item<int>(), 1);
   CHECK_THROWS_AS(transpose(x, {0}), std::invalid_argument);
   CHECK_THROWS_AS(transpose(x, {1}), std::invalid_argument);
 
   x = array({1}, {1});
   y = transpose(x);
-  CHECK_EQ(y.shape(), std::vector<int>{1});
+  CHECK_EQ(y.shape(), Shape{1});
   CHECK_EQ(y.item<int>(), 1);
 
   // Negative indices
   y = transpose(x, {-1});
-  CHECK_EQ(y.shape(), std::vector<int>{1});
+  CHECK_EQ(y.shape(), Shape{1});
   CHECK_EQ(y.item<int>(), 1);
 
   CHECK_THROWS_AS(transpose(x, {1}), std::invalid_argument);
@@ -364,24 +712,24 @@ TEST_CASE("test transpose") {
   // Works with empty array
   x = array({});
   y = transpose(x);
-  CHECK_EQ(y.shape(), std::vector<int>{0});
+  CHECK_EQ(y.shape(), Shape{0});
   y.eval();
   CHECK_EQ(y.size(), 0);
 
   x = array({1, 2, 3, 4, 5, 6}, {2, 3});
   y = transpose(x);
-  CHECK_EQ(y.shape(), std::vector<int>{3, 2});
+  CHECK_EQ(y.shape(), Shape{3, 2});
   y = transpose(x, {-1, 0});
-  CHECK_EQ(y.shape(), std::vector<int>{3, 2});
+  CHECK_EQ(y.shape(), Shape{3, 2});
   y = transpose(x, {-1, -2});
-  CHECK_EQ(y.shape(), std::vector<int>{3, 2});
+  CHECK_EQ(y.shape(), Shape{3, 2});
   y.eval();
   CHECK(array_equal(y, array({1, 4, 2, 5, 3, 6}, {3, 2})).item<bool>());
   y = transpose(x, {0, 1});
-  CHECK_EQ(y.shape(), std::vector<int>{2, 3});
+  CHECK_EQ(y.shape(), Shape{2, 3});
   CHECK(array_equal(y, x).item<bool>());
   y = transpose(x, {0, -1});
-  CHECK_EQ(y.shape(), std::vector<int>{2, 3});
+  CHECK_EQ(y.shape(), Shape{2, 3});
   CHECK(array_equal(y, x).item<bool>());
 
   CHECK_THROWS_AS(transpose(x, {}), std::invalid_argument);
@@ -392,19 +740,19 @@ TEST_CASE("test transpose") {
 
   x = array({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, {2, 3, 2});
   y = transpose(x);
-  CHECK_EQ(y.shape(), std::vector<int>{2, 3, 2});
+  CHECK_EQ(y.shape(), Shape{2, 3, 2});
   auto expected = array({1, 7, 3, 9, 5, 11, 2, 8, 4, 10, 6, 12}, {2, 3, 2});
   CHECK(array_equal(y, expected).item<bool>());
 
   y = transpose(x, {0, 1, 2});
-  CHECK_EQ(y.shape(), std::vector<int>{2, 3, 2});
+  CHECK_EQ(y.shape(), Shape{2, 3, 2});
   CHECK(array_equal(y, x).item<bool>());
   y = transpose(x, {1, 0, 2});
-  CHECK_EQ(y.shape(), std::vector<int>{3, 2, 2});
+  CHECK_EQ(y.shape(), Shape{3, 2, 2});
   expected = array({1, 2, 7, 8, 3, 4, 9, 10, 5, 6, 11, 12}, {3, 2, 2});
   CHECK(array_equal(y, expected).item<bool>());
   y = transpose(x, {0, 2, 1});
-  CHECK_EQ(y.shape(), std::vector<int>{2, 2, 3});
+  CHECK_EQ(y.shape(), Shape{2, 2, 3});
   expected = array({1, 3, 5, 2, 4, 6, 7, 9, 11, 8, 10, 12}, {2, 2, 3});
   CHECK(array_equal(y, expected).item<bool>());
 
@@ -429,7 +777,7 @@ TEST_CASE("test comparison ops") {
     array y({});
     auto z = x == y;
     CHECK_EQ(z.dtype(), bool_);
-    CHECK_EQ(z.shape(), std::vector<int>{0});
+    CHECK_EQ(z.shape(), Shape{0});
   }
 
   // Basic cases
@@ -518,7 +866,7 @@ TEST_CASE("test comparison ops") {
     auto y = zeros({2, 1});
     auto z = equal(x, y);
     CHECK_EQ(z.dtype(), bool_);
-    CHECK_EQ(z.shape(), std::vector<int>{2, 2});
+    CHECK_EQ(z.shape(), Shape{2, 2});
     auto expected = array({true, true, true, true}, {2, 2});
     CHECK(array_equal(z, expected).item<bool>());
 
@@ -526,7 +874,7 @@ TEST_CASE("test comparison ops") {
     y = array({1.0, 2.0}, {2, 1});
     z = equal(x, y);
     CHECK_EQ(z.dtype(), bool_);
-    CHECK_EQ(z.shape(), std::vector<int>{2, 2});
+    CHECK_EQ(z.shape(), Shape{2, 2});
     expected = array({true, false, false, true}, {2, 2});
     CHECK(array_equal(z, expected).item<bool>());
 
@@ -590,7 +938,7 @@ TEST_CASE("test is inf") {
   CHECK_FALSE(any(isinf(z)).item<bool>());
 
   array w = array({1.0f, inf, 2.0f});
-  CHECK(array_equal({false, true, false}, isinf(w)).item<bool>());
+  CHECK(array_equal(array({false, true, false}), isinf(w)).item<bool>());
 
   array a(1.0f, bfloat16);
   CHECK_FALSE(isinf(a).item<bool>());
@@ -656,15 +1004,15 @@ TEST_CASE("test reduction ops") {
     CHECK_THROWS_AS(sum(x, 0), std::out_of_range);
     CHECK_THROWS_AS(sum(x, -1), std::out_of_range);
     out = sum(x, std::vector<int>{});
-    CHECK_EQ(out.shape(), std::vector<int>{});
+    CHECK_EQ(out.shape(), Shape{});
     CHECK_EQ(out.size(), 1);
 
     x = array({});
     out = sum(x);
-    CHECK_EQ(out.shape(), std::vector<int>{});
+    CHECK_EQ(out.shape(), Shape{});
     CHECK_EQ(out.size(), 1);
     out = sum(x, true);
-    CHECK_EQ(out.shape(), std::vector<int>{1});
+    CHECK_EQ(out.shape(), Shape{1});
     out = sum(x, std::vector<int>{});
     CHECK_EQ(out.shape(), x.shape());
 
@@ -675,7 +1023,7 @@ TEST_CASE("test reduction ops") {
     CHECK_EQ(out.ndim(), 0);
     out = sum(x, -1, true);
     CHECK_EQ(out.ndim(), 1);
-    CHECK_EQ(out.shape(), std::vector<int>{1});
+    CHECK_EQ(out.shape(), Shape{1});
 
     CHECK_THROWS_AS(sum(x, 1), std::out_of_range);
     CHECK_THROWS_AS(sum(x, -2), std::out_of_range);
@@ -684,21 +1032,21 @@ TEST_CASE("test reduction ops") {
 
     x = zeros({2, 3, 4});
     out = sum(x, {0, 2});
-    CHECK_EQ(out.shape(), std::vector<int>{3});
+    CHECK_EQ(out.shape(), Shape{3});
     out = sum(x, std::vector<int>{});
     CHECK_EQ(out.shape(), x.shape());
 
     out = sum(x, {0, -1});
-    CHECK_EQ(out.shape(), std::vector<int>{3});
+    CHECK_EQ(out.shape(), Shape{3});
 
     out = sum(x, {0, -1}, true);
-    CHECK_EQ(out.shape(), std::vector<int>{1, 3, 1});
+    CHECK_EQ(out.shape(), Shape{1, 3, 1});
 
     out = sum(x, true);
-    CHECK_EQ(out.shape(), std::vector<int>{1, 1, 1});
+    CHECK_EQ(out.shape(), Shape{1, 1, 1});
 
     out = sum(x);
-    CHECK_EQ(out.shape(), std::vector<int>{});
+    CHECK_EQ(out.shape(), Shape{});
 
     CHECK_THROWS_AS(sum(x, 3), std::out_of_range);
     CHECK_THROWS_AS(sum(x, -4), std::out_of_range);
@@ -741,6 +1089,23 @@ TEST_CASE("test reduction ops") {
     CHECK(array_equal(sum(x, 1), array({3.0f, 6.0f}, {2})).item<bool>());
   }
 
+  // Test unsigned sum
+  {
+    const int num_elems = 1000;
+
+    auto x = astype(full({num_elems}, 255), uint8);
+    CHECK_EQ(sum(x, Device::cpu).item<uint32_t>(), 255 * num_elems);
+
+    x = astype(full({num_elems}, 65535), uint16);
+    CHECK_EQ(sum(x, Device::cpu).item<uint32_t>(), 65535 * num_elems);
+
+    x = full({3, 3, 3}, 10000, uint32);
+    CHECK_EQ(sum(x, Device::cpu).item<uint32_t>(), 270000);
+
+    x = full({3, 3, 3}, 10000, uint64);
+    CHECK_EQ(sum(x, Device::cpu).item<uint64_t>(), 270000);
+  }
+
   // Test prod
   {
     auto x = array({});
@@ -771,6 +1136,21 @@ TEST_CASE("test reduction ops") {
     x = array({true, true, true, false, true, false}, {2, 3});
     CHECK(array_equal(prod(x, 0), array({false, true, false})).item<bool>());
     CHECK(array_equal(prod(x, 1), array({true, false})).item<bool>());
+  }
+
+  // Test unsigned prod
+  {
+    auto x = array({255, 255}, {2}, uint8);
+    CHECK_EQ(prod(x, Device::cpu).item<uint32_t>(), 65025);
+
+    x = array({65535, 2}, {2}, uint16);
+    CHECK_EQ(prod(x, Device::cpu).item<uint32_t>(), 131070);
+
+    x = array({100000, 2}, {2}, uint32);
+    CHECK_EQ(prod(x, Device::cpu).item<uint32_t>(), 200000);
+
+    x = array({100000, 2}, {2}, uint64);
+    CHECK_EQ(prod(x, Device::cpu).item<uint64_t>(), 200000);
   }
 
   // Test all
@@ -850,6 +1230,10 @@ TEST_CASE("test reduction ops") {
     x = array({true, true, true, false, true, false}, {2, 3});
     CHECK(array_equal(min(x, 1), array({true, false})).item<bool>());
     CHECK(array_equal(min(x, 0), array({false, true, false})).item<bool>());
+
+    x = array({1.0f, NAN, 3.0f, 4.0f, 5.0f, 6.0f}, {2, 3});
+    CHECK(array_equal(max(x, 0), array({4.0f, NAN, 6.0f}), true).item<bool>());
+    CHECK(array_equal(max(x, 1), array({NAN, 6.0f}), true).item<bool>());
   }
 
   // Test logsumexp
@@ -860,6 +1244,9 @@ TEST_CASE("test reduction ops") {
     constexpr float inf = std::numeric_limits<float>::infinity();
 
     x = array({-inf, -inf});
+    CHECK_EQ(logsumexp(x).item<float>(), -inf);
+
+    x = repeat(array(-inf), 5000);
     CHECK_EQ(logsumexp(x).item<float>(), -inf);
 
     x = array({0.0f, -inf});
@@ -873,7 +1260,7 @@ TEST_CASE("test reduction ops") {
     std::vector<float> nums = {0.0f, 1.0f, 2.0f, 3.0f};
     x = array(nums.data(), {2, 2});
     auto y = logsumexp(x, {0, 1}, true);
-    CHECK_EQ(y.shape(), std::vector<int>{1, 1});
+    CHECK_EQ(y.shape(), Shape{1, 1});
     auto result = std::log(
         std::exp(nums[0]) + std::exp(nums[1]) + std::exp(nums[2]) +
         std::exp(nums[3]));
@@ -891,12 +1278,50 @@ TEST_CASE("test reduction ops") {
 
   // Test softmax
   {
-    auto x = array({0., 0., 0., 0.});
-    auto y = array({0.25, 0.25, 0.25, 0.25});
-    CHECK(array_equal(y, softmax(x)).item<bool>());
-    CHECK(array_equal(y, softmax(x, -1)).item<bool>());
-    CHECK(array_equal(y, softmax(x, std::vector<int>{-1})).item<bool>());
-    CHECK(array_equal(y, softmax(x, std::vector<int>{0})).item<bool>());
+    for (auto t : {float16, bfloat16, float32}) {
+      const auto rtol = t == float32 ? 1e-5 : 1e-2;
+      auto x = array({}, t);
+      CHECK(array_equal(x, softmax(x)).item<bool>());
+
+      // all zeros
+      x = array({0., 0., 0., 0.}, t);
+      auto y = array({0.25, 0.25, 0.25, 0.25}, t);
+      CHECK(array_equal(y, softmax(x)).item<bool>());
+      CHECK(array_equal(y, softmax(x, -1)).item<bool>());
+      CHECK(array_equal(y, softmax(x, std::vector<int>{-1})).item<bool>());
+      CHECK(array_equal(y, softmax(x, std::vector<int>{0})).item<bool>());
+
+      auto ones = array(1.0f, t);
+      CHECK(array_equal(ones, sum(softmax(x))).item<bool>());
+
+      // all ones
+      x = array({1., 1., 1., 1.}, t);
+      CHECK(array_equal(y, softmax(x)).item<bool>());
+      CHECK(array_equal(ones, sum(softmax(x))).item<bool>());
+
+      // negative values
+      x = array({-1., -2., -3., -4.}, t);
+      y = array({0.643914, 0.236883, 0.0871443, 0.0320586}, t);
+      CHECK(allclose(y, softmax(x), rtol).item<bool>());
+      CHECK(allclose(ones, sum(softmax(x)), rtol).item<bool>());
+
+      // positive and negative values
+      x = array({1., 0., -1., 0.}, t);
+      y = array({0.534447, 0.196612, 0.0723295, 0.196612}, t);
+      CHECK(allclose(y, softmax(x), rtol).item<bool>());
+      CHECK(allclose(ones, sum(softmax(x)), rtol).item<bool>());
+
+      // large positive values
+      x = array({1000., 1000., 1000.}, t);
+      y = array({0.333333, 0.333333, 0.333333}, t);
+      CHECK(allclose(y, softmax(x)).item<bool>());
+      CHECK(array_equal(ones, sum(softmax(x))).item<bool>());
+
+      // large negative values
+      x = negative(x);
+      CHECK(allclose(y, softmax(x)).item<bool>());
+      CHECK(array_equal(ones, sum(softmax(x))).item<bool>());
+    }
   }
 }
 
@@ -1029,6 +1454,47 @@ TEST_CASE("test arithmetic unary ops") {
     // bool
     x = array({false, true});
     CHECK(array_equal(sign(x), x).item<bool>());
+
+    // uint64
+    array x_uint64(
+        {uint64_t(0xa11cc311cb6acd70),
+         uint64_t(0x7a375ac3ebb533f3),
+         uint64_t(0x734969adf9d7190c),
+         uint64_t(0xb400515a4f673424)});
+    array expected(
+        {uint64_t(0x0000000000000001),
+         uint64_t(0x0000000000000001),
+         uint64_t(0x0000000000000001),
+         uint64_t(0x0000000000000001)});
+    CHECK(array_equal(sign(x_uint64), expected).item<bool>());
+
+    x_uint64 = array(
+        {uint64_t(0xa11cc311cb6acd70),
+         uint64_t(0x7a375ac3ebb533f3),
+         uint64_t(0x734969adf9d7190c)});
+    expected = array(
+        {uint64_t(0x0000000000000001),
+         uint64_t(0x0000000000000001),
+         uint64_t(0x0000000000000001)});
+    CHECK(array_equal(sign(x_uint64), expected).item<bool>());
+
+    x_uint64 =
+        array({uint64_t(0xa11cc311cb6acd70), uint64_t(0x7a375ac3ebb533f3)});
+    expected =
+        array({uint64_t(0x0000000000000001), uint64_t(0x0000000000000001)});
+    CHECK(array_equal(sign(x_uint64), expected).item<bool>());
+
+    x_uint64 = array({uint64_t(0xa11cc311cb6acd70)});
+    expected = array({uint64_t(0x0000000000000001)});
+    CHECK(array_equal(sign(x_uint64), expected).item<bool>());
+
+    x_uint64 = array({uint64_t(0xffffffffffffffff)});
+    expected = array({uint64_t(0x0000000000000001)});
+    CHECK(array_equal(sign(x_uint64), expected).item<bool>());
+
+    x_uint64 = array({uint64_t(0x0000000000000001)});
+    expected = array({uint64_t(0x0000000000000001)});
+    CHECK(array_equal(sign(x_uint64), expected).item<bool>());
   }
 
   constexpr float neginf = -std::numeric_limits<float>::infinity();
@@ -1076,7 +1542,7 @@ TEST_CASE("test arithmetic unary ops") {
     CHECK(array_equal(exp(array({})), array({})).item<bool>());
 
     x = array(neginf);
-    CHECK_EQ(exp(x).item<float>(), 0.0f);
+    CHECK_EQ(exp(x).item<float>(), doctest::Approx(0.0f));
 
     // Integer input type
     x = array(2);
@@ -1090,6 +1556,11 @@ TEST_CASE("test arithmetic unary ops") {
     x = split(array({0.0f, 1.0f, 2.0f, 3.0f}, {2, 2}), 2, 1)[0];
     auto expected = array({std::exp(0.0f), std::exp(2.0f)}, {2, 1});
     CHECK(allclose(exp(x), expected).item<bool>());
+
+    // Complex of -inf
+    constexpr float inf = std::numeric_limits<float>::infinity();
+    x = array(complex64_t{-inf, -inf});
+    CHECK_EQ(exp(x).item<complex64_t>(), complex64_t{0, 0});
   }
 
   // Test expm1
@@ -1443,7 +1914,7 @@ TEST_CASE("test arithmetic binary ops") {
   x = array({1.0, 2.0, 3.0}, {1, 3});
   y = array({1.0, 2.0, 3.0}, {1, 3});
   z = add(x, y);
-  CHECK_EQ(z.shape(), std::vector<int>{1, 3});
+  CHECK_EQ(z.shape(), Shape{1, 3});
   auto eq = array_equal(z, array({2.0, 4.0, 6.0}, {1, 3}));
   CHECK(eq.item<bool>());
 
@@ -1475,13 +1946,13 @@ TEST_CASE("test arithmetic binary ops") {
   x = array({1.0, 2.0}, {1, 2});
   y = array({1.0, 2.0}, {2, 1});
   z = add(x, y);
-  CHECK_EQ(z.shape(), std::vector<int>{2, 2});
+  CHECK_EQ(z.shape(), Shape{2, 2});
   eq = array_equal(z, array({2.0, 3.0, 3.0, 4.0}, {2, 2}));
   CHECK(eq.item<bool>());
 
   x = ones({3, 2, 1});
   z = x + 2.0;
-  CHECK_EQ(z.shape(), std::vector<int>{3, 2, 1});
+  CHECK_EQ(z.shape(), Shape{3, 2, 1});
   eq = array_equal(z, array({3.0, 3.0, 3.0, 3.0, 3.0, 3.0}, {3, 2, 1}));
   CHECK(eq.item<bool>());
 
@@ -1491,7 +1962,7 @@ TEST_CASE("test arithmetic binary ops") {
   z = x + y;
   z.eval();
   CHECK_EQ(z.size(), 0);
-  CHECK_EQ(z.shape(), std::vector<int>{0});
+  CHECK_EQ(z.shape(), Shape{0});
 
   // Check subtraction
   x = array({3, 2, 1});
@@ -1570,50 +2041,54 @@ TEST_CASE("test arithmetic binary ops") {
   x = array(-inf);
   y = array(inf);
   CHECK_EQ(logaddexp(x, y).item<float>(), inf);
+
+  x = array(complex64_t{1, 1});
+  y = array(complex64_t{-inf, -inf});
+  CHECK_EQ(logaddexp(x, y).item<complex64_t>(), complex64_t{1, 1});
 }
 
 TEST_CASE("test broadcast") {
   auto s = broadcast_shapes({1}, {1, 2});
-  CHECK_EQ(s, std::vector<int>{1, 2});
+  CHECK_EQ(s, Shape{1, 2});
 
   s = broadcast_shapes({1, 2}, {1});
-  CHECK_EQ(s, std::vector<int>{1, 2});
+  CHECK_EQ(s, Shape{1, 2});
 
   s = broadcast_shapes({2, 2}, {});
-  CHECK_EQ(s, std::vector<int>{2, 2});
+  CHECK_EQ(s, Shape{2, 2});
 
   s = broadcast_shapes({}, {1, 1});
-  CHECK_EQ(s, std::vector<int>{1, 1});
+  CHECK_EQ(s, Shape{1, 1});
 
   s = broadcast_shapes({1, 2, 1}, {2});
-  CHECK_EQ(s, std::vector<int>{1, 2, 2});
+  CHECK_EQ(s, Shape{1, 2, 2});
 
   s = broadcast_shapes({2}, {1, 2, 1});
-  CHECK_EQ(s, std::vector<int>{1, 2, 2});
+  CHECK_EQ(s, Shape{1, 2, 2});
 
   s = broadcast_shapes({2, 2, 2}, {1, 2, 1});
-  CHECK_EQ(s, std::vector<int>{2, 2, 2});
+  CHECK_EQ(s, Shape{2, 2, 2});
 
   s = broadcast_shapes({2, 2, 2, 1}, {1, 2, 1});
-  CHECK_EQ(s, std::vector<int>{2, 2, 2, 1});
+  CHECK_EQ(s, Shape{2, 2, 2, 1});
 
   s = broadcast_shapes({0}, {0, 0});
-  CHECK_EQ(s, std::vector<int>{0, 0});
+  CHECK_EQ(s, Shape{0, 0});
 
-  CHECK_EQ(broadcast_shapes({}, {0}), std::vector<int>{0});
+  CHECK_EQ(broadcast_shapes({}, {0}), Shape{0});
 
   s = broadcast_shapes({5, 0}, {0, 5, 0});
-  CHECK_EQ(s, std::vector<int>{0, 5, 0});
+  CHECK_EQ(s, Shape{0, 5, 0});
 
-  CHECK_EQ(broadcast_shapes({}, {0}), std::vector<int>{0});
-  CHECK_EQ(broadcast_shapes({1}, {0}), std::vector<int>{0});
-  CHECK_EQ(broadcast_shapes({1}, {0}), std::vector<int>{0});
-  CHECK_EQ(broadcast_shapes({1}, {0, 0}), std::vector<int>{0, 0});
-  CHECK_EQ(broadcast_shapes({1, 1}, {0}), std::vector<int>{1, 0});
-  CHECK_EQ(broadcast_shapes({1, 1}, {0, 0}), std::vector<int>{0, 0});
-  CHECK_EQ(broadcast_shapes({2, 1}, {1, 0}), std::vector<int>{2, 0});
-  CHECK_EQ(broadcast_shapes({2, 1}, {2, 0}), std::vector<int>{2, 0});
-  CHECK_EQ(broadcast_shapes({2, 1}, {1, 2, 0}), std::vector<int>{1, 2, 0});
+  CHECK_EQ(broadcast_shapes({}, {0}), Shape{0});
+  CHECK_EQ(broadcast_shapes({1}, {0}), Shape{0});
+  CHECK_EQ(broadcast_shapes({1}, {0}), Shape{0});
+  CHECK_EQ(broadcast_shapes({1}, {0, 0}), Shape{0, 0});
+  CHECK_EQ(broadcast_shapes({1, 1}, {0}), Shape{1, 0});
+  CHECK_EQ(broadcast_shapes({1, 1}, {0, 0}), Shape{0, 0});
+  CHECK_EQ(broadcast_shapes({2, 1}, {1, 0}), Shape{2, 0});
+  CHECK_EQ(broadcast_shapes({2, 1}, {2, 0}), Shape{2, 0});
+  CHECK_EQ(broadcast_shapes({2, 1}, {1, 2, 0}), Shape{1, 2, 0});
   CHECK_THROWS_AS(broadcast_shapes({2}, {0}), std::invalid_argument);
   CHECK_THROWS_AS(broadcast_shapes({2, 1}, {0, 0}), std::invalid_argument);
 
@@ -1627,19 +2102,19 @@ TEST_CASE("test broadcast") {
   CHECK_EQ(broadcast_to(x, {1, 1}).item<float>(), 2.3f);
 
   x = broadcast_to(x, {5, 1});
-  CHECK_EQ(x.shape(), std::vector<int>{5, 1});
+  CHECK_EQ(x.shape(), Shape{5, 1});
   x.eval();
-  CHECK_EQ(x.strides(), std::vector<size_t>{0, 0});
+  CHECK_EQ(x.strides(), Strides{0, 0});
 
   CHECK_THROWS_AS(broadcast_to(x, {1, 5}), std::invalid_argument);
   x = broadcast_to(x, {5, 5});
-  CHECK_EQ(x.shape(), std::vector<int>{5, 5});
+  CHECK_EQ(x.shape(), Shape{5, 5});
 
   x = zeros({2, 1, 2});
   x = broadcast_to(x, {4, 2, 1, 2});
-  CHECK_EQ(x.shape(), std::vector<int>{4, 2, 1, 2});
+  CHECK_EQ(x.shape(), Shape{4, 2, 1, 2});
   x.eval();
-  CHECK_EQ(x.strides(), std::vector<size_t>{0, 2, 0, 1});
+  CHECK_EQ(x.strides(), Strides{0, 2, 0, 1});
 
   // Broadcast on empty arrays works as expected
   x = array({});
@@ -1650,29 +2125,29 @@ TEST_CASE("test broadcast") {
   auto y = broadcast_to(x, {0});
   eval(y);
   CHECK_EQ(y.size(), 0);
-  CHECK_EQ(y.shape(), std::vector<int>{0});
+  CHECK_EQ(y.shape(), Shape{0});
 
   x = array({1, 2}, {2, 1});
   y = broadcast_to(x, {2, 0});
   eval(y);
   CHECK_EQ(y.size(), 0);
-  CHECK_EQ(y.shape(), std::vector<int>{2, 0});
+  CHECK_EQ(y.shape(), Shape{2, 0});
 
   // Check repeat application works
   x = zeros({2});
   x = broadcast_to(broadcast_to(x, {2, 2}), {2, 2});
-  CHECK_EQ(x.shape(), std::vector<int>{2, 2});
+  CHECK_EQ(x.shape(), Shape{2, 2});
   x.eval();
-  CHECK_EQ(x.strides(), std::vector<size_t>{0, 1});
+  CHECK_EQ(x.strides(), Strides{0, 1});
   x = broadcast_to(broadcast_to(x, {2, 2}), {2, 2, 2});
-  CHECK_EQ(x.shape(), std::vector<int>{2, 2, 2});
+  CHECK_EQ(x.shape(), Shape{2, 2, 2});
   x.eval();
-  CHECK_EQ(x.strides(), std::vector<size_t>{0, 0, 1});
+  CHECK_EQ(x.strides(), Strides{0, 0, 1});
 
   // Broadcast on transposed array works
   x = array({0, 1, 2, 3, 4, 5}, {2, 3});
   x = broadcast_to(transpose(x), {2, 3, 2});
-  CHECK_EQ(x.shape(), std::vector<int>{2, 3, 2});
+  CHECK_EQ(x.shape(), Shape{2, 3, 2});
   y = broadcast_to(array({0, 3, 1, 4, 2, 5}, {3, 2}), {2, 3, 2});
   CHECK(array_equal(x, y).item<bool>());
 
@@ -1684,6 +2159,9 @@ TEST_CASE("test broadcast") {
 }
 
 TEST_CASE("test gather") {
+  // Empty input, non-empty indices/slice
+  CHECK_THROWS(gather(array({}), array({1}), 0, {1}));
+
   // More indices than dimensions
   CHECK_THROWS(gather(array(0), array({1}), 0, {1}));
 
@@ -1716,16 +2194,16 @@ TEST_CASE("test gather") {
   auto x = arange(20);
   auto y = arange(10);
   auto out = gather(x, y, 0, {1});
-  CHECK_EQ(out.shape(), std::vector<int>{10, 1});
+  CHECK_EQ(out.shape(), Shape{10, 1});
   CHECK(array_equal(reshape(out, {-1}), y).item<bool>());
 
   out = gather(x, array({15}, uint32), 0, {1});
-  CHECK_EQ(out.shape(), std::vector<int>{1, 1});
+  CHECK_EQ(out.shape(), Shape{1, 1});
   CHECK_EQ(out.item<int32_t>(), 15);
 
   // No index gather works
   out = gather(x, {}, std::vector<int>{}, {10});
-  CHECK_EQ(out.shape(), std::vector<int>{10});
+  CHECK_EQ(out.shape(), Shape{10});
   CHECK(array_equal(out, arange(10)).item<bool>());
 
   // Basic test of correctness with 2D input
@@ -1733,13 +2211,13 @@ TEST_CASE("test gather") {
   x = reshape(x, {4, 32});
   y = array({0, 1}, uint32);
   out = gather(x, y, 0, {1, 32});
-  CHECK_EQ(out.shape(), std::vector<int>{2, 1, 32});
+  CHECK_EQ(out.shape(), Shape{2, 1, 32});
   CHECK(array_equal(reshape(out, {64}), arange(64)).item<bool>());
 
   x = reshape(x, {64, 2});
   y = array({0}, uint32);
   out = gather(x, y, 0, {64, 1});
-  CHECK_EQ(out.shape(), std::vector<int>{1, 64, 1});
+  CHECK_EQ(out.shape(), Shape{1, 64, 1});
   CHECK(array_equal(out, reshape(arange(0, 128, 2), {1, 64, 1})).item<bool>());
 
   // Basic test of correctness with 3D input
@@ -1747,7 +2225,7 @@ TEST_CASE("test gather") {
   x = reshape(x, {8, 4, 8});
   y = array({0}, uint32);
   out = gather(x, y, 0, {8, 1, 1});
-  CHECK_EQ(out.shape(), std::vector<int>{1, 8, 1, 1});
+  CHECK_EQ(out.shape(), Shape{1, 8, 1, 1});
   CHECK(
       array_equal(out, reshape(arange(0, 256, 32), {1, 8, 1, 1})).item<bool>());
 
@@ -1762,10 +2240,10 @@ TEST_CASE("test take") {
   // Empty takes
   auto empty = astype(array({}), int32);
   auto z = take(array({1}), empty);
-  CHECK_EQ(z.shape(), std::vector<int>{0});
+  CHECK_EQ(z.shape(), Shape{0});
   empty = reshape(empty, {1, 0, 1});
   z = take(array({1}), empty);
-  CHECK_EQ(z.shape(), std::vector<int>{1, 0, 1});
+  CHECK_EQ(z.shape(), Shape{1, 0, 1});
 
   CHECK_THROWS(take(array({}), array(1)));
 
@@ -1775,7 +2253,7 @@ TEST_CASE("test take") {
   // Take a single row
   auto x = reshape(arange(256), {8, 4, 8});
   z = take(x, array({0}, uint32), 0);
-  CHECK_EQ(z.shape(), std::vector<int>{1, 4, 8});
+  CHECK_EQ(z.shape(), Shape{1, 4, 8});
   z = reshape(z, {32});
   CHECK(array_equal(z, arange(32)).item<bool>());
 
@@ -1836,6 +2314,64 @@ TEST_CASE("test take") {
   CHECK(array_equal(out, zeros({1, 1, 1})).item<bool>());
   out = take(a, array({0, 1}), 1);
   CHECK(array_equal(out, zeros({1, 2, 1})).item<bool>());
+
+  // Indices have wrong shape
+  a = zeros({2, 3, 4});
+  CHECK_THROWS(take(a, zeros({1, 3, 4}), 1));
+  CHECK_THROWS(take(a, zeros({2, 3, 7}), 1));
+  CHECK_THROWS(take(a, zeros({2, 3, 2}), 0));
+}
+
+TEST_CASE("test gather contiguity") {
+  // Regression test for a CPU-backend bug where the gather "fast copy" path
+  // copied a multi-dimensional slice from a column-contiguous source as a raw
+  // (column-major) memory block, producing a transposed/wrong-stride result.
+  // The bug only showed up on the CPU backend and is exercised by:
+  //  - chained takes through a size-1 axis (which produce a col-contiguous
+  //    intermediate), and
+  //  - a direct take from a transposed (col-contiguous) source.
+
+  // Chained gather through size-1 axes (issue repro).
+  {
+    auto u = reshape(array({1.0f, 2.0f}), {2, 1, 1});
+    auto g = take(u, array({0, 1}, int32), 0, Device::cpu);
+    g = take(g, array({0, 0, 0}, int32), 1, Device::cpu);
+    g = take(g, array({0, 0, 0}, int32), 2, Device::cpu);
+    CHECK_EQ(g.shape(), Shape{2, 3, 3});
+    // Each batch must be uniform: batch 0 -> 1.0, batch 1 -> 2.0.
+    auto expected = array(
+        {1.0f,
+         1.0f,
+         1.0f,
+         1.0f,
+         1.0f,
+         1.0f,
+         1.0f,
+         1.0f,
+         1.0f,
+         2.0f,
+         2.0f,
+         2.0f,
+         2.0f,
+         2.0f,
+         2.0f,
+         2.0f,
+         2.0f,
+         2.0f},
+        {2, 3, 3});
+    CHECK(array_equal(g, expected).item<bool>());
+  }
+
+  // Direct take from a column-contiguous source with a multi-dim slice.
+  {
+    auto base = astype(reshape(arange(24), {4, 3, 2}), int32);
+    auto a = transpose(base, {2, 1, 0}); // [2, 3, 4], col-contiguous
+    auto t = take(a, array({0, 1}, int32), 2, Device::cpu);
+    CHECK_EQ(t.shape(), Shape{2, 3, 2});
+    auto expected =
+        array({0, 6, 2, 8, 4, 10, 1, 7, 3, 9, 5, 11}, {2, 3, 2}, int32);
+    CHECK(array_equal(t, expected).item<bool>());
+  }
 }
 
 TEST_CASE("test take along axis") {
@@ -1854,24 +2390,18 @@ TEST_CASE("test take along axis") {
   out = take_along_axis(a, array({1}), -1);
   CHECK_EQ(out.item<int>(), 1);
 
-  // Indices have wrong shape
-  a = zeros({2, 3, 4});
-  CHECK_THROWS(take(a, zeros({1, 3, 4}), 1));
-  CHECK_THROWS(take(a, zeros({2, 3, 7}), 1));
-  CHECK_THROWS(take(a, zeros({2, 3, 2}), 0));
-
   // Empty arrays
   a = reshape(array({}), {1, 0});
   CHECK_THROWS(take_along_axis(a, array({1}), 0));
 
   out = take_along_axis(a, reshape(array({1}), {1, 1}), 0);
   eval(out); // Make sure it runs
-  CHECK_EQ(out.shape(), std::vector<int>{1, 0});
+  CHECK_EQ(out.shape(), Shape{1, 0});
 
   auto inds = reshape(astype(array({}), int32), {1, 0});
   out = take_along_axis(a, inds, 0);
   eval(out); // Make sure it runs
-  CHECK_EQ(out.shape(), std::vector<int>{1, 0});
+  CHECK_EQ(out.shape(), Shape{1, 0});
 
   a = array({1, 2, 3, 4}, {2, 2});
   inds = array({0, 1}, {1, 2});
@@ -1908,6 +2438,48 @@ TEST_CASE("test take along axis") {
   out = take_along_axis(a, inds, 2);
   CHECK(array_equal(out, array({0, 1, 2, 2, 5, 4, 6, 7}, {2, 2, 2}))
             .item<bool>());
+}
+
+TEST_CASE("test put along axis") {
+  // No zero dim arrays
+  auto a = array(1);
+  auto v = array(1);
+  CHECK_THROWS(put_along_axis(a, array(0), v, 0));
+
+  // Index and array size mismatches
+  a = arange(5);
+  CHECK_THROWS(put_along_axis(a, array({1}), array({0}), 1));
+  CHECK_THROWS(put_along_axis(a, array({1}, {1, 1}), array({0}), 0));
+  CHECK_THROWS(put_along_axis(a, array(1), array(0), -1));
+
+  auto expected = array({0, 0, 2, 3, 4});
+  auto out = put_along_axis(a, array({1}), array({0}), 0);
+  CHECK(array_equal(out, expected).item<bool>());
+
+  // Empty arrays
+  a = reshape(array({}), {1, 0});
+  CHECK_THROWS(put_along_axis(a, array({1}), array({0}), 0));
+
+  auto inds = reshape(astype(array({}), int32), {1, 0});
+  out = take_along_axis(a, inds, 0);
+  eval(out); // Make sure it runs
+  CHECK_EQ(out.shape(), Shape{1, 0});
+
+  a = array({1, 2, 3, 4}, {2, 2});
+  inds = array({0, 1}, {1, 2});
+  out = put_along_axis(a, inds, array({0}), 0);
+  expected = array({0, 2, 3, 0}, {2, 2});
+  CHECK(array_equal(out, expected).item<bool>());
+
+  inds = array({0, 0, 1, 1}, {2, 2}, int32);
+  auto values = array({2, 3, 4, 5}, {2, 2}, int32);
+  out = put_along_axis(a, inds, values, 0);
+  CHECK(array_equal(out, array({2, 3, 4, 5}, {2, 2})).item<bool>());
+
+  inds = array({0, 1}, {2, 1});
+  out = put_along_axis(a, inds, array({0}), 1);
+  expected = array({0, 2, 3, 0}, {2, 2});
+  CHECK(array_equal(out, expected).item<bool>());
 }
 
 TEST_CASE("test scatter") {
@@ -2061,6 +2633,56 @@ TEST_CASE("test scatter") {
     auto expected = reshape(array({0, 0, 0, 0, 1, 2, 3, 4}), {2, 4});
     auto out = scatter(dst, idx, src, 0);
     CHECK(array_equal(out, expected).item<bool>());
+  }
+
+  // 1D indices with 2D update
+  {
+    auto dst = zeros({3, 4}, int32);
+    auto indices = {array({1}), array({2})};
+    auto axes = {0, 1};
+    auto updates = reshape(array({1, 2, 3, 4}, int32), {1, 2, 2});
+    auto out = scatter(dst, indices, updates, axes);
+    auto expected =
+        reshape(array({0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 3, 4}), {3, 4});
+    CHECK(array_equal(out, expected).item<bool>());
+  }
+}
+
+TEST_CASE("test masked_scatter") {
+  // Wrong mask dtype
+  CHECK_THROWS(masked_scatter(array({1, 2}), array({1, 2}), array({1, 2})));
+
+  // Mask must be broadcastable to self array
+  CHECK_THROWS(masked_scatter(
+      array({1, 2, 3, 4}, {2, 2}),
+      array({false, true, true, false}, {4, 1}),
+      array({1, 2})));
+
+  // 1D mask
+  {
+    auto self = zeros({4}, int32);
+    auto mask = array({true, true, false, true});
+    auto source = array({1, 2, 4});
+    auto out = masked_scatter(self, mask, source);
+    CHECK(array_equal(out, array({1, 2, 0, 4})).item<bool>());
+  }
+
+  // Empty mask
+  {
+    auto self = zeros({4}, int32);
+    auto mask = array({false, false, false, false});
+    auto source = array({1, 2, 4});
+    auto out = masked_scatter(self, mask, source);
+    CHECK(array_equal(out, self).item<bool>());
+  }
+
+  // Broadcasted mask
+  {
+    auto self = zeros({2, 2}, int32);
+    auto mask = array({true, false});
+    auto source = array({5, 6, 7, 8}, {2, 2});
+    auto out = masked_scatter(self, mask, source);
+    CHECK(array_equal(out, array({5, 6, 0, 0}, {2, 2})).item<bool>());
   }
 }
 
@@ -2225,11 +2847,41 @@ TEST_CASE("test as_strided op") {
   auto x = arange(10);
   auto y = as_strided(x, {3, 3}, {1, 1}, 0);
   auto expected = array({0, 1, 2, 1, 2, 3, 2, 3, 4}, {3, 3});
+  eval(y);
   CHECK(array_equal(y, expected).item<bool>());
+  CHECK_EQ(y.data_size(), 5);
+  CHECK_FALSE(y.flags().contiguous);
 
   y = as_strided(x, {3, 3}, {0, 3}, 0);
   expected = array({0, 3, 6, 0, 3, 6, 0, 3, 6}, {3, 3});
+  eval(y);
   CHECK(array_equal(y, expected).item<bool>());
+  CHECK_EQ(y.data_size(), 7);
+  CHECK_FALSE(y.flags().contiguous);
+
+  x = arange(24);
+  y = as_strided(x, {2, 3, 4}, {3, 1, 6}, 0);
+  expected = array(
+      {0, 6, 12, 18, 1, 7,  13, 19, 2, 8,  14, 20,
+       3, 9, 15, 21, 4, 10, 16, 22, 5, 11, 17, 23},
+      {2, 3, 4});
+  eval(y);
+  CHECK(array_equal(y, expected).item<bool>());
+  CHECK_EQ(y.data_size(), 24);
+  CHECK(y.flags().contiguous);
+  CHECK_FALSE(y.flags().row_contiguous);
+  CHECK_FALSE(y.flags().col_contiguous);
+
+  auto z = astype(y, float32);
+  CHECK(array_equal(z, astype(expected, float32)).item<bool>());
+
+  x = arange(10);
+  y = as_strided(x, {10}, {-1}, 9);
+  expected = array({9, 8, 7, 6, 5, 4, 3, 2, 1, 0}, {10});
+  eval(y);
+  CHECK(array_equal(y, expected).item<bool>());
+  CHECK_EQ(y.data_size(), 10);
+  CHECK_FALSE(y.flags().contiguous);
 
   x = reshape(x, {2, 5}); // 0 1 2 3 ...
   x = transpose(x, {1, 0}); // 0 5 1 6 2 7 ...
@@ -2301,9 +2953,74 @@ TEST_CASE("test scan op") {
 
 TEST_CASE("test pad") {
   auto x = zeros({1, 2, 3});
-  CHECK_EQ(pad(x, 1).shape(), std::vector<int>{3, 4, 5});
-  CHECK_EQ(pad(x, {0, 1}).shape(), std::vector<int>{2, 3, 4});
-  CHECK_EQ(pad(x, {{1, 1}, {1, 2}, {3, 1}}).shape(), std::vector<int>{3, 5, 7});
+  CHECK_EQ(pad(x, 1).shape(), Shape{3, 4, 5});
+  CHECK_EQ(pad(x, {0, 1}).shape(), Shape{2, 3, 4});
+  CHECK_EQ(pad(x, {{1, 1}, {1, 2}, {3, 1}}).shape(), Shape{3, 5, 7});
+
+  x = array({1.0f, 2.0f, 3.0f, 4.0f}, {2, 2});
+  auto padded_x = pad(x, 1);
+  auto expected = array(
+      {0.0f,
+       0.0f,
+       0.0f,
+       0.0f,
+       0.0f,
+       1.0f,
+       2.0f,
+       0.0f,
+       0.0f,
+       3.0f,
+       4.0f,
+       0.0f,
+       0.0f,
+       0.0f,
+       0.0f,
+       0.0f},
+      {4, 4});
+  CHECK(array_equal(padded_x, expected).item<bool>());
+
+  // reflect padding (mirror without repeating the edge value)
+  x = array({1.0f, 2.0f, 3.0f, 4.0f, 5.0f}, {5});
+  CHECK(array_equal(
+            pad(x, {{2, 2}}, array(0.0f), "reflect"),
+            array({3.0f, 2.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 4.0f, 3.0f}, {9}))
+            .item<bool>());
+  CHECK(array_equal(
+            pad(x, {{0, 3}}, array(0.0f), "reflect"),
+            array({1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 4.0f, 3.0f, 2.0f}, {8}))
+            .item<bool>());
+
+  // symmetric padding (mirror repeating the edge value)
+  CHECK(array_equal(
+            pad(x, {{2, 2}}, array(0.0f), "symmetric"),
+            array({2.0f, 1.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 5.0f, 4.0f}, {9}))
+            .item<bool>());
+  CHECK(array_equal(
+            pad(x, {{3, 0}}, array(0.0f), "symmetric"),
+            array({3.0f, 2.0f, 1.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f}, {8}))
+            .item<bool>());
+
+  // multi-reflect: pad larger than the axis repeats the reflection (numpy
+  // parity)
+  x = array({1.0f, 2.0f, 3.0f}, {3});
+  CHECK(array_equal(
+            pad(x, {{5, 5}}, array(0.0f), "reflect"),
+            array(
+                {2.0f,
+                 1.0f,
+                 2.0f,
+                 3.0f,
+                 2.0f,
+                 1.0f,
+                 2.0f,
+                 3.0f,
+                 2.0f,
+                 1.0f,
+                 2.0f,
+                 3.0f,
+                 2.0f},
+                {13}))
+            .item<bool>());
 }
 
 TEST_CASE("test power") {
@@ -2330,6 +3047,13 @@ TEST_CASE("test power") {
   auto out = (power(array(a), array(b))).item<complex64_t>();
   CHECK(abs(out.real() - expected.real()) < 1e-7);
   CHECK(abs(out.imag() - expected.imag()) < 1e-7);
+
+  a = complex64_t{-1.2, 0.1};
+  b = complex64_t{2.2, 0.0};
+  expected = std::pow(a, b);
+  out = (power(array(a), array(b))).item<complex64_t>();
+  CHECK(abs(out.real() - expected.real()) < 1e-6);
+  CHECK(abs(out.imag() - expected.imag()) < 1e-6);
 }
 
 TEST_CASE("test where") {
@@ -2413,20 +3137,20 @@ TEST_CASE("test where") {
 
 TEST_CASE("test stack") {
   auto x = array({});
-  CHECK_EQ(stack({x}, 0).shape(), std::vector<int>{1, 0});
-  CHECK_EQ(stack({x}, 1).shape(), std::vector<int>{0, 1});
+  CHECK_EQ(stack({x}, 0).shape(), Shape{1, 0});
+  CHECK_EQ(stack({x}, 1).shape(), Shape{0, 1});
 
   x = array({1, 2, 3}, {3});
-  CHECK_EQ(stack({x}, 0).shape(), std::vector<int>{1, 3});
-  CHECK_EQ(stack({x}, 1).shape(), std::vector<int>{3, 1});
+  CHECK_EQ(stack({x}, 0).shape(), Shape{1, 3});
+  CHECK_EQ(stack({x}, 1).shape(), Shape{3, 1});
 
   auto y = array({4, 5, 6}, {3});
   auto z = std::vector<array>{x, y};
-  CHECK_EQ(stack(z).shape(), std::vector<int>{2, 3});
-  CHECK_EQ(stack(z, 0).shape(), std::vector<int>{2, 3});
-  CHECK_EQ(stack(z, 1).shape(), std::vector<int>{3, 2});
-  CHECK_EQ(stack(z, -1).shape(), std::vector<int>{3, 2});
-  CHECK_EQ(stack(z, -2).shape(), std::vector<int>{2, 3});
+  CHECK_EQ(stack(z).shape(), Shape{2, 3});
+  CHECK_EQ(stack(z, 0).shape(), Shape{2, 3});
+  CHECK_EQ(stack(z, 1).shape(), Shape{3, 2});
+  CHECK_EQ(stack(z, -1).shape(), Shape{3, 2});
+  CHECK_EQ(stack(z, -2).shape(), Shape{2, 3});
 
   CHECK_THROWS_MESSAGE(stack({}, 0), "No arrays provided for stacking");
 
@@ -2440,22 +3164,53 @@ TEST_CASE("test stack") {
       stack({x, y}, 0), "All arrays must have the same shape and dtype");
 }
 
+TEST_CASE("test full_like") {
+  auto base_int = array({1, 2, 3}, {3}, int16);
+
+  auto from_array_with_dtype = full_like(base_int, array(7.5f), float16);
+  auto expected_float16 = array({7.5, 7.5, 7.5}, {3}, float16);
+  CHECK_EQ(from_array_with_dtype.dtype(), float16);
+  CHECK(array_equal(from_array_with_dtype, expected_float16).item<bool>());
+
+  auto from_array_default_dtype = full_like(base_int, array(4.0f));
+  auto expected_int16 = array({4, 4, 4}, {3}, int16);
+  CHECK_EQ(from_array_default_dtype.dtype(), int16);
+  CHECK(array_equal(from_array_default_dtype, expected_int16).item<bool>());
+
+  auto from_scalar_with_dtype = full_like(base_int, 3.25f, float32);
+  auto expected_float32 = array({3.25f, 3.25f, 3.25f}, {3}, float32);
+  CHECK_EQ(from_scalar_with_dtype.dtype(), float32);
+  CHECK(array_equal(from_scalar_with_dtype, expected_float32).item<bool>());
+
+  auto base_float = array({1.0f, 2.0f}, {2}, float32);
+  auto from_scalar_default_dtype = full_like(base_float, 2);
+  auto expected_base_float = array({2.0f, 2.0f}, {2}, float32);
+  CHECK_EQ(from_scalar_default_dtype.dtype(), float32);
+  CHECK(
+      array_equal(from_scalar_default_dtype, expected_base_float).item<bool>());
+}
+
 TEST_CASE("test eye") {
   auto eye_3 = eye(3);
-  CHECK_EQ(eye_3.shape(), std::vector<int>{3, 3});
+  CHECK_EQ(eye_3.shape(), Shape{3, 3});
   auto expected_eye_3 =
       array({1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f}, {3, 3});
   CHECK(array_equal(eye_3, expected_eye_3).item<bool>());
 
   auto eye_3x2 = eye(3, 2);
-  CHECK_EQ(eye_3x2.shape(), std::vector<int>{3, 2});
+  CHECK_EQ(eye_3x2.shape(), Shape{3, 2});
   auto expected_eye_3x2 = array({1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f}, {3, 2});
   CHECK(array_equal(eye_3x2, expected_eye_3x2).item<bool>());
+
+  auto eye_0x0 = eye(0, 0);
+  CHECK_EQ(eye_0x0.shape(), Shape{0, 0});
+  CHECK_EQ(eye_0x0.size(), 0);
+  CHECK_EQ(eye_0x0.dtype(), float32);
 }
 
 TEST_CASE("test tri") {
   auto _tri = tri(4, 4, 0, float32);
-  CHECK_EQ(_tri.shape(), std::vector<int>{4, 4});
+  CHECK_EQ(_tri.shape(), Shape{4, 4});
   auto expected_tri = array(
       {1.0f,
        0.0f,
@@ -2478,8 +3233,8 @@ TEST_CASE("test tri") {
 }
 
 TEST_CASE("test tril") {
-  auto _tril = tril(full(std::vector<int>{4, 4}, 2.0f, float32), 0);
-  CHECK_EQ(_tril.shape(), std::vector<int>{4, 4});
+  auto _tril = tril(full({4, 4}, 2.0f, float32), 0);
+  CHECK_EQ(_tril.shape(), Shape{4, 4});
   auto expected_tri = array(
       {2.0f,
        0.0f,
@@ -2502,8 +3257,8 @@ TEST_CASE("test tril") {
 }
 
 TEST_CASE("test triu") {
-  auto _triu = triu(full(std::vector<int>{4, 4}, 2.0f, float32), 0);
-  CHECK_EQ(_triu.shape(), std::vector<int>{4, 4});
+  auto _triu = triu(full({4, 4}, 2.0f, float32), 0);
+  CHECK_EQ(_triu.shape(), Shape{4, 4});
   auto expected_tri = array(
       {2.0f,
        2.0f,
@@ -2527,7 +3282,7 @@ TEST_CASE("test triu") {
 
 TEST_CASE("test identity") {
   auto id_4 = identity(4);
-  CHECK_EQ(id_4.shape(), std::vector<int>{4, 4});
+  CHECK_EQ(id_4.shape(), Shape{4, 4});
   auto expected_id_4 = array(
       {1.0f,
        0.0f,
@@ -2551,7 +3306,7 @@ TEST_CASE("test identity") {
 
 TEST_CASE("test eye with positive k offset") {
   auto eye_3_k1 = eye(3, 4, 1);
-  CHECK_EQ(eye_3_k1.shape(), std::vector<int>{3, 4});
+  CHECK_EQ(eye_3_k1.shape(), Shape{3, 4});
   auto expected_eye_3_k1 = array(
       {0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f},
       {3, 4});
@@ -2560,7 +3315,7 @@ TEST_CASE("test eye with positive k offset") {
 
 TEST_CASE("test eye with negative k offset") {
   auto eye_4_k_minus1 = eye(4, 3, -1);
-  CHECK_EQ(eye_4_k_minus1.shape(), std::vector<int>{4, 3});
+  CHECK_EQ(eye_4_k_minus1.shape(), Shape{4, 3});
   auto expected_eye_4_k_minus1 = array(
       {0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f},
       {4, 3});
@@ -2593,11 +3348,27 @@ TEST_CASE("test linspace") {
   auto expected = array({0.0f, 2.5f, 5.0f, 7.5f, 10.0f}, {5});
   CHECK(array_equal(x, expected).item<bool>());
 
-  x = linspace(0, 10, 5, int32);
+  x = linspace(0, 10, 5, true, int32);
   expected = array({0, 2, 5, 7, 10}, {5});
   CHECK(array_equal(x, expected).item<bool>());
 
   x = linspace(0, 1, 0);
+  expected = array(std::initializer_list<float>{}, {0});
+  CHECK(array_equal(x, expected).item<bool>());
+
+  x = linspace(0, 10, 5, false);
+  expected = array({0.0f, 2.0f, 4.0f, 6.0f, 8.0f}, {5});
+  CHECK(array_equal(x, expected).item<bool>());
+
+  x = linspace(0, 10, 5, false, int32);
+  expected = array({0, 2, 4, 6, 8}, {5});
+  CHECK(array_equal(x, expected).item<bool>());
+
+  x = linspace(1, 10, 1, false);
+  expected = array({1.0f}, {1});
+  CHECK(array_equal(x, expected).item<bool>());
+
+  x = linspace(0, 1, 0, false);
   expected = array(std::initializer_list<float>{}, {0});
   CHECK(array_equal(x, expected).item<bool>());
 }
@@ -2609,10 +3380,13 @@ TEST_CASE("test quantize dequantize") {
 
   for (int i = 2; i <= 8; i *= 2) {
     int el_per_int = 32 / i;
-    auto [x_q, scales, biases] = quantize(x, 128, i);
-    CHECK_EQ(x_q.shape(), std::vector<int>{128, 512 / el_per_int});
-    CHECK_EQ(scales.shape(), std::vector<int>{128, 4});
-    CHECK_EQ(biases.shape(), std::vector<int>{128, 4});
+    auto res = quantize(x, 128, i);
+    auto x_q = res[0];
+    auto scales = res[1];
+    auto biases = res[2];
+    CHECK_EQ(x_q.shape(), Shape{128, 512 / el_per_int});
+    CHECK_EQ(scales.shape(), Shape{128, 4});
+    CHECK_EQ(biases.shape(), Shape{128, 4});
 
     auto x_hat = dequantize(x_q, scales, biases, 128, i);
     auto max_diff = max(abs(x - x_hat)).item<float>();
@@ -2658,8 +3432,12 @@ TEST_CASE("test repeat") {
 
   // 0 repeats
   auto repeat_4 = repeat(data_3, 0, 0);
-  auto expected_4 = array({});
-  CHECK(array_equal(repeat_2, expected_2).item<bool>());
+  auto expected_4 = array(std::initializer_list<int>{}, {0, 3});
+  CHECK(array_equal(repeat_4, expected_4).item<bool>());
+
+  repeat_4 = repeat(data_3, 0, 1);
+  expected_4 = array(std::initializer_list<int>{}, {3, 0});
+  CHECK(array_equal(repeat_4, expected_4).item<bool>());
 
   // negative repeats
   CHECK_THROWS_AS(repeat(data_3, -3, 0), std::invalid_argument);
@@ -2815,13 +3593,17 @@ TEST_CASE("test divmod") {
 
   // Check that we can still eval when one output goes out of scope
   std::vector<array> out_holder;
-  { out_holder.push_back(divmod(x, y)[0]); }
+  {
+    out_holder.push_back(divmod(x, y)[0]);
+  }
   eval(out_holder);
   CHECK_EQ(out_holder[0].item<float>(), 0.0);
 
   // Check that we can still eval when the other output goes out of scope
   out_holder.clear();
-  { out_holder.push_back(divmod(x, y)[1]); }
+  {
+    out_holder.push_back(divmod(x, y)[1]);
+  }
   eval(out_holder);
   CHECK_EQ(out_holder[0].item<float>(), 1.0);
 }
@@ -2843,7 +3625,7 @@ TEST_CASE("test diagonal") {
 
   out = diagonal(x, -5, 0, 1);
   eval(out);
-  CHECK_EQ(out.shape(), std::vector<int>{0});
+  CHECK_EQ(out.shape(), Shape{0});
 
   x = array({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, {3, 2, 2});
   out = diagonal(x, 1, 0, 1);
@@ -3099,17 +3881,17 @@ TEST_CASE("test atleast_1d") {
   auto x = array(1);
   auto out = atleast_1d(x);
   CHECK_EQ(out.ndim(), 1);
-  CHECK_EQ(out.shape(), std::vector<int>{1});
+  CHECK_EQ(out.shape(), Shape{1});
 
   x = array({1, 2, 3}, {3});
   out = atleast_1d(x);
   CHECK_EQ(out.ndim(), 1);
-  CHECK_EQ(out.shape(), std::vector<int>{3});
+  CHECK_EQ(out.shape(), Shape{3});
 
   x = array({1, 2, 3}, {3, 1});
   out = atleast_1d(x);
   CHECK_EQ(out.ndim(), 2);
-  CHECK_EQ(out.shape(), std::vector<int>{3, 1});
+  CHECK_EQ(out.shape(), Shape{3, 1});
 }
 
 TEST_CASE("test atleast_1d vector") {
@@ -3118,28 +3900,28 @@ TEST_CASE("test atleast_1d vector") {
   auto out = atleast_1d(x);
   CHECK_EQ(out.size(), 3);
   CHECK_EQ(out[0].ndim(), 1);
-  CHECK_EQ(out[0].shape(), std::vector<int>{1});
+  CHECK_EQ(out[0].shape(), Shape{1});
   CHECK_EQ(out[1].ndim(), 1);
-  CHECK_EQ(out[1].shape(), std::vector<int>{3});
+  CHECK_EQ(out[1].shape(), Shape{3});
   CHECK_EQ(out[2].ndim(), 2);
-  CHECK_EQ(out[2].shape(), std::vector<int>{3, 1});
+  CHECK_EQ(out[2].shape(), Shape{3, 1});
 }
 
 TEST_CASE("test atleast_2d") {
   auto x = array(1);
   auto out = atleast_2d(x);
   CHECK_EQ(out.ndim(), 2);
-  CHECK_EQ(out.shape(), std::vector<int>{1, 1});
+  CHECK_EQ(out.shape(), Shape{1, 1});
 
   x = array({1, 2, 3}, {3});
   out = atleast_2d(x);
   CHECK_EQ(out.ndim(), 2);
-  CHECK_EQ(out.shape(), std::vector<int>{1, 3});
+  CHECK_EQ(out.shape(), Shape{1, 3});
 
   x = array({1, 2, 3}, {3, 1});
   out = atleast_2d(x);
   CHECK_EQ(out.ndim(), 2);
-  CHECK_EQ(out.shape(), std::vector<int>{3, 1});
+  CHECK_EQ(out.shape(), Shape{3, 1});
 }
 
 TEST_CASE("test atleast_2d vector") {
@@ -3148,28 +3930,28 @@ TEST_CASE("test atleast_2d vector") {
   auto out = atleast_2d(x);
   CHECK_EQ(out.size(), 3);
   CHECK_EQ(out[0].ndim(), 2);
-  CHECK_EQ(out[0].shape(), std::vector<int>{1, 1});
+  CHECK_EQ(out[0].shape(), Shape{1, 1});
   CHECK_EQ(out[1].ndim(), 2);
-  CHECK_EQ(out[1].shape(), std::vector<int>{1, 3});
+  CHECK_EQ(out[1].shape(), Shape{1, 3});
   CHECK_EQ(out[2].ndim(), 2);
-  CHECK_EQ(out[2].shape(), std::vector<int>{3, 1});
+  CHECK_EQ(out[2].shape(), Shape{3, 1});
 }
 
 TEST_CASE("test atleast_3d") {
   auto x = array(1);
   auto out = atleast_3d(x);
   CHECK_EQ(out.ndim(), 3);
-  CHECK_EQ(out.shape(), std::vector<int>{1, 1, 1});
+  CHECK_EQ(out.shape(), Shape{1, 1, 1});
 
   x = array({1, 2, 3}, {3});
   out = atleast_3d(x);
   CHECK_EQ(out.ndim(), 3);
-  CHECK_EQ(out.shape(), std::vector<int>{1, 3, 1});
+  CHECK_EQ(out.shape(), Shape{1, 3, 1});
 
   x = array({1, 2, 3}, {3, 1});
   out = atleast_3d(x);
   CHECK_EQ(out.ndim(), 3);
-  CHECK_EQ(out.shape(), std::vector<int>{3, 1, 1});
+  CHECK_EQ(out.shape(), Shape{3, 1, 1});
 }
 
 TEST_CASE("test atleast_3d vector") {
@@ -3178,11 +3960,11 @@ TEST_CASE("test atleast_3d vector") {
   auto out = atleast_3d(x);
   CHECK_EQ(out.size(), 3);
   CHECK_EQ(out[0].ndim(), 3);
-  CHECK_EQ(out[0].shape(), std::vector<int>{1, 1, 1});
+  CHECK_EQ(out[0].shape(), Shape{1, 1, 1});
   CHECK_EQ(out[1].ndim(), 3);
-  CHECK_EQ(out[1].shape(), std::vector<int>{1, 3, 1});
+  CHECK_EQ(out[1].shape(), Shape{1, 3, 1});
   CHECK_EQ(out[2].ndim(), 3);
-  CHECK_EQ(out[2].shape(), std::vector<int>{3, 1, 1});
+  CHECK_EQ(out[2].shape(), Shape{3, 1, 1});
 }
 
 TEST_CASE("test topk") {
@@ -3241,7 +4023,6 @@ TEST_CASE("test conv1d") {
           {1, 3, 2}),
       float16);
 
-  int kernel = 3;
   int stride = 1;
   int padding = 1;
 
@@ -3268,22 +4049,22 @@ TEST_CASE("test conv1d") {
         float16);
 
     auto expected = array(
-        {1.5685,
-         0.5672,
-         1.8121,
-         1.2948,
-         2.3448,
-         1.6104,
-         2.7743,
-         1.6126,
-         1.4056,
-         0.9331,
-         1.8739,
-         1.0909},
+        {1.56836,
+         0.567383,
+         1.8125,
+         1.29492,
+         2.34375,
+         1.61035,
+         2.77539,
+         1.61328,
+         1.40527,
+         0.933105,
+         1.87402,
+         1.09082},
         {1, 3, 4});
 
     auto out = conv1d(in, wt, stride, padding, /* dilation= */ 1, groups);
-    CHECK(allclose(out, expected, /* rtol = */ 1.0e-3).item<bool>());
+    CHECK(allclose(out, expected).item<bool>());
   }
 
   {
@@ -3309,21 +4090,468 @@ TEST_CASE("test conv1d") {
         {4, 3, 1});
 
     auto expected = array(
-        {1.0703,
-         0.7533,
-         0.7007,
-         0.4681,
-         1.1859,
-         0.9117,
-         0.9565,
-         0.6111,
-         0.6416,
-         0.5665,
-         0.9074,
-         0.0605},
+        {1.07007,
+         0.753201,
+         0.700818,
+         0.468176,
+         1.18568,
+         0.91152,
+         0.956607,
+         0.611213,
+         0.641404,
+         0.566401,
+         0.907472,
+         0.0605397},
         {1, 3, 4});
 
     auto out = conv1d(in, wt, stride, padding, /* dilation= */ 1, groups);
-    CHECK(allclose(out, expected, /* rtol = */ 1.0e-3).item<bool>());
+    CHECK(allclose(out, expected).item<bool>());
   }
+}
+
+TEST_CASE("test conv2d") {
+  auto in = array(
+      {0.57429284,
+       -0.21628855,
+       -0.18673691,
+       -0.3793517,
+
+       0.3059678,
+       -0.8137168,
+       0.6168841,
+       -0.26912728},
+      {1, 2, 2, 2});
+
+  std::pair<int, int> stride{1, 1};
+  std::pair<int, int> padding{0, 0};
+
+  {
+    int groups = 1;
+
+    auto wt = array(
+        {0.3190391,   -0.24937038, 1.4621079,   -2.0601406,  -0.3224172,
+         -0.38405436, 1.1337694,   -1.0998913,  -0.1724282,  -0.8778584,
+         0.04221375,  0.58281523,  -1.1006192,  1.1447237,   0.9015907,
+         0.50249434,  0.90085596,  -0.68372786, -0.12289023, -0.93576944,
+         -0.26788807, 0.53035545,  -0.69166076, -0.39675352, -0.6871727,
+         -0.84520566, -0.6712461,  -0.0126646,  -1.1173104,  0.2344157,
+         1.6598022,   0.74204415},
+        {4, 2, 2, 2});
+
+    auto expected =
+        array({1.9549234, -0.98542136, 0.2097499, 0.20991313}, {1, 1, 1, 4});
+    auto out = conv2d(in, wt, stride, padding, /* dilation= */ {1, 1}, groups);
+    CHECK(allclose(out, expected).item<bool>());
+  }
+
+  {
+    int groups = 2;
+    auto wt = array(
+        {0.3190391,
+         -0.24937038,
+
+         1.46210794,
+         -2.06014071,
+
+         -0.3224172,
+         -0.38405435,
+
+         1.13376944,
+         -1.09989127,
+
+         -0.17242821,
+         -0.87785842,
+
+         0.04221375,
+         0.58281521,
+
+         -1.10061918,
+         1.14472371,
+
+         0.90159072,
+         0.50249434},
+        {4, 2, 2, 1});
+
+    auto expected = array(
+        {-0.59372161, -0.44505326, 0.17910982, -1.06507601}, {1, 1, 1, 4});
+
+    auto out = conv2d(in, wt, stride, padding, /* dilation= */ {1, 1}, groups);
+    CHECK(allclose(out, expected).item<bool>());
+  }
+
+  {
+    in = array(
+        {0.57429284,
+         -0.21628855,
+         -0.18673691,
+         -0.3793517,
+
+         0.3059678,
+         -0.8137168,
+         0.6168841,
+         -0.26912728,
+
+         0.57429284,
+         -0.21628855,
+         -0.18673691,
+         -0.3793517,
+
+         0.3059678,
+         -0.8137168,
+         0.6168841,
+         -0.26912728},
+        {2, 2, 2, 2});
+
+    int groups = 2;
+    auto wt = array(
+        {0.3190391,
+         -0.24937038,
+
+         1.46210794,
+         -2.06014071,
+
+         -0.3224172,
+         -0.38405435,
+
+         1.13376944,
+         -1.09989127,
+
+         -0.17242821,
+         -0.87785842,
+
+         0.04221375,
+         0.58281521,
+
+         -1.10061918,
+         1.14472371,
+
+         0.90159072,
+         0.50249434},
+        {4, 2, 2, 1});
+
+    auto expected = array(
+        {-0.59372161, -0.44505326, 0.17910982, -1.06507601}, {1, 1, 1, 4});
+
+    auto out = conv2d(in, wt, stride, padding, /* dilation= */ {1, 1}, groups);
+    CHECK(allclose(out, expected).item<bool>());
+  }
+}
+
+TEST_CASE("test trace") {
+  auto in = eye(3);
+  auto out = trace(in).item<float>();
+  CHECK_EQ(out, 3.0);
+
+  in = array({1, 2, 3, 4, 5, 6, 7, 8, 9}, {3, 3}, int32);
+  auto out2 = trace(in).item<int>();
+  CHECK_EQ(out2, 15);
+
+  in = reshape(arange(8), {2, 2, 2});
+  auto out3 = trace(in, 0, 0, 1);
+  CHECK(array_equal(out3, array({6, 8}, {2})).item<bool>());
+
+  auto out4 = trace(in, 0, 1, 2, float32);
+  CHECK(array_equal(out4, array({3, 11}, {2})).item<bool>());
+}
+
+TEST_CASE("test view") {
+  auto in = array(3);
+  CHECK_THROWS(view(in, int64));
+
+  in = array({1, 2, 3});
+  CHECK_THROWS(view(in, int64));
+
+  in = array({1, 2, 3, 4}, int64);
+  auto out = view(in, int32);
+  CHECK(array_equal(out, array({1, 0, 2, 0, 3, 0, 4, 0})).item<bool>());
+}
+
+TEST_CASE("test roll") {
+  auto x = reshape(arange(10), {2, 5});
+
+  auto y = roll(x, 2);
+  CHECK(array_equal(y, array({8, 9, 0, 1, 2, 3, 4, 5, 6, 7}, {2, 5}))
+            .item<bool>());
+
+  y = roll(x, -2);
+  CHECK(array_equal(y, array({2, 3, 4, 5, 6, 7, 8, 9, 0, 1}, {2, 5}))
+            .item<bool>());
+
+  y = roll(x, 2, 1);
+  CHECK(array_equal(y, array({3, 4, 0, 1, 2, 8, 9, 5, 6, 7}, {2, 5}))
+            .item<bool>());
+
+  y = roll(x, -2, 1);
+  CHECK(array_equal(y, array({2, 3, 4, 0, 1, 7, 8, 9, 5, 6}, {2, 5}))
+            .item<bool>());
+
+  y = roll(x, 2, {0, 0, 0});
+  CHECK(array_equal(y, array({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, {2, 5}))
+            .item<bool>());
+
+  y = roll(x, 1, {1, 1, 1});
+  CHECK(array_equal(y, array({2, 3, 4, 0, 1, 7, 8, 9, 5, 6}, {2, 5}))
+            .item<bool>());
+
+  y = roll(x, {1, 2}, {0, 1});
+  CHECK(array_equal(y, array({8, 9, 5, 6, 7, 3, 4, 0, 1, 2}, {2, 5}))
+            .item<bool>());
+
+  y = roll(array({}), 0, 0);
+  CHECK(array_equal(y, array({})).item<bool>());
+}
+
+TEST_CASE("test contiguous") {
+  auto x = array({1, 2, 3});
+  x = contiguous(broadcast_to(x, {2, 2, 3}));
+  eval(x);
+  CHECK(x.flags().row_contiguous);
+  CHECK_EQ(x.strides(), decltype(x.strides()){6, 3, 1});
+
+  x = array({1, 2, 1, 2}, {2, 2});
+  x = contiguous(transpose(x), true);
+  eval(x);
+  CHECK(x.flags().col_contiguous);
+  CHECK_EQ(x.strides(), decltype(x.strides()){1, 2});
+}
+
+TEST_CASE("test bitwise shift operations") {
+  std::vector<Dtype> dtypes = {
+      int8, int16, int32, int64, uint8, uint16, uint32, uint64};
+
+  for (const auto& dtype : dtypes) {
+    array x = full({4}, 1, dtype);
+    array y = full({4}, 2, dtype);
+
+    auto left_shift_result = left_shift(x, y);
+    CHECK_EQ(left_shift_result.dtype(), dtype);
+    CHECK(array_equal(left_shift_result, array({4, 4, 4, 4}, dtype))
+              .item<bool>());
+
+    auto right_shift_result = right_shift(full({4}, 4, dtype), y);
+    CHECK_EQ(right_shift_result.dtype(), dtype);
+    CHECK(array_equal(right_shift_result, full({4}, 1, dtype)).item<bool>());
+  }
+
+  array x = array({127, -128}, int8);
+  array y = array({1, 1}, int8);
+  auto left_shift_result = left_shift(x, y);
+  auto right_shift_result = right_shift(x, y);
+
+  CHECK(array_equal(left_shift_result, array({-2, 0}, int8)).item<bool>());
+  CHECK(array_equal(right_shift_result, array({63, -64}, int8)).item<bool>());
+
+  array x_bool = full({4}, true, bool_);
+  array y_bool = full({4}, true, bool_);
+  auto left_shift_bool_result = left_shift(x_bool, y_bool);
+  auto right_shift_bool_result = right_shift(x_bool, y_bool);
+
+  CHECK_EQ(left_shift_bool_result.dtype(), uint8);
+  CHECK(array_equal(left_shift_bool_result, full({4}, 2, uint8)).item<bool>());
+
+  CHECK_EQ(right_shift_bool_result.dtype(), uint8);
+  CHECK(array_equal(right_shift_bool_result, full({4}, 0, uint8)).item<bool>());
+}
+
+TEST_CASE("test conv_transpose1d with output_padding") {
+  auto in = array({1.0, 2.0, 3.0}, {1, 1, 3});
+  auto wt = array({1.0, 1.0, 1.0}, {1, 1, 3});
+  int stride = 2;
+  int padding = 0;
+  int dilation = 1;
+  int output_padding = 1;
+  int groups = 1;
+
+  auto out = conv_transpose1d(
+      in, wt, stride, padding, dilation, output_padding, groups);
+  auto expected = array({6.0, 0.0}, {1, 2, 1});
+  CHECK(array_equal(out, expected).item<bool>());
+}
+
+TEST_CASE("test conv_transpose2d with output_padding") {
+  auto in = array({1.0, 2.0, 3.0, 4.0}, {1, 1, 2, 2});
+  auto wt = array({1.0, 1.0, 1.0, 1.0}, {2, 1, 1, 2});
+  std::pair<int, int> stride{2, 2};
+  std::pair<int, int> padding{0, 0};
+  std::pair<int, int> output_padding{1, 1};
+  std::pair<int, int> dilation{1, 1};
+  int groups = 1;
+
+  auto out = conv_transpose2d(
+      in, wt, stride, padding, dilation, output_padding, groups);
+  auto expected = array(
+      {3.0,
+       3.0,
+       0.0,
+       0.0,
+       7.0,
+       7.0,
+       0.0,
+       0.0,
+       0.0,
+       0.0,
+       0.0,
+       0.0,
+       0.0,
+       0.0,
+       0.0,
+       0.0},
+      {1, 2, 4, 2});
+  CHECK(array_equal(out, expected).item<bool>());
+}
+
+TEST_CASE("test conv_transpose3d with output_padding") {
+  auto in = array({1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0}, {1, 1, 2, 2, 2});
+  auto wt = array({1.0, 1.0}, {1, 1, 1, 1, 2});
+  std::tuple<int, int, int> stride{2, 2, 2};
+  std::tuple<int, int, int> padding{0, 0, 0};
+  std::tuple<int, int, int> output_padding{1, 1, 1};
+  std::tuple<int, int, int> dilation{1, 1, 1};
+  int groups = 1;
+
+  auto out = conv_transpose3d(
+      in, wt, stride, padding, dilation, output_padding, groups);
+  auto expected = array(
+      {3.0, 0.0, 7.0, 0.0, 0.0, 0.0, 0.0, 0.0, 11.0, 0.0, 15.0,
+       0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  0.0, 0.0,
+       0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  0.0},
+      {1, 2, 4, 4, 1});
+  CHECK(array_equal(out, expected).item<bool>());
+}
+
+TEST_CASE("test conv shape overflow") {
+  // Conv shape arithmetic must not overflow (signed-int UB) for large but
+  // otherwise valid int32 parameters; out-of-range results are rejected
+  // gracefully. https://github.com/ml-explore/mlx/issues/3611
+  const int imax = 2147483647;
+  const int imin = -2147483647 - 1;
+  auto in = zeros({1, 8, 8, 1});
+  auto wt = zeros({1, 3, 3, 1});
+
+  // A kernel dilated past the input reports the spatial-size error.
+  CHECK_THROWS_AS(
+      conv_general(in, wt, {1, 1}, {0, 0}, {0, 0}, {imax, imax}, {1, 1}),
+      std::invalid_argument);
+
+  // Padding sums, input dilation, and negating a padding of INT_MIN raise.
+  CHECK_THROWS_AS(
+      conv_general(in, wt, {1, 1}, {imax, imax}, {imax, imax}, {1, 1}, {1, 1}),
+      std::overflow_error);
+  CHECK_THROWS_AS(
+      conv_general(in, wt, {1, 1}, {imax, 0}, {0, 0}, {1, 1}, {1, 1}),
+      std::overflow_error);
+  CHECK_THROWS_AS(
+      conv_general(in, wt, {1, 1}, {0, 0}, {0, 0}, {1, 1}, {imax, imax}),
+      std::overflow_error);
+  CHECK_THROWS_AS(
+      conv_general(in, wt, {1, 1}, {imin, imin}, {0, 0}, {1, 1}, {1, 1}),
+      std::overflow_error);
+
+  // The transposed padding setup runs before conv_general validates it.
+  auto in_t = zeros({1, 4, 4, 1});
+  CHECK_THROWS_AS(
+      conv_transpose2d(in_t, wt, {1, 1}, {0, 0}, {imax, imax}, {0, 0}),
+      std::overflow_error);
+  CHECK_THROWS_AS(
+      conv_transpose2d(in_t, wt, {1, 1}, {imin, imin}, {1, 1}, {0, 0}),
+      std::overflow_error);
+
+  // The dilated input and kernel are both near 4e9 and cancel in the forward
+  // output, so only the gradient's own recompute goes out of range.
+  auto in_g = zeros({1, 3, 1, 1});
+  auto wt_g = zeros({1, 200000, 1, 1});
+  auto conv_g = [](const std::vector<array>& primals) {
+    return std::vector<array>{conv_general(
+        primals[0],
+        primals[1],
+        {1, 1},
+        {0, 0},
+        {0, 0},
+        {20000, 1},
+        {2000000000, 1})};
+  };
+  auto cotan = ones(conv_g({in_g, wt_g})[0].shape());
+  CHECK_THROWS_AS(vjp(conv_g, {in_g, wt_g}, {cotan}), std::overflow_error);
+
+  // The weight gradient pads without dividing by the stride.
+  auto in_w = zeros({1, 8, 8, 1});
+  auto conv_w = [&in_w, imax](const std::vector<array>& primals) {
+    return std::vector<array>{conv_general(
+        in_w, primals[0], {imax, 1}, {imax, 0}, {imax, 0}, {1, 1}, {1, 1})};
+  };
+  auto cotan_w = ones(conv_w({wt})[0].shape());
+  CHECK_THROWS_AS(vjp(conv_w, {wt}, {cotan_w}), std::overflow_error);
+
+  // In-range parameters still give the same shapes.
+  CHECK_EQ(
+      conv_general(in, wt, {1, 1}, {1, 1}, {1, 1}, {2, 2}, {1, 1}).shape(),
+      Shape{1, 6, 6, 1});
+  CHECK_EQ(
+      conv_transpose2d(in_t, wt, {2, 2}, {1, 1}, {1, 1}, {1, 1}).shape(),
+      Shape{1, 8, 8, 1});
+}
+
+TEST_CASE("test fp8 conversion") {
+  for (auto t : {float32, float16, bfloat16}) {
+    array in({-1.125, -1.0, 0.0, 1.0, 1.125, 4.5, 448.0}, t);
+    auto in_fp8 = to_fp8(in);
+    auto out = from_fp8(in_fp8, t);
+    CHECK(array_equal(out, in).item<bool>());
+  }
+
+  array in({-1.125, -1.0, 0.0, 1.0, 1.125, 4.5, 448.0});
+  array noisy_in({-1.135, -1.01, 0.0001, 1.01, 1.135, 4.6, 447.0});
+  auto in_fp8 = to_fp8(noisy_in);
+  auto out = from_fp8(in_fp8, float32);
+  CHECK(array_equal(out, in).item<bool>());
+
+  // Overflow
+  in = array({-600.0, 600.0});
+  in_fp8 = to_fp8(in);
+  out = from_fp8(in_fp8, float32);
+
+  auto expected = array({-448.0f, 448.0f});
+  CHECK(array_equal(out, expected, true).item<bool>());
+}
+
+TEST_CASE("test max min with nan") {
+  // Test maximum and minimum with NaN values
+  auto x = array({0.0f, 1.0f, NAN, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f});
+  auto y = array({NAN, 1.0f, NAN, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f});
+  auto expected_max = array({NAN, 1.0f, NAN, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f});
+  auto expected_min = array({NAN, 1.0f, NAN, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f});
+  auto max_result = maximum(x, y);
+  auto min_result = minimum(x, y);
+  CHECK(array_equal(max_result, expected_max, true).item<bool>());
+  CHECK(array_equal(min_result, expected_min, true).item<bool>());
+
+  // Test with all NaN values
+  x = array({NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN});
+  y = array({NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN});
+  max_result = maximum(x, y);
+  min_result = minimum(x, y);
+  auto expected = array({NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN});
+  CHECK(array_equal(max_result, expected, true).item<bool>());
+  CHECK(array_equal(min_result, expected, true).item<bool>());
+}
+
+TEST_CASE("roll and tile shape overflow") {
+  // Shape arithmetic must not overflow (signed-int UB) for large but otherwise
+  // valid int32 inputs; out-of-range results are rejected gracefully.
+  // https://github.com/ml-explore/mlx/issues/3601
+
+  // tile: reps * dim exceeding int32 raises instead of overflowing.
+  CHECK_THROWS_AS(tile(zeros({2}), {2147483647}), std::overflow_error);
+
+  // roll: a shift sum exceeding int32 raises instead of overflowing.
+  CHECK_THROWS_AS(
+      roll(zeros({4}), Shape{2147483647, 2147483647}), std::overflow_error);
+  CHECK_THROWS_AS(
+      roll(zeros({4}), Shape{2147483647, 2147483647}, 0), std::overflow_error);
+
+  // roll: a shift of INT_MIN must not negate-overflow. INT_MIN mod 4 == 0, so
+  // rolling a size-4 axis by INT_MIN is the identity.
+  auto x = array({1, 2, 3, 4});
+  auto rolled = roll(x, -2147483647 - 1);
+  CHECK(array_equal(rolled, x).item<bool>());
 }

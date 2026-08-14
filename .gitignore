@@ -3,23 +3,19 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# C extensions
-*.so
-
 # tensor files
 *.safe
 *.safetensors
 
 # Metal libraries
 *.metallib
-venv/
 
 # Distribution / packaging
+/build/
 python/mlx/core
 python/mlx/share
 python/mlx/include
 .Python
-build/
 develop-eggs/
 dist/
 downloads/
@@ -30,18 +26,15 @@ lib64/
 parts/
 sdist/
 var/
+venv/
 wheels/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 MANIFEST
-
-# vim
-*.swp
-
-# Ignore build dir
-build/
+uv.lock
+.DS_Store
 
 # Prerequisites
 *.d
@@ -51,6 +44,7 @@ build/
 *.lo
 *.o
 *.obj
+*.ilk
 
 # Precompiled Headers
 *.gch
@@ -76,9 +70,12 @@ build/
 *.out
 *.app
 
-# VSCode 
-.vscode/
-.DS_Store
+# Debug symbols
+*.pdb
 
+# VSCode
+.vscode/
 # Jetbrains
-.cache
+.cache/
+# vim
+*.swp

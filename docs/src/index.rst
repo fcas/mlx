@@ -32,18 +32,23 @@ are the CPU and GPU.
    install
 
 .. toctree::
-   :caption: Usage 
+   :caption: Usage
    :maxdepth: 1
 
    usage/quick_start
    usage/lazy_evaluation
    usage/unified_memory
    usage/indexing
+   usage/kv_cache
    usage/saving_and_loading
    usage/function_transforms
    usage/compile
    usage/numpy
+   usage/precision
+   usage/environment_variables
+   usage/distributed
    usage/using_streams
+   usage/export
 
 .. toctree::
    :caption: Examples
@@ -52,6 +57,8 @@ are the CPU and GPU.
    examples/linear_regression
    examples/mlp
    examples/llama-inference
+   examples/data_parallelism
+   examples/tensor_parallelism
 
 .. toctree::
    :caption: Python API Reference
@@ -60,6 +67,7 @@ are the CPU and GPU.
    python/array
    python/data_types
    python/devices_and_streams
+   python/export
    python/ops
    python/random
    python/transforms
@@ -67,9 +75,13 @@ are the CPU and GPU.
    python/fft
    python/linalg
    python/metal
+   python/cuda
+   python/memory_management
    python/nn
    python/optimizers
+   python/distributed
    python/tree_utils
+   python/printoptions
 
 .. toctree::
    :caption: C++ API Reference
@@ -83,3 +95,6 @@ are the CPU and GPU.
 
    dev/extensions
    dev/metal_debugger
+   dev/metal_logging
+   dev/custom_metal_kernels
+   dev/mlx_in_cpp

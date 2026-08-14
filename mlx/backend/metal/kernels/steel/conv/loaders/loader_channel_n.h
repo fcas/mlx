@@ -83,7 +83,7 @@ struct Conv2DInputBlockLoaderSmallChannels {
   const constant MLXConvParams<2>* params;
   const constant ImplicitGemmConv2DParams* gemm_params;
 
-  short weight_hw;
+  int weight_hw;
 
   const device T* src[n_rows];
 
@@ -99,10 +99,10 @@ struct Conv2DInputBlockLoaderSmallChannels {
       const constant MLXConvParams<2>* params_,
       const constant ImplicitGemmConv2DParams* gemm_params_,
       uint simd_group_id [[simdgroup_index_in_threadgroup]],
-      uint simd_lane_id [[thread_index_in_simdgroup]])
+      uint simd_lane_id [[thread_index_in_simdgroup]]) thread
       : thread_idx(simd_group_id * 32 + simd_lane_id),
         bi(thread_idx / TCOLS),
-        bj(vec_size * (thread_idx % TCOLS)),
+        bj(vec_size*(thread_idx % TCOLS)),
         dst(dst_ + bi * dst_ld + bj),
         params(params_),
         gemm_params(gemm_params_),
@@ -131,7 +131,7 @@ struct Conv2DInputBlockLoaderSmallChannels {
   }
 
   /* Load from device memory into threadgroup memory - without bound checking */
-  METAL_FUNC void load_unsafe() const {
+  METAL_FUNC void load_unsafe() const thread {
     if (weight_hw >= params->wS[1] * params->wS[0]) {
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < BROWS; i += TROWS) {
@@ -187,7 +187,7 @@ struct Conv2DInputBlockLoaderSmallChannels {
   }
 
   /* Iteration helper */
-  METAL_FUNC void next() {
+  METAL_FUNC void next() thread {
     weight_hw += TCOLS;
   }
 };
@@ -243,11 +243,11 @@ struct Conv2DWeightBlockLoaderSmallChannels {
       const constant MLXConvParams<2>* params_,
       const constant ImplicitGemmConv2DParams* gemm_params_,
       uint simd_group_id [[simdgroup_index_in_threadgroup]],
-      uint simd_lane_id [[thread_index_in_simdgroup]])
-      : src_ld(params_ -> wt_strides[0]),
+      uint simd_lane_id [[thread_index_in_simdgroup]]) thread
+      : src_ld(params_->wt_strides[0]),
         thread_idx(simd_group_id * 32 + simd_lane_id),
         bi(thread_idx / TCOLS),
-        bj(vec_size * (thread_idx % TCOLS)),
+        bj(vec_size*(thread_idx % TCOLS)),
         dst(dst_ + bi * dst_ld + bj),
         src(src_ + bi * src_ld),
         params(params_),
@@ -256,7 +256,7 @@ struct Conv2DWeightBlockLoaderSmallChannels {
         do_read(read_n + BN <= gemm_params_->N) {}
 
   /* Load from device memory into threadgroup memory - without bound checking */
-  METAL_FUNC void load_unsafe() const {
+  METAL_FUNC void load_unsafe() const thread {
     if (bi >= BROWS || bj >= BCOLS)
       return;
 
@@ -272,7 +272,7 @@ struct Conv2DWeightBlockLoaderSmallChannels {
       return;
     }
 
-    const device T* curr_src = src + weight_hw * params->wt_strides[2];
+    const device T* curr_src = src + weight_hw * (params->C / params->groups);
 
     if (BN != 8 || do_read) {
       STEEL_PRAGMA_UNROLL
@@ -310,7 +310,7 @@ struct Conv2DWeightBlockLoaderSmallChannels {
   }
 
   /* Iteration helper */
-  METAL_FUNC void next() {
+  METAL_FUNC void next() thread {
     weight_hw += TCOLS;
   }
 };

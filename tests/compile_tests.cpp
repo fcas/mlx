@@ -1,6 +1,12 @@
 // Copyright © 2023-2024 Apple Inc.
 
+// Required for using M_SQRT2 in MSVC.
+#define _USE_MATH_DEFINES
+
 #include "doctest/doctest.h"
+
+#include <cmath>
+#include <limits>
 
 #include "mlx/mlx.h"
 #include "mlx/primitives.h"
@@ -106,6 +112,34 @@ TEST_CASE("test enable and disable compile") {
   CHECK_THROWS(compile(nullptr));
 }
 
+std::vector<array> nan_const_fun(const std::vector<array>& inputs) {
+  auto nan = array(std::numeric_limits<float>::quiet_NaN());
+  return {where(greater(inputs[0], array(0.0f)), inputs[0], nan)};
+}
+
+std::vector<array> neg_inf_const_fun(const std::vector<array>& inputs) {
+  auto inf = array(-std::numeric_limits<float>::infinity());
+  return {where(greater(inputs[0], array(0.0f)), inputs[0], inf)};
+}
+
+TEST_CASE("test compile with non-finite constants") {
+  // Regression test: baking a non-finite scalar constant (NaN / infinity) into
+  // a fused compiled kernel used to stream a bare token (e.g. `nan`) into the
+  // generated kernel source, which is not a valid identifier and broke
+  // compilation (notably on the Metal backend).
+  auto out = compile(nan_const_fun)({array({1.0f, -1.0f})})[0];
+  eval(out);
+  CHECK_EQ(out.shape(), Shape{2});
+  CHECK_EQ(out.data<float>()[0], 1.0f);
+  CHECK(std::isnan(out.data<float>()[1]));
+
+  out = compile(neg_inf_const_fun)({array({1.0f, -1.0f})})[0];
+  eval(out);
+  CHECK_EQ(out.data<float>()[0], 1.0f);
+  CHECK(std::isinf(out.data<float>()[1]));
+  CHECK_LT(out.data<float>()[1], 0.0f);
+}
+
 auto add_scalars(const std::vector<array>&) {
   auto a = array(-1.0f);
   auto b = array(-1.0f);
@@ -154,6 +188,17 @@ TEST_CASE("test simplify") {
   set_compile_mode(CompileMode::enabled);
 }
 
+TEST_CASE("test simplify noops") {
+  set_compile_mode(CompileMode::no_fuse);
+  auto a = array({1.0f, 2.0f});
+  auto fun = [](const std::vector<array>& inputs) -> std::vector<array> {
+    return {copy(stop_gradient(exp(stop_gradient(inputs[0]))))};
+  };
+  auto b = compile(fun)({a})[0];
+  CHECK(b.inputs()[0].id() == a.id());
+  set_compile_mode(CompileMode::enabled);
+}
+
 auto add_diff(const std::vector<array>& inputs) {
   auto a = inputs[0];
   return std::vector<array>{cos(a) + sin(a)};
@@ -180,8 +225,7 @@ auto multi_one(const std::vector<array>&) {
 auto multi_two(const std::vector<array>&) {
   auto a = array(1.0);
   auto b = array(1.0);
-  auto c = divmod(a, b);
-  return std::vector<array>{c};
+  return divmod(a, b);
 }
 
 auto multi_three(const std::vector<array>&) {
@@ -495,15 +539,15 @@ TEST_CASE("test compile tape with outside parents") {
   }
 }
 
-auto compile_accross_streams(const std::vector<array>& inputs) {
+auto compile_across_streams(const std::vector<array>& inputs) {
   auto s2 = new_stream(default_device());
   auto x = exp(abs(inputs[0]));
   auto y = exp(abs(x, s2), s2);
   return std::vector<array>{y};
 }
 
-TEST_CASE("test compile accross streams") {
-  auto cfun = compile(compile_accross_streams);
+TEST_CASE("test compile across streams") {
+  auto cfun = compile(compile_across_streams);
   auto x = array({2.0f});
   auto out = cfun({x})[0];
   auto& p1 = out.primitive();
@@ -682,7 +726,8 @@ auto compile_shapeless_ok(const std::vector<array>& inputs) {
 TEST_CASE("test shapeless compile") {
   {
     auto cfun = compile(compile_shapeless_not_ok, /* shapeless */ true);
-    CHECK_THROWS(cfun({array({1, 2, 3, 4})}));
+    cfun({array({1, 2, 3, 4})});
+    CHECK_THROWS(cfun({array({1, 2, 3, 4, 5})}));
   }
 
   {
@@ -718,4 +763,115 @@ TEST_CASE("test compile strides") {
     eval(out);
     CHECK_EQ(out.strides().size(), 3);
   }
+}
+
+TEST_CASE("test compile change streams") {
+  auto cfun = compile(simple_fun);
+  auto out = cfun({array(1.0f), array(2.0f)})[0];
+  CHECK_EQ(out.primitive().stream(), default_stream(default_device()));
+
+  auto s = new_stream(default_device());
+  StreamContext sctx(s);
+  out = cfun({array(1.0f), array(2.0f)})[0];
+  CHECK_EQ(out.primitive().stream(), s);
+}
+
+TEST_CASE("test compile lambda") {
+  auto fun = [](const std::vector<array>& inputs) {
+    return std::vector<array>{abs(inputs[0])};
+  };
+
+  auto out = compile(fun)({array(-1)});
+  CHECK_EQ(out[0].item<int>(), 1);
+
+  decltype(compile(nullptr)) c_local_fun;
+  {
+    auto local_fun = [](const std::vector<array>& inputs) {
+      return std::vector<array>{abs(inputs[0])};
+    };
+    c_local_fun = compile(local_fun);
+  }
+
+  // This is ok even though local_fun is out of scope
+  out = c_local_fun({array(-1)});
+  CHECK_EQ(out[0].item<int>(), 1);
+
+  {
+    int x = 2;
+    auto local_fun = [x](const std::vector<array>& inputs) {
+      return std::vector<array>{inputs[0] + x};
+    };
+    c_local_fun = compile(local_fun);
+  }
+  // Also ok even though local_fun is out of scope.
+  out = c_local_fun({array(0)});
+  CHECK_EQ(out[0].item<int>(), 2);
+
+  int x = 2;
+  auto fun_with_capture = [&x](const std::vector<array>& inputs) {
+    return std::vector<array>{inputs[0] + x};
+  };
+  auto cfun = compile(fun_with_capture);
+  out = cfun({array(0)});
+  CHECK_EQ(out[0].item<int>(), 2);
+
+  // Doesn't recompile
+  x = 3;
+  out = cfun({array(0)});
+  CHECK_EQ(out[0].item<int>(), 2);
+
+  // Recompiles
+  auto cfun2 = compile(fun_with_capture);
+  out = cfun2({array(0)});
+  CHECK_EQ(out[0].item<int>(), 3);
+}
+
+TEST_CASE("test compile with no-ops") {
+  auto fun = [](const std::vector<array>& inputs) {
+    return std::vector<array>{abs(stop_gradient(abs(inputs[0])))};
+  };
+  auto in = array(1.0);
+  auto out = compile(fun)({in})[0];
+  CHECK_EQ(out.inputs()[0].id(), in.id());
+}
+
+TEST_CASE("test compile random bits") {
+  auto fun = [](const std::vector<array>& inputs) {
+    auto key = inputs[0];
+    auto a = random::bits({32, 32}, 4, key);
+    auto b = random::bits({32, 32}, 2, key);
+    return std::vector<array>{a + b};
+  };
+  auto in = random::key(0);
+  auto expected = fun({in})[0];
+  auto out = compile(fun)({in})[0];
+  CHECK(array_equal(out, expected).item<bool>());
+}
+
+TEST_CASE("test compile throwing first trace does not poison cache") {
+  // A nullary function whose first trace raises. Without rolling the cache
+  // entry back, the second call with matching (empty) inputs would hit a
+  // half-filled entry, skip tracing, and silently return empty outputs.
+  bool should_throw = true;
+  auto fun = [&should_throw](const std::vector<array>& inputs) {
+    if (should_throw) {
+      throw std::runtime_error("trace failure");
+    }
+    return std::vector<array>{array(1.0f) + array(2.0f)};
+  };
+
+  auto cfun = compile(fun);
+
+  // First call: the trace raises and must propagate.
+  CHECK_THROWS_AS(cfun({}), std::runtime_error);
+
+  // Second call: still raising. It must re-trace and raise again rather than
+  // return an empty result from a poisoned cache entry.
+  CHECK_THROWS_AS(cfun({}), std::runtime_error);
+
+  // Once the function stops raising, a retry must trace cleanly and succeed.
+  should_throw = false;
+  auto out = cfun({});
+  REQUIRE_EQ(out.size(), 1);
+  CHECK_EQ(out[0].item<float>(), 3.0f);
 }

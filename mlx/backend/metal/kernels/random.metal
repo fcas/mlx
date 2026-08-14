@@ -34,8 +34,8 @@ rbits threefry2x32_hash(const thread uint2& key, uint2 count) {
 [[kernel]] void rbitsc(
     device const uint32_t* keys,
     device char* out,
-    device const bool& odd,
-    device const uint& bytes_per_key,
+    constant const bool& odd,
+    constant const ulong& bytes_per_key,
     uint2 grid_dim [[threads_per_grid]],
     uint2 index [[thread_position_in_grid]]) {
   auto kidx = 2 * index.x;
@@ -43,20 +43,22 @@ rbits threefry2x32_hash(const thread uint2& key, uint2 count) {
   auto half_size = grid_dim.y - odd;
   out += index.x * bytes_per_key;
   bool drop_last = odd && (index.y == half_size);
-  auto count = uint2(index.y, drop_last ? 0 : index.y + grid_dim.y);
-  auto bits = threefry2x32_hash(key, count);
+  auto bits = threefry2x32_hash(
+      key, uint2(index.y, drop_last ? 0 : index.y + grid_dim.y));
+  size_t idx = size_t(index.y) << 2;
   for (int i = 0; i < 4; ++i) {
-    out[4 * count.x + i] = bits.bytes[0][i];
+    out[idx + i] = bits.bytes[0][i];
   }
   if (!drop_last) {
+    idx = (drop_last ? 0 : size_t(index.y) + grid_dim.y) << 2;
     if ((index.y + 1) == half_size && (bytes_per_key % 4) > 0) {
       int edge_bytes = (bytes_per_key % 4);
       for (int i = 0; i < edge_bytes; ++i) {
-        out[4 * count.y + i] = bits.bytes[1][i];
+        out[idx + i] = bits.bytes[1][i];
       }
     } else {
       for (int i = 0; i < 4; ++i) {
-        out[4 * count.y + i] = bits.bytes[1][i];
+        out[idx + i] = bits.bytes[1][i];
       }
     }
   }
@@ -65,11 +67,11 @@ rbits threefry2x32_hash(const thread uint2& key, uint2 count) {
 [[kernel]] void rbits(
     device const uint32_t* keys,
     device char* out,
-    device const bool& odd,
-    device const uint& bytes_per_key,
-    device const int& ndim,
-    device const int* key_shape,
-    device const size_t* key_strides,
+    constant const bool& odd,
+    constant const ulong& bytes_per_key,
+    constant const int& ndim,
+    constant const int* key_shape,
+    constant const int64_t* key_strides,
     uint2 grid_dim [[threads_per_grid]],
     uint2 index [[thread_position_in_grid]]) {
   auto kidx = 2 * index.x;
@@ -77,22 +79,24 @@ rbits threefry2x32_hash(const thread uint2& key, uint2 count) {
   auto k2_elem = elem_to_loc(kidx + 1, key_shape, key_strides, ndim);
   auto key = uint2(keys[k1_elem], keys[k2_elem]);
   auto half_size = grid_dim.y - odd;
-  out += index.x * bytes_per_key;
+  out += size_t(index.x) * bytes_per_key;
   bool drop_last = odd && (index.y == half_size);
-  auto count = uint2(index.y, drop_last ? 0 : index.y + grid_dim.y);
-  auto bits = threefry2x32_hash(key, count);
+  auto bits = threefry2x32_hash(
+      key, uint2(index.y, drop_last ? 0 : index.y + grid_dim.y));
+  size_t idx = size_t(index.y) << 2;
   for (int i = 0; i < 4; ++i) {
-    out[4 * count.x + i] = bits.bytes[0][i];
+    out[idx + i] = bits.bytes[0][i];
   }
   if (!drop_last) {
+    idx = (drop_last ? 0 : size_t(index.y) + grid_dim.y) << 2;
     if ((index.y + 1) == half_size && (bytes_per_key % 4) > 0) {
       int edge_bytes = (bytes_per_key % 4);
       for (int i = 0; i < edge_bytes; ++i) {
-        out[4 * count.y + i] = bits.bytes[1][i];
+        out[idx + i] = bits.bytes[1][i];
       }
     } else {
       for (int i = 0; i < 4; ++i) {
-        out[4 * count.y + i] = bits.bytes[1][i];
+        out[idx + i] = bits.bytes[1][i];
       }
     }
   }

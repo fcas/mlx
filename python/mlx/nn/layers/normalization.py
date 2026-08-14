@@ -25,7 +25,8 @@ class InstanceNorm(Module):
         affine (bool): Default: ``False``.
 
     Shape:
-      - Input: :math:`(..., C)` where :math:`C` is equal to :attr:`dims`.
+      - Input: :math:`(N, ..., C)` where :math:`C` is equal to :attr:`dims`.
+        The input must have at least 3 dimensions.
       - Output: Same shape as the input.
 
     Examples:
@@ -56,6 +57,11 @@ class InstanceNorm(Module):
         return f"{self.dims}, eps={self.eps}, affine={'weight' in self}"
 
     def __call__(self, x: mx.array) -> mx.array:
+        if x.ndim < 3:
+            raise ValueError(
+                f"InstanceNorm expects inputs with at least 3 dimensions"
+                f" (N, ..., C) but the input has {x.ndim} dimensions."
+            )
         reduction_axes = tuple(range(1, x.ndim - 1))
         # Compute stats
         mean = mx.mean(x, axis=reduction_axes, keepdims=True)
@@ -73,7 +79,7 @@ class LayerNorm(Module):
 
     .. math::
 
-        y = \frac{x - E[x]}{\sqrt{Var[x]} + \epsilon} \gamma + \beta,
+        y = \frac{x - E[x]}{\sqrt{Var[x] + \epsilon}} \gamma + \beta,
 
     where :math:`\gamma` and :math:`\beta` are learned per feature dimension
     parameters initialized at 1 and 0 respectively.
@@ -82,12 +88,13 @@ class LayerNorm(Module):
 
     Args:
         dims (int): The feature dimension of the input to normalize over
-        eps (float): A small additive constant for numerical stability
+        eps (float): A small additive constant for numerical stability.
+            Default: ``1e-5``.
         affine (bool): If True learn an affine transform to apply after the
-            normalization
+            normalization. Default: ``True``.
         bias (bool): If True include a translation to the affine
             transformation. If set to False the transformation is not really affine
-            just scaling.
+            just scaling. Default: ``True``.
     """
 
     def __init__(
@@ -128,7 +135,8 @@ class RMSNorm(Module):
 
     Args:
         dims (int): The feature dimension of the input to normalize over
-        eps (float): A small additive constant for numerical stability
+        eps (float): A small additive constant for numerical stability.
+            Default: ``1e-5``.
     """
 
     def __init__(self, dims: int, eps: float = 1e-5):
@@ -150,7 +158,7 @@ class GroupNorm(Module):
 
     .. math::
 
-        y = \frac{x - E[x]}{\sqrt{Var[x]} + \epsilon} \gamma + \beta,
+        y = \frac{x - E[x]}{\sqrt{Var[x] + \epsilon}} \gamma + \beta,
 
     where :math:`\gamma` and :math:`\beta` are learned per feature dimension
     parameters initialized at 1 and 0 respectively. However, the mean and
@@ -166,11 +174,12 @@ class GroupNorm(Module):
     Args:
         num_groups (int): Number of groups to separate the features into
         dims (int): The feature dimensions of the input to normalize over
-        eps (float): A small additive constant for numerical stability
+        eps (float): A small additive constant for numerical stability.
+            Default: ``1e-5``.
         affine (bool): If True learn an affine transform to apply after the
-            normalization.
+            normalization. Default: ``True``.
         pytorch_compatible (bool): If True perform the group normalization in
-            the same order/grouping as PyTorch.
+            the same order/grouping as PyTorch. Default: ``False``.
     """
 
     def __init__(
@@ -182,6 +191,19 @@ class GroupNorm(Module):
         pytorch_compatible: bool = False,
     ):
         super().__init__()
+        if num_groups <= 0:
+            raise ValueError(
+                f"The number of groups ({num_groups}) must be a positive integer."
+            )
+        if dims <= 0:
+            raise ValueError(
+                f"The number of features ({dims}) must be a positive integer."
+            )
+        if dims % num_groups != 0:
+            raise ValueError(
+                f"The number of features ({dims}) must be evenly divisible"
+                f" by the number of groups ({num_groups})."
+            )
         if affine:
             self.bias = mx.zeros((dims,))
             self.weight = mx.ones((dims,))
@@ -199,18 +221,17 @@ class GroupNorm(Module):
     def _pytorch_compatible_group_norm(self, x):
         num_groups = self.num_groups
         batch, *rest, dims = x.shape
+        group_size = dims // num_groups
 
         # Split into groups
-        x = x.reshape(batch, -1, num_groups, dims // num_groups)
-        x = x.transpose(0, 1, 3, 2).reshape(batch, -1, num_groups)
+        x = x.reshape(batch, -1, num_groups, group_size)
+        x = x.transpose(0, 2, 1, 3).reshape(batch, num_groups, -1)
 
         # Normalize
-        means = mx.mean(x, axis=1, keepdims=True)
-        var = mx.var(x, axis=1, keepdims=True)
-        x = (x - means) * mx.rsqrt(var + self.eps)
-        x = x.reshape(batch, -1, dims // num_groups, num_groups)
-        x = x.transpose(0, 1, 3, 2).reshape(batch, *rest, dims)
+        x = mx.fast.layer_norm(x, eps=self.eps, weight=None, bias=None)
 
+        x = x.reshape(batch, num_groups, -1, group_size)
+        x = x.transpose(0, 2, 1, 3).reshape(batch, *rest, dims)
         return x
 
     def _group_norm(self, x):
@@ -239,13 +260,13 @@ class GroupNorm(Module):
 
 
 class BatchNorm(Module):
-    r"""Applies Batch Normalization over a 2D or 3D input.
+    r"""Applies Batch Normalization over a 2D, 3D or 4D input.
 
     Computes
 
     .. math::
 
-        y = \frac{x - E[x]}{\sqrt{Var[x]} + \epsilon} \gamma + \beta,
+        y = \frac{x - E[x]}{\sqrt{Var[x] + \epsilon}} \gamma + \beta,
 
     where :math:`\gamma` and :math:`\beta` are learned per feature dimension
     parameters initialized at 1 and 0 respectively.
@@ -316,13 +337,14 @@ class BatchNorm(Module):
             f"track_running_stats={self.track_running_stats}"
         )
 
-    def _calc_stats(self, x: mx.array) -> Tuple[mx.array, mx.array]:
+    def _calc_stats(self, x: mx.array, ddof: int = 0) -> Tuple[mx.array, mx.array]:
         """
         Calculate the mean and variance of the input tensor across the batch
         and spatial dimensions.
 
         Args:
             x (array): Input tensor.
+            ddof (int): Delta degrees of freedom for variance.
 
         Returns:
             tuple: Tuple containing mean and variance.
@@ -330,7 +352,7 @@ class BatchNorm(Module):
         reduction_axes = tuple(range(0, x.ndim - 1))
 
         mean = mx.mean(x, axis=reduction_axes)
-        var = mx.var(x, axis=reduction_axes)
+        var = mx.var(x, axis=reduction_axes, ddof=ddof)
 
         return mean, var
 
@@ -349,13 +371,23 @@ class BatchNorm(Module):
                 f"Expected input tensor to have 2, 3 or 4 dimensions, but got {x.ndim}"
             )
 
+        if self.training:
+            stats_size = 1
+            for size in x.shape[:-1]:
+                stats_size *= size
+            if stats_size == 1:
+                raise ValueError(
+                    "BatchNorm training requires more than one value per channel."
+                )
+
         # Calculate the mean and variance used to normalize the input x. If we
         # are in training mode update the running stats if needed.
         mean, var = self._calc_stats(x)
         if self.training and self.track_running_stats:
             mu = self.momentum
+            _, running_var = self._calc_stats(x, ddof=1)
             self.running_mean = (1 - mu) * self.running_mean + mu * mean
-            self.running_var = (1 - mu) * self.running_var + mu * var
+            self.running_var = (1 - mu) * self.running_var + mu * running_var
         elif self.track_running_stats:
             mean = self.running_mean
             var = self.running_var

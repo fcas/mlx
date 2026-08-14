@@ -1,12 +1,12 @@
 // Copyright © 2023-2024 Apple Inc.
-
 #include <algorithm>
 #include <cassert>
 #include <numeric>
-#include <sstream>
 
-#include "mlx/backend/metal/copy.h"
+#include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/gpu/slicing.h"
 #include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/kernels/defines.h"
 #include "mlx/backend/metal/kernels/steel/conv/params.h"
 #include "mlx/backend/metal/matmul.h"
@@ -20,73 +20,127 @@ namespace mlx::core {
 
 namespace {
 
+inline array
+ensure_row_contiguous(const array& x, metal::Device& d, const Stream& s) {
+  if (x.flags().row_contiguous) {
+    return x;
+  }
+  auto result = contiguous_copy_gpu(x, s);
+  metal::get_command_encoder(s).add_temporary(result);
+  return result;
+}
+
+inline int max_unfold_rows(metal::Device& d, size_t row_bytes, int total_rows) {
+  size_t max_buffer = d.mtl_device()->maxBufferLength();
+  size_t max_rows = row_bytes == 0 ? total_rows : max_buffer / row_bytes;
+  // Force a smaller tile (tests, or to bound the unfold buffer further).
+  if (int forced = env::get_var("MLX_CONV_UNFOLD_TILE_ROWS", 0); forced > 0) {
+    max_rows = std::min(max_rows, static_cast<size_t>(forced));
+  }
+  if (max_rows == 0) {
+    std::ostringstream msg;
+    msg << "[conv] A single unfolding row needs " << row_bytes
+        << " bytes, which exceeds the maximum Metal buffer size of "
+        << max_buffer << " bytes.";
+    throw std::runtime_error(msg.str());
+  }
+  return static_cast<int>(std::min(max_rows, static_cast<size_t>(total_rows)));
+}
+
 template <int N>
 void explicit_gemm_conv_ND_gpu(
     const Stream& s,
     metal::Device& d,
     const array& in,
     const array& wt,
-    array out,
+    array& out,
     const MLXConvParams<N>& conv_params) {
   // Get gemm shapes
-  int implicit_M = out.size() / conv_params.O;
-  int implicit_K = wt.size() / conv_params.O;
+  int implicit_M = safe_cast(out.size() / conv_params.O, "conv");
+  int implicit_K = safe_cast(wt.size() / conv_params.O, "conv");
   int implicit_N = conv_params.O;
-  // Prepare unfolding array
-  std::vector<int> unfolded_shape{implicit_M, implicit_K};
-  array in_unfolded(unfolded_shape, in.dtype(), nullptr, {});
-
-  in_unfolded.set_data(allocator::malloc_or_wait(in_unfolded.nbytes()));
-
   // Prepare unfolding kernel
-  std::ostringstream kname;
-  kname << "naive_unfold_nd_" << type_to_name(in_unfolded) << "_" << N;
-  auto& compute_encoder = d.get_command_encoder(s.index);
-  auto kernel = d.get_kernel(kname.str());
-  compute_encoder->setComputePipelineState(kernel);
-
-  compute_encoder.set_input_array(in, 0);
-  compute_encoder.set_output_array(in_unfolded, 1);
-
-  compute_encoder->setBytes(&conv_params, sizeof(conv_params), 2);
-
-  // Launch unfolding kernel
-  int tgp_x = std::min(conv_params.C, 64);
-  tgp_x = 32 * ((tgp_x + 32 - 1) / 32);
-  int tgp_y = 256 / tgp_x;
-
-  MTL::Size group_dims = MTL::Size(tgp_x, tgp_y, 1);
-  MTL::Size grid_dims = MTL::Size(
-      conv_params.C, unfolded_shape[1] / conv_params.C, unfolded_shape[0]);
-
-  compute_encoder.dispatchThreads(grid_dims, group_dims);
+  std::string kname;
+  kname.reserve(32);
+  concatenate(kname, "naive_unfold_nd_", type_to_name(in), "_", N);
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = d.get_kernel(kname);
 
   // Reshape weight
-  std::vector<int> wt_reshape{implicit_K, implicit_N};
-  std::vector<size_t> wt_restride{1, static_cast<size_t>(implicit_K)};
+  Shape wt_reshape{implicit_K, implicit_N};
+  Strides wt_restride{1, implicit_K};
   array wt_reshaped(wt_reshape, wt.dtype(), nullptr, {});
   auto wt_flags = wt.flags();
   wt_flags.row_contiguous = false;
   wt_flags.col_contiguous = true;
   wt_reshaped.copy_shared_buffer(wt, wt_restride, wt_flags, wt.data_size());
 
-  // Perform gemm
-  std::vector<array> copies = {in_unfolded, wt_reshaped};
-  return steel_matmul(
-      s,
-      d,
-      /*a = */ in_unfolded,
-      /*b = */ wt_reshaped,
-      /*c = */ out,
-      /*M = */ implicit_M,
-      /*N = */ implicit_N,
-      /*K = */ implicit_K,
-      /*batch_size_out = */ 1,
-      /*a_cols = */ implicit_K,
-      /*b_cols = */ implicit_K,
-      /*a_transposed = */ false,
-      /*b_transposed = */ true,
-      /*copies = */ copies);
+  // 2D view of the output; each tile writes a row window of it.
+  Strides out_2d_strides{out.strides(-2), out.strides(-1)};
+  array out_2d({implicit_M, implicit_N}, out.dtype(), nullptr, {});
+  out_2d.copy_shared_buffer(out, out_2d_strides, out.flags(), out.data_size());
+
+  // The full unfold buffer can exceed maxBufferLength, so unfold and gemm in
+  // row tiles reusing one buffer, keeping peak memory at a single tile.
+  size_t row_bytes = static_cast<size_t>(implicit_K) * in.itemsize();
+  int max_rows = max_unfold_rows(d, row_bytes, implicit_M);
+
+  array in_unfolded({max_rows, implicit_K}, in.dtype(), nullptr, {});
+  in_unfolded.set_data(allocator::malloc(in_unfolded.nbytes()));
+
+  for (int row_offset = 0; row_offset < implicit_M; row_offset += max_rows) {
+    int tile_rows = std::min(max_rows, implicit_M - row_offset);
+
+    // Tile view of the reused unfold buffer.
+    array in_tile({tile_rows, implicit_K}, in.dtype(), nullptr, {});
+    in_tile.copy_shared_buffer(
+        in_unfolded,
+        in_unfolded.strides(),
+        in_unfolded.flags(),
+        in_tile.size());
+
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(in, 0);
+    compute_encoder.set_output_array(in_tile, 1);
+    compute_encoder.set_bytes(conv_params, 2);
+    compute_encoder.set_bytes(row_offset, 3);
+
+    size_t tgp_x = std::min(conv_params.C, 64);
+    tgp_x = 32 * ((tgp_x + 32 - 1) / 32);
+    size_t tgp_y = 256 / tgp_x;
+
+    MTL::Size grid_dims =
+        MTL::Size(conv_params.C, implicit_K / conv_params.C, tile_rows);
+    MTL::Size group_dims = MTL::Size(
+        std::min(tgp_x, grid_dims.width), std::min(tgp_y, grid_dims.height), 1);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
+
+    // Gemm the tile into its output rows.
+    array out_tile({tile_rows, implicit_N}, out.dtype(), nullptr, {});
+    out_tile.copy_shared_buffer(
+        out_2d,
+        out_2d_strides,
+        out_2d.flags(),
+        out_tile.size(),
+        static_cast<int64_t>(row_offset) * out_2d_strides[0]);
+
+    std::vector<array> copies = {in_tile};
+    steel_matmul(
+        s,
+        d,
+        /*a = */ in_tile,
+        /*b = */ wt_reshaped,
+        /*c = */ out_tile,
+        /*M = */ tile_rows,
+        /*N = */ implicit_N,
+        /*K = */ implicit_K,
+        /*batch_size_out = */ 1,
+        /*a_cols = */ implicit_K,
+        /*b_cols = */ implicit_K,
+        /*a_transposed = */ false,
+        /*b_transposed = */ true,
+        /*copies = */ copies);
+  }
 }
 
 template <int N>
@@ -95,14 +149,14 @@ void explicit_gemm_conv_group_ND_gpu(
     metal::Device& d,
     const array& in,
     const array& wt,
-    array out,
+    array& out,
     const MLXConvParams<N>& conv_params) {
   const int groups = conv_params.groups;
   const int C_per_group = conv_params.C / conv_params.groups;
   const int O_per_group = conv_params.O / conv_params.groups;
   // Get gemm shapes
-  const int implicit_M = out.size() / conv_params.O;
-  const int implicit_K = wt.size() / conv_params.O;
+  const int implicit_M = safe_cast(out.size() / conv_params.O, "conv");
+  const int implicit_K = safe_cast(wt.size() / conv_params.O, "conv");
   const int implicit_N = O_per_group;
 
   int kernel_size = 1;
@@ -110,144 +164,95 @@ void explicit_gemm_conv_group_ND_gpu(
     kernel_size *= conv_params.wS[i];
   }
 
-  // Prepare unfolding array
-  std::vector<int> unfolded_shape{implicit_M, implicit_K * groups};
-  array in_unfolded(unfolded_shape, in.dtype(), nullptr, {});
-  in_unfolded.set_data(allocator::malloc_or_wait(in_unfolded.nbytes()));
-
   // Prepare unfolding kernel
-  std::ostringstream kname;
-  kname << "naive_unfold_transpose_nd_" << type_to_name(in_unfolded) << "_"
-        << N;
-  auto& compute_encoder = d.get_command_encoder(s.index);
-  auto kernel = d.get_kernel(kname.str());
-  compute_encoder->setComputePipelineState(kernel);
-
-  compute_encoder.set_input_array(in, 0);
-  compute_encoder.set_output_array(in_unfolded, 1);
-
-  compute_encoder->setBytes(&conv_params, sizeof(conv_params), 2);
-
-  // Launch unfolding kernel
-  int tgp_x = std::min(conv_params.C, 64);
-  tgp_x = 32 * ((tgp_x + 32 - 1) / 32);
-  int tgp_y = 256 / tgp_x;
-
-  MTL::Size group_dims = MTL::Size(tgp_x, tgp_y, 1);
-  MTL::Size grid_dims = MTL::Size(
-      conv_params.C, unfolded_shape[1] / conv_params.C, unfolded_shape[0]);
-
-  compute_encoder.dispatchThreads(grid_dims, group_dims);
+  std::string kname;
+  kname.reserve(32);
+  concatenate(kname, "naive_unfold_transpose_nd_", type_to_name(in), "_", N);
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = d.get_kernel(kname);
 
   // Transpose kernel weights so that we can slice them by contiguous chunks
   // of channel groups.
   array wt_view(
       {wt.shape(0), C_per_group, kernel_size}, wt.dtype(), nullptr, {});
   wt_view.copy_shared_buffer(
-      wt,
-      {wt.strides(0), 1, static_cast<size_t>(C_per_group)},
-      wt.flags(),
-      wt.size());
+      wt, {wt.strides(0), 1, C_per_group}, wt.flags(), wt.size());
 
   // Materialize
-  auto wt_transpose = array(wt_view.shape(), wt_view.dtype(), nullptr, {});
-  copy_gpu(wt_view, wt_transpose, CopyType::General, s);
+  array wt_transpose = contiguous_copy_gpu(wt_view, s);
 
-  // Perform gemm
-  std::vector<array> copies = {in_unfolded, wt_view, wt_transpose};
-  return steel_matmul_conv_groups(
-      s,
-      d,
-      /*a = */ in_unfolded,
-      /*b = */ wt_transpose,
-      /*c = */ out,
-      /*M = */ implicit_M,
-      /*N = */ implicit_N,
-      /*K = */ implicit_K,
-      /*a_cols = */ implicit_K * groups,
-      /*b_cols = */ implicit_K,
-      /*out_cols = */ implicit_N * groups,
-      /*a_transposed = */ false,
-      /*b_transposed = */ true,
-      /* groups = */ groups,
-      /*copies = */ copies);
-}
+  // 2D view of the output; each tile writes a row window of it.
+  Strides out_2d_strides{out.strides(-2), out.strides(-1)};
+  array out_2d({implicit_M, conv_params.O}, out.dtype(), nullptr, {});
+  out_2d.copy_shared_buffer(out, out_2d_strides, out.flags(), out.data_size());
 
-void conv_1D_gpu(
-    const Stream& s,
-    metal::Device& d,
-    const array& in,
-    const array& wt,
-    array out,
-    const std::vector<int>& padding,
-    const std::vector<int>& wt_strides,
-    const std::vector<int>& wt_dilation,
-    const std::vector<int>& in_dilation,
-    int groups,
-    bool flip) {
-  // Make conv params
-  MLXConvParams<1> conv_params{
-      /* const int  N = */ in.shape(0),
-      /* const int  C = */ in.shape(2),
-      /* const int  O = */ wt.shape(0),
-      /* const int iS[NDIM] = */ {in.shape(1)},
-      /* const int wS[NDIM] = */ {wt.shape(1)},
-      /* const int oS[NDIM] = */ {out.shape(1)},
-      /* const int str[NDIM] = */ {wt_strides[0]},
-      /* const int pad[NDIM] = */ {padding[0]},
-      /* const int kdil[NDIM] = */ {wt_dilation[0]},
-      /* const int idil[NDIM] = */ {in_dilation[0]},
-      /* const size_t in_strides[NDIM + 2] = */
-      {in.strides()[0], in.strides()[1], in.strides()[2]},
-      /* const size_t wt_strides[NDIM + 2] = */
-      {wt.strides()[0], wt.strides()[1], wt.strides()[2]},
-      /* const size_t out_strides[NDIM + 2] = */
-      {out.strides()[0], out.strides()[1], out.strides()[2]},
-      /* const int groups = */ groups,
-      /* const bool flip = */ flip};
+  // The full unfold buffer can exceed maxBufferLength, so unfold and gemm in
+  // row tiles reusing one buffer, keeping peak memory at a single tile.
+  size_t row_bytes = static_cast<size_t>(implicit_K) * groups * in.itemsize();
+  int max_rows = max_unfold_rows(d, row_bytes, implicit_M);
 
-  // Direct to explicit gemm conv
-  if (groups > 1) {
-    return explicit_gemm_conv_group_ND_gpu(s, d, in, wt, out, conv_params);
-  } else {
-    return explicit_gemm_conv_ND_gpu(s, d, in, wt, out, conv_params);
+  array in_unfolded({max_rows, implicit_K * groups}, in.dtype(), nullptr, {});
+  in_unfolded.set_data(allocator::malloc(in_unfolded.nbytes()));
+
+  for (int row_offset = 0; row_offset < implicit_M; row_offset += max_rows) {
+    int tile_rows = std::min(max_rows, implicit_M - row_offset);
+
+    // Tile view of the reused unfold buffer.
+    array in_tile({tile_rows, implicit_K * groups}, in.dtype(), nullptr, {});
+    in_tile.copy_shared_buffer(
+        in_unfolded,
+        in_unfolded.strides(),
+        in_unfolded.flags(),
+        in_tile.size());
+
+    compute_encoder.set_compute_pipeline_state(kernel);
+    compute_encoder.set_input_array(in, 0);
+    compute_encoder.set_output_array(in_tile, 1);
+    compute_encoder.set_bytes(conv_params, 2);
+    compute_encoder.set_bytes(row_offset, 3);
+
+    size_t tgp_x = std::min(conv_params.C, 64);
+    tgp_x = 32 * ((tgp_x + 32 - 1) / 32);
+    size_t tgp_y = 256 / tgp_x;
+
+    MTL::Size grid_dims = MTL::Size(
+        conv_params.C, (implicit_K * groups) / conv_params.C, tile_rows);
+    MTL::Size group_dims = MTL::Size(
+        std::min(tgp_x, grid_dims.width), std::min(tgp_y, grid_dims.height), 1);
+    compute_encoder.dispatch_threads(grid_dims, group_dims);
+
+    // Gemm the tile into its output rows.
+    array out_tile({tile_rows, conv_params.O}, out.dtype(), nullptr, {});
+    out_tile.copy_shared_buffer(
+        out_2d,
+        out_2d_strides,
+        out_2d.flags(),
+        out_tile.size(),
+        static_cast<int64_t>(row_offset) * out_2d_strides[0]);
+
+    std::vector<array> copies = {in_tile, wt_transpose};
+    steel_matmul_regular(
+        /* const Stream& s = */ s,
+        /* Device& d = */ d,
+        /* const array& a = */ in_tile,
+        /* const array& b = */ wt_transpose,
+        /* array& c = */ out_tile,
+        /* int M = */ tile_rows,
+        /* int N = */ implicit_N,
+        /* int K = */ implicit_K,
+        /* int batch_size_out = */ groups,
+        /* int lda = */ implicit_K * groups,
+        /* int ldb = */ implicit_K,
+        /* int ldd = */ implicit_N * groups,
+        /* bool transpose_a = */ false,
+        /* bool transpose_b = */ true,
+        /* std::vector<array>& copies = */ copies,
+        /* Shape batch_shape = */ {1},
+        /* Strides batch_strides = */ {0},
+        /* int64_t A_batch_strides = */ int64_t(implicit_K),
+        /* int64_t B_batch_strides = */ int64_t(implicit_N) * implicit_K,
+        /* int64_t matrix_stride_out = */ int64_t(implicit_N));
   }
-}
-
-void slow_conv_2D_gpu(
-    const Stream& s,
-    metal::Device& d,
-    const array& in,
-    const array& wt,
-    array out,
-    const MLXConvParams<2>& conv_params) {
-  int bm = 16, bn = 8;
-  int tm = 4, tn = 4;
-
-  std::ostringstream kname;
-  kname << "naive_conv_2d_" << type_to_name(out) << "_bm" << bm << "_bn" << bn
-        << "_tm" << tm << "_tn" << tn;
-
-  // Encode and dispatch kernel
-  auto& compute_encoder = d.get_command_encoder(s.index);
-  auto kernel = d.get_kernel(kname.str());
-  compute_encoder->setComputePipelineState(kernel);
-
-  size_t n_pixels = conv_params.oS[0] * conv_params.oS[1];
-
-  size_t grid_dim_x = (n_pixels + (tm * bm) - 1) / (tm * bm);
-  size_t grid_dim_y = (conv_params.O + (tn * bn) - 1) / (tn * bn);
-  size_t grid_dim_z = conv_params.N;
-
-  MTL::Size group_dims = MTL::Size(bm, bn, 1);
-  MTL::Size grid_dims = MTL::Size(grid_dim_x, grid_dim_y, grid_dim_z);
-
-  compute_encoder.set_input_array(in, 0);
-  compute_encoder.set_input_array(wt, 1);
-  compute_encoder.set_output_array(out, 2);
-
-  compute_encoder->setBytes(&conv_params, sizeof(MLXConvParams<2>), 3);
-  compute_encoder.dispatchThreadgroups(grid_dims, group_dims);
 }
 
 void implicit_gemm_conv_2D_gpu(
@@ -255,17 +260,24 @@ void implicit_gemm_conv_2D_gpu(
     metal::Device& d,
     const array& in,
     const array& wt,
-    array out,
+    array& out,
     const MLXConvParams<2>& conv_params) {
+  const int groups = conv_params.groups;
+  const int C_per_group = conv_params.C / conv_params.groups;
+  const int O_per_group = conv_params.O / conv_params.groups;
+
   // Deduce implicit gemm size
-  int implicit_M = conv_params.N * conv_params.oS[0] * conv_params.oS[1];
-  int implicit_N = conv_params.O;
-  int implicit_K = conv_params.wS[0] * conv_params.wS[1] * conv_params.C;
+  const int implicit_M = safe_cast(
+      static_cast<int64_t>(conv_params.N) * conv_params.oS[0] *
+          conv_params.oS[1],
+      "conv");
+  const int implicit_N = O_per_group;
+  const int implicit_K = conv_params.wS[0] * conv_params.wS[1] * C_per_group;
 
   // Determine block and warp tiles
   int wm = 2, wn = 2;
 
-  int bm = implicit_M >= 8192 && conv_params.C >= 64 ? 64 : 32;
+  int bm = implicit_M >= 8192 && C_per_group >= 64 ? 64 : 32;
   int bn = (bm == 64 || implicit_N >= 64) ? 64 : 32;
   int bk = 16;
 
@@ -281,15 +293,15 @@ void implicit_gemm_conv_2D_gpu(
 
   // Fix small channel specialization
   int n_channel_specialization = 0;
-  int channel_k_iters = ((conv_params.C + bk - 1) / bk);
+  int channel_k_iters = ((C_per_group + bk - 1) / bk);
   int gemm_k_iters = conv_params.wS[0] * conv_params.wS[1] * channel_k_iters;
 
-  if (conv_params.C <= 2) {
+  if (C_per_group <= 2) {
     gemm_k_iters = (implicit_K + bk - 1) / bk;
-    n_channel_specialization = conv_params.C;
-  } else if (conv_params.C <= 4) {
+    n_channel_specialization = C_per_group;
+  } else if (C_per_group <= 4) {
     gemm_k_iters = ((conv_params.wS[0] * conv_params.wS[1] * 4) + bk - 1) / bk;
-    n_channel_specialization = conv_params.C;
+    n_channel_specialization = C_per_group;
   }
 
   bool small_filter = (!n_channel_specialization) &&
@@ -322,17 +334,41 @@ void implicit_gemm_conv_2D_gpu(
       /* const int swizzle_log = */ swizzle_log};
 
   // Determine kernel
-  std::ostringstream kname;
-  kname << "implicit_gemm_conv_2d_" << type_to_name(out) << "_bm" << bm << "_bn"
-        << bn << "_bk" << bk << "_wm" << wm << "_wn" << wn << "_channel_"
-        << (n_channel_specialization ? std::to_string(n_channel_specialization)
-                                     : "l")
-        << "_filter_" << (small_filter ? 's' : 'l');
+  std::string kname;
+  kname.reserve(64);
+  concatenate(
+      kname,
+      "implicit_gemm_conv_2d_",
+      type_to_name(out),
+      "_bm",
+      bm,
+      "_bn",
+      bn,
+      "_bk",
+      bk,
+      "_wm",
+      wm,
+      "_wn",
+      wn,
+      "_channel_",
+      n_channel_specialization ? std::to_string(n_channel_specialization) : "l",
+      "_filter_",
+      small_filter ? 's' : 'l');
 
   // Encode and dispatch kernel
-  auto& compute_encoder = d.get_command_encoder(s.index);
-  auto kernel = d.get_kernel(kname.str());
-  compute_encoder->setComputePipelineState(kernel);
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = get_steel_conv_kernel(
+      d,
+      kname,
+      out,
+      bm,
+      bn,
+      bk,
+      wm,
+      wn,
+      n_channel_specialization,
+      small_filter);
+  compute_encoder.set_compute_pipeline_state(kernel);
 
   // Deduce grid launch dimensions
   int tile = 1 << swizzle_log;
@@ -340,7 +376,7 @@ void implicit_gemm_conv_2D_gpu(
   size_t grid_dim_x = tn * tile;
 
   MTL::Size group_dims = MTL::Size(32, wn, wm);
-  MTL::Size grid_dims = MTL::Size(grid_dim_x, grid_dim_y, 1);
+  MTL::Size grid_dims = MTL::Size(grid_dim_x, grid_dim_y, groups);
 
   // Encode arrays
   compute_encoder.set_input_array(in, 0);
@@ -348,11 +384,11 @@ void implicit_gemm_conv_2D_gpu(
   compute_encoder.set_output_array(out, 2);
 
   // Encode params
-  compute_encoder->setBytes(&conv_params, sizeof(MLXConvParams<2>), 3);
-  compute_encoder->setBytes(&gemm_params, sizeof(ImplicitGemmConv2DParams), 4);
+  compute_encoder.set_bytes(conv_params, 3);
+  compute_encoder.set_bytes(gemm_params, 4);
 
   // Launch kernel
-  compute_encoder.dispatchThreadgroups(grid_dims, group_dims);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
 void implicit_gemm_conv_2D_general_gpu(
@@ -360,10 +396,13 @@ void implicit_gemm_conv_2D_general_gpu(
     metal::Device& d,
     const array& in,
     const array& wt,
-    array out,
+    array& out,
     const MLXConvParams<2>& conv_params) {
   // Deduce implicit gemm size
-  int implicit_M = conv_params.N * conv_params.oS[0] * conv_params.oS[1];
+  int implicit_M = safe_cast(
+      static_cast<int64_t>(conv_params.N) * conv_params.oS[0] *
+          conv_params.oS[1],
+      "conv");
   int implicit_N = conv_params.O;
   int implicit_K = conv_params.wS[0] * conv_params.wS[1] * conv_params.C;
 
@@ -450,6 +489,7 @@ void implicit_gemm_conv_2D_general_gpu(
   // Get channel iteration info
   int channel_k_iters = ((conv_params.C + bk - 1) / bk);
   int gemm_k_iters = channel_k_iters;
+  bool align_C = conv_params.C % bk == 0;
 
   // Fix host side helper params
   int sign = (conv_params.flip ? -1 : 1);
@@ -478,14 +518,34 @@ void implicit_gemm_conv_2D_general_gpu(
       /* const int swizzle_log = */ swizzle_log};
 
   // Determine kernel
-  std::ostringstream kname;
-  kname << "implicit_gemm_conv_2d_general_" << type_to_name(out) << "_bm" << bm
-        << "_bn" << bn << "_bk" << bk << "_wm" << wm << "_wn" << wn;
+  std::string kname;
+  kname.reserve(64);
+  concatenate(
+      kname,
+      "implicit_gemm_conv_2d_general_",
+      type_to_name(out),
+      "_bm",
+      bm,
+      "_bn",
+      bn,
+      "_bk",
+      bk,
+      "_wm",
+      wm,
+      "_wn",
+      wn);
+  std::string hash_name;
+  hash_name.reserve(64);
+  concatenate(hash_name, kname, "_alC_", align_C);
+  metal::MTLFCList func_consts = {
+      {&align_C, MTL::DataType::DataTypeBool, 200},
+  };
 
   // Encode and dispatch kernel
-  auto& compute_encoder = d.get_command_encoder(s.index);
-  auto kernel = d.get_kernel(kname.str());
-  compute_encoder->setComputePipelineState(kernel);
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = get_steel_conv_general_kernel(
+      d, kname, hash_name, func_consts, out, bm, bn, bk, wm, wn);
+  compute_encoder.set_compute_pipeline_state(kernel);
 
   // Deduce grid launch dimensions
   int tile = 1 << swizzle_log;
@@ -502,17 +562,228 @@ void implicit_gemm_conv_2D_general_gpu(
   compute_encoder.set_output_array(out, 2);
 
   // Encode params
-  compute_encoder->setBytes(&conv_params, sizeof(MLXConvParams<2>), 3);
-  compute_encoder->setBytes(&gemm_params, sizeof(ImplicitGemmConv2DParams), 4);
-  compute_encoder->setBytes(&jump_params, sizeof(Conv2DGeneralJumpParams), 5);
+  compute_encoder.set_bytes(conv_params, 3);
+  compute_encoder.set_bytes(gemm_params, 4);
+  compute_encoder.set_bytes(jump_params, 5);
 
-  compute_encoder->setBytes(
-      base_h.data(), sizeof(Conv2DGeneralBaseInfo) * base_h.size(), 6);
-  compute_encoder->setBytes(
-      base_w.data(), sizeof(Conv2DGeneralBaseInfo) * base_w.size(), 7);
+  compute_encoder.set_vector_bytes(base_h, 6);
+  compute_encoder.set_vector_bytes(base_w, 7);
 
   // Launch kernel
-  compute_encoder.dispatchThreadgroups(grid_dims, group_dims);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void implicit_gemm_conv_3D_gpu(
+    const Stream& s,
+    metal::Device& d,
+    const array& in,
+    const array& wt,
+    array& out,
+    const MLXConvParams<3>& conv_params) {
+  const int groups = conv_params.groups;
+  const int C_per_group = conv_params.C / conv_params.groups;
+  const int O_per_group = conv_params.O / conv_params.groups;
+
+  // Deduce implicit gemm size
+  const int implicit_M = safe_cast(
+      static_cast<int64_t>(conv_params.N) * conv_params.oS[0] *
+          conv_params.oS[1] * conv_params.oS[2],
+      "conv");
+  const int implicit_N = O_per_group;
+  const int implicit_K =
+      conv_params.wS[0] * conv_params.wS[1] * conv_params.wS[2] * C_per_group;
+
+  // Determine block and warp tiles
+  int wm = 2, wn = 2;
+
+  int bm = implicit_M >= 8192 && C_per_group >= 64 ? 64 : 32;
+  int bn = (bm == 64 || implicit_N >= 64) ? 64 : 32;
+  int bk = 16;
+
+  if (implicit_N <= 16) {
+    bn = 8;
+    wm = 4;
+    wn = 1;
+  }
+
+  int tn = (implicit_N + bn - 1) / bn;
+  int tm = (implicit_M + bm - 1) / bm;
+  int swizzle_log = 0;
+
+  bool small_filter =
+      (conv_params.wS[0] <= 16 && conv_params.wS[1] <= 16 &&
+       conv_params.wS[2] <= 16);
+
+  int channel_k_iters = ((C_per_group + bk - 1) / bk);
+  int gemm_k_iters = conv_params.wS[0] * conv_params.wS[1] * conv_params.wS[2] *
+      channel_k_iters;
+
+  // Fix host side helper params
+  int sign = (conv_params.flip ? -1 : 1);
+  int ijw = conv_params.in_strides[3] * conv_params.kdil[2];
+  int ijh = conv_params.in_strides[2] * conv_params.kdil[1];
+  int ijd = conv_params.in_strides[1] * conv_params.kdil[0];
+
+  int inp_jump_w = sign * ijw;
+  int inp_jump_h = sign * (ijh - (conv_params.wS[2] - 1) * ijw);
+  int inp_jump_d = sign *
+      (ijd - (conv_params.wS[1] - 1) * ijh - (conv_params.wS[2] - 1) * ijw);
+  int inp_jump_c = bk - sign * (conv_params.wS[0] - 1) * ijd -
+      sign * (conv_params.wS[1] - 1) * ijh -
+      sign * (conv_params.wS[2] - 1) * ijw;
+
+  // Build implicit gemm params
+  ImplicitGemmConv3DParams gemm_params{
+      /* const int M = */ implicit_M,
+      /* const int N = */ implicit_N,
+      /* const int K = */ implicit_K,
+
+      /* const int gemm_k_iterations = */ gemm_k_iters,
+
+      /* const int inp_jump_w = */ inp_jump_w,
+      /* const int inp_jump_h = */ inp_jump_h,
+      /* const int inp_jump_d = */ inp_jump_d,
+      /* const int inp_jump_c = */ inp_jump_c,
+
+      /* const int tiles_n = */ tn,
+      /* const int tiles_m = */ tm,
+      /* const int swizzle_log = */ swizzle_log};
+
+  // Determine kernel
+  std::string kname;
+  kname.reserve(64);
+  concatenate(
+      kname,
+      "implicit_gemm_conv_3d_",
+      type_to_name(out),
+      "_bm",
+      bm,
+      "_bn",
+      bn,
+      "_bk",
+      bk,
+      "_wm",
+      wm,
+      "_wn",
+      wn,
+      "_filter_",
+      small_filter ? 's' : 'l');
+
+  // Encode and dispatch kernel
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel =
+      get_steel_conv_3d_kernel(d, kname, out, bm, bn, bk, wm, wn, small_filter);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  // Deduce grid launch dimensions
+  int tile = 1 << swizzle_log;
+  size_t grid_dim_y = (tm + tile - 1) / tile;
+  size_t grid_dim_x = tn * tile;
+
+  MTL::Size group_dims = MTL::Size(32, wn, wm);
+  MTL::Size grid_dims = MTL::Size(grid_dim_x, grid_dim_y, groups);
+
+  // Encode arrays
+  compute_encoder.set_input_array(in, 0);
+  compute_encoder.set_input_array(wt, 1);
+  compute_encoder.set_output_array(out, 2);
+
+  // Encode params
+  compute_encoder.set_bytes(conv_params, 3);
+  compute_encoder.set_bytes(gemm_params, 4);
+
+  // Launch kernel
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void pad_and_slice_conv_3D_gpu(
+    const Stream& s,
+    metal::Device& d,
+    const array& in_pre,
+    const array& wt_pre,
+    array& out,
+    const MLXConvParams<3>& conv_params) {
+  // For now assume conv_params.groups == 1
+  int extra_c = ((conv_params.C + 15) / 16) * 16 - conv_params.C;
+  int extra_o = ((conv_params.O + 15) / 16) * 16 - conv_params.O;
+
+  // Pad function
+  auto pad_array = [&](const array& x, int pad_ax_first, int pad_ax_last) {
+    if (pad_ax_first == 0 && pad_ax_last == 0) {
+      return ensure_row_contiguous(x, d, s);
+    }
+
+    auto xshape = x.shape();
+    xshape.front() += pad_ax_first;
+    xshape.back() += pad_ax_last;
+    array x_copy(xshape, x.dtype(), nullptr, {});
+    array zero(0, x.dtype());
+    pad_gpu(x, zero, x_copy, {0, -1}, {0, 0}, s);
+    metal::get_command_encoder(s).add_temporary(x_copy);
+
+    return x_copy;
+  };
+
+  // Allocate space for the intermediate output. Don't save it as a temporary
+  // since it will be sliced to the output so they share the buffer.
+  auto oshape = out.shape();
+  oshape.back() += extra_o;
+  array intermediate(oshape, out.dtype(), nullptr, {});
+  intermediate.set_data(allocator::malloc(intermediate.nbytes()));
+
+  // Actually pad and conv
+  array in = pad_array(in_pre, 0, extra_c);
+  array wt = pad_array(wt_pre, extra_o, extra_c);
+  auto new_params =
+      MLXConvParams<3>::with_padded_channels(conv_params, extra_o, extra_c);
+  implicit_gemm_conv_3D_gpu(s, d, in, wt, intermediate, new_params);
+
+  // Slice out
+  out.copy_shared_buffer(
+      intermediate, intermediate.strides(), {0}, intermediate.data_size());
+}
+
+void dispatch_conv_3D_gpu(
+    const Stream& s,
+    metal::Device& d,
+    const array& in_pre,
+    const array& wt_pre,
+    array& out,
+    const MLXConvParams<3>& conv_params,
+    std::vector<array>& copies) {
+  bool is_idil_one = conv_params.idil[0] == 1 && conv_params.idil[1] == 1 &&
+      conv_params.idil[2] == 1;
+  const int C_per_group = conv_params.C / conv_params.groups;
+  const int O_per_group = conv_params.O / conv_params.groups;
+
+  bool mod16_channels =
+      C_per_group % 16 == 0 && (O_per_group <= 16 || O_per_group % 16 == 0);
+
+  // Check if we can do implicit gemm but the channels are not divisible by 16
+  // so we can pad and slice.
+  //
+  // We check it first because it doesn't need contiguous inputs and it needs
+  // different output allocation.
+  if (is_idil_one && !mod16_channels && conv_params.groups == 1) {
+    return pad_and_slice_conv_3D_gpu(s, d, in_pre, wt_pre, out, conv_params);
+  }
+
+  // Allocate the output and ensure contiguous inputs
+  out.set_data(allocator::malloc(out.nbytes()));
+  auto in = ensure_row_contiguous(in_pre, d, s);
+  auto wt = ensure_row_contiguous(wt_pre, d, s);
+
+  // Perform the implicit gemm
+  if (is_idil_one && mod16_channels) {
+    return implicit_gemm_conv_3D_gpu(s, d, in, wt, out, conv_params);
+  }
+
+  // Explicit gemms where we unfold and do a matmul
+  // (separate one for groups > 1)
+  if (conv_params.groups > 1) {
+    return explicit_gemm_conv_group_ND_gpu(s, d, in, wt, out, conv_params);
+  }
+  return explicit_gemm_conv_ND_gpu(s, d, in, wt, out, conv_params);
 }
 
 void winograd_conv_2D_gpu(
@@ -520,10 +791,10 @@ void winograd_conv_2D_gpu(
     metal::Device& d,
     const array& in,
     const array& wt,
-    array out,
+    array& out,
     const MLXConvParams<2>& conv_params,
     std::vector<array>& copies_w) {
-  std::vector<int> padded_shape = {
+  Shape padded_shape = {
       conv_params.N,
       conv_params.iS[0] + 2 * conv_params.pad[0],
       conv_params.iS[1] + 2 * conv_params.pad[1],
@@ -532,11 +803,11 @@ void winograd_conv_2D_gpu(
   padded_shape[1] = 6 * ((padded_shape[1] - 2 + 5) / 6) + 2;
   padded_shape[2] = 6 * ((padded_shape[2] - 2 + 5) / 6) + 2;
 
-  array in_padded(padded_shape, in.dtype(), nullptr, {});
+  array in_padded(std::move(padded_shape), in.dtype(), nullptr, {});
 
   // Fill with zeros
   array zero_arr = array(0, in.dtype());
-  copy_gpu(zero_arr, in_padded, CopyType::Scalar, s);
+  fill_gpu(zero_arr, in_padded, s);
   copies_w.push_back(zero_arr);
 
   // Pick input slice from padded
@@ -555,15 +826,18 @@ void winograd_conv_2D_gpu(
 
   copies_w.push_back(in_padded_slice);
   copies_w.push_back(in_padded);
-  copies_w.push_back(zero_arr);
 
   MLXConvParams<2> conv_params_updated{
-      /* const int  N = */ in_padded.shape(0),
-      /* const int  C = */ in_padded.shape(3),
-      /* const int  O = */ wt.shape(0),
-      /* const int iS[NDIM] = */ {in_padded.shape(1), in_padded.shape(2)},
-      /* const int wS[NDIM] = */ {wt.shape(1), wt.shape(2)},
-      /* const int oS[NDIM] = */ {out.shape(1), out.shape(2)},
+      /* const int  N = */ static_cast<int>(in_padded.shape(0)),
+      /* const int  C = */ static_cast<int>(in_padded.shape(3)),
+      /* const int  O = */ static_cast<int>(wt.shape(0)),
+      /* const int iS[NDIM] = */
+      {static_cast<int>(in_padded.shape(1)),
+       static_cast<int>(in_padded.shape(2))},
+      /* const int wS[NDIM] = */
+      {static_cast<int>(wt.shape(1)), static_cast<int>(wt.shape(2))},
+      /* const int oS[NDIM] = */
+      {static_cast<int>(out.shape(1)), static_cast<int>(out.shape(2))},
       /* const int str[NDIM] = */ {1, 1},
       /* const int pad[NDIM] = */ {0, 0},
       /* const int kdil[NDIM] = */ {1, 1},
@@ -590,64 +864,73 @@ void winograd_conv_2D_gpu(
   int N_tiles = N_tiles_n * N_tiles_h * N_tiles_w;
 
   // Do filter transform
-  std::vector<int> filt_wg_shape = {8 * 8, conv_params.C, conv_params.O};
-  array filt_wg(filt_wg_shape, wt.dtype(), nullptr, {});
-  filt_wg.set_data(allocator::malloc_or_wait(filt_wg.nbytes()));
+  Shape filt_wg_shape = {8 * 8, conv_params.C, conv_params.O};
+  array filt_wg(std::move(filt_wg_shape), wt.dtype(), nullptr, {});
+  filt_wg.set_data(allocator::malloc(filt_wg.nbytes()));
   copies_w.push_back(filt_wg);
   {
     int bc = 32;
     int bo = 4;
-    std::ostringstream kname;
-    kname << "winograd_conv_2d_weight_transform_" << type_to_name(out) << "_bc"
-          << bc;
-    auto& compute_encoder = d.get_command_encoder(s.index);
-    auto kernel = d.get_kernel(kname.str());
-    compute_encoder->setComputePipelineState(kernel);
+    std::string kname;
+    kname.reserve(32);
+    concatenate(
+        kname,
+        "winograd_conv_2d_weight_transform_",
+        type_to_name(out),
+        "_bc",
+        bc);
+    auto& compute_encoder = metal::get_command_encoder(s);
+    auto kernel = d.get_kernel(kname);
+    compute_encoder.set_compute_pipeline_state(kernel);
 
     compute_encoder.set_input_array(wt, 0);
     compute_encoder.set_output_array(filt_wg, 1);
 
-    compute_encoder->setBytes(&C_c, sizeof(int), 2);
-    compute_encoder->setBytes(&O_c, sizeof(int), 3);
+    compute_encoder.set_bytes(C_c, 2);
+    compute_encoder.set_bytes(O_c, 3);
 
     MTL::Size group_dims = MTL::Size(32, bo, 1);
     MTL::Size grid_dims = MTL::Size(O_c / bo, 1, 1);
 
-    compute_encoder.dispatchThreadgroups(grid_dims, group_dims);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
   }
 
   // Do input transform
-  std::vector<int> inp_wg_shape = {8 * 8, N_tiles, conv_params.C};
-  array inp_wg(inp_wg_shape, in.dtype(), nullptr, {});
-  inp_wg.set_data(allocator::malloc_or_wait(inp_wg.nbytes()));
+  Shape inp_wg_shape = {8 * 8, N_tiles, conv_params.C};
+  array inp_wg(std::move(inp_wg_shape), in.dtype(), nullptr, {});
+  inp_wg.set_data(allocator::malloc(inp_wg.nbytes()));
   copies_w.push_back(inp_wg);
   {
     int bc = 32;
     int wm = 2;
     int wn = 2;
-    std::ostringstream kname;
-    kname << "winograd_conv_2d_input_transform_" << type_to_name(out) << "_bc"
-          << bc;
-    auto& compute_encoder = d.get_command_encoder(s.index);
-    auto kernel = d.get_kernel(kname.str());
-    compute_encoder->setComputePipelineState(kernel);
+    std::string kname;
+    kname.reserve(32);
+    concatenate(
+        kname,
+        "winograd_conv_2d_input_transform_",
+        type_to_name(out),
+        "_bc",
+        bc);
+    auto& compute_encoder = metal::get_command_encoder(s);
+    auto kernel = d.get_kernel(kname);
+    compute_encoder.set_compute_pipeline_state(kernel);
 
     compute_encoder.set_input_array(in_padded, 0);
     compute_encoder.set_output_array(inp_wg, 1);
 
-    compute_encoder->setBytes(
-        &conv_params_updated, sizeof(MLXConvParams<2>), 2);
+    compute_encoder.set_bytes(conv_params_updated, 2);
 
     MTL::Size group_dims = MTL::Size(32, wn, wm);
     MTL::Size grid_dims = MTL::Size(N_tiles_w, N_tiles_h, N_tiles_n);
 
-    compute_encoder.dispatchThreadgroups(grid_dims, group_dims);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
   }
 
   // Do batched gemm
-  std::vector<int> out_wg_shape = {8 * 8, N_tiles, conv_params.O};
-  array out_wg(out_wg_shape, in.dtype(), nullptr, {});
-  out_wg.set_data(allocator::malloc_or_wait(out_wg.nbytes()));
+  Shape out_wg_shape = {8 * 8, N_tiles, conv_params.O};
+  array out_wg(std::move(out_wg_shape), in.dtype(), nullptr, {});
+  out_wg.set_data(allocator::malloc(out_wg.nbytes()));
   copies_w.push_back(out_wg);
   {
     std::vector<array> empty_copies;
@@ -673,83 +956,194 @@ void winograd_conv_2D_gpu(
     int bc = 32;
     int wm = 2;
     int wn = 2;
-    std::ostringstream kname;
-    kname << "winograd_conv_2d_output_transform_" << type_to_name(out) << "_bo"
-          << bc;
-    auto& compute_encoder = d.get_command_encoder(s.index);
-    auto kernel = d.get_kernel(kname.str());
-    compute_encoder->setComputePipelineState(kernel);
+    std::string kname;
+    kname.reserve(32);
+    concatenate(
+        kname,
+        "winograd_conv_2d_output_transform_",
+        type_to_name(out),
+        "_bo",
+        bc);
+    auto& compute_encoder = metal::get_command_encoder(s);
+    auto kernel = d.get_kernel(kname);
+    compute_encoder.set_compute_pipeline_state(kernel);
 
     compute_encoder.set_input_array(out_wg, 0);
     compute_encoder.set_output_array(out, 1);
 
-    compute_encoder->setBytes(
-        &conv_params_updated, sizeof(MLXConvParams<2>), 2);
+    compute_encoder.set_bytes(conv_params_updated, 2);
 
     MTL::Size group_dims = MTL::Size(32, wn, wm);
     MTL::Size grid_dims = MTL::Size(N_tiles_w, N_tiles_h, N_tiles_n);
 
-    compute_encoder.dispatchThreadgroups(grid_dims, group_dims);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
   }
 }
 
-void conv_2D_gpu(
+void depthwise_conv_2D_gpu(
     const Stream& s,
     metal::Device& d,
     const array& in,
     const array& wt,
-    array out,
-    const std::vector<int>& padding,
-    const std::vector<int>& wt_strides,
-    const std::vector<int>& wt_dilation,
-    const std::vector<int>& in_dilation,
-    bool flip,
-    std::vector<array>& copies) {
-  // Make conv params
-  MLXConvParams<2> conv_params{
-      /* const int  N = */ in.shape(0),
-      /* const int  C = */ in.shape(3),
-      /* const int  O = */ wt.shape(0),
-      /* const int iS[NDIM] = */ {in.shape(1), in.shape(2)},
-      /* const int wS[NDIM] = */ {wt.shape(1), wt.shape(2)},
-      /* const int oS[NDIM] = */ {out.shape(1), out.shape(2)},
-      /* const int str[NDIM] = */ {wt_strides[0], wt_strides[1]},
-      /* const int pad[NDIM] = */ {padding[0], padding[1]},
-      /* const int kdil[NDIM] = */ {wt_dilation[0], wt_dilation[1]},
-      /* const int idil[NDIM] = */ {in_dilation[0], in_dilation[1]},
-      /* const size_t in_strides[NDIM + 2] = */
-      {in.strides()[0], in.strides()[1], in.strides()[2], in.strides()[3]},
-      /* const size_t wt_strides[NDIM + 2] = */
-      {wt.strides()[0], wt.strides()[1], wt.strides()[2], wt.strides()[3]},
-      /* const size_t out_strides[NDIM + 2] = */
-      {out.strides()[0], out.strides()[1], out.strides()[2], out.strides()[3]},
-      /* const int groups = */ 1,
-      /* const bool flip = */ flip,
+    array& out,
+    const MLXConvParams<2>& conv_params) {
+  std::string base_name;
+  base_name.reserve(32);
+  concatenate(base_name, "depthwise_conv_2d_", type_to_name(out));
+
+  const int N = conv_params.N;
+  const int ker_h = conv_params.wS[0];
+  const int ker_w = conv_params.wS[1];
+  const int str_h = conv_params.str[0];
+  const int str_w = conv_params.str[1];
+  const int tc = 8;
+  const int tw = 8;
+  const int th = 4;
+  const bool do_flip = conv_params.flip;
+
+  metal::MTLFCList func_consts = {
+      {&ker_h, MTL::DataType::DataTypeInt, 00},
+      {&ker_w, MTL::DataType::DataTypeInt, 01},
+      {&str_h, MTL::DataType::DataTypeInt, 10},
+      {&str_w, MTL::DataType::DataTypeInt, 11},
+      {&th, MTL::DataType::DataTypeInt, 100},
+      {&tw, MTL::DataType::DataTypeInt, 101},
+      {&do_flip, MTL::DataType::DataTypeBool, 200},
   };
 
+  // clang-format off
+  std::string hash_name;
+  hash_name.reserve(64);
+  concatenate(
+      hash_name,
+      base_name,
+  "_ker_h_", ker_h,
+  "_ker_w_", ker_w,
+  "_str_h_", str_h,
+  "_str_w_", str_w,
+  "_tgp_h_", th,
+  "_tgp_w_", tw,
+  "_do_flip_", do_flip ? 't' : 'n'); // clang-format on
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = d.get_kernel(base_name, hash_name, func_consts);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  compute_encoder.set_input_array(in, 0);
+  compute_encoder.set_input_array(wt, 1);
+  compute_encoder.set_output_array(out, 2);
+
+  compute_encoder.set_bytes(conv_params, 3);
+
+  MTL::Size group_dims = MTL::Size(tc, tw, th);
+  MTL::Size grid_dims = MTL::Size(
+      conv_params.C / tc,
+      (conv_params.oS[1] + tw - 1) / tw,
+      ((conv_params.oS[0] + th - 1) / th) * N);
+
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void pad_in_channels_conv_2D_gpu(
+    const Stream& s,
+    metal::Device& d,
+    const array& in_pre,
+    const array& wt_pre,
+    array& out,
+    const MLXConvParams<2>& conv_params) {
+  // Only the input channels are padded, so the kernel writes straight into out
+  // and the output stays contiguous. Assumes conv_params.groups == 1.
+  int extra_c = ((conv_params.C + 15) / 16) * 16 - conv_params.C;
+
+  // Pad function
+  auto pad_array = [&](const array& x) {
+    auto xshape = x.shape();
+    xshape.back() += extra_c;
+    array x_copy(xshape, x.dtype(), nullptr, {});
+    array zero(0, x.dtype());
+    pad_gpu(x, zero, x_copy, {-1}, {0}, s);
+    metal::get_command_encoder(s).add_temporary(x_copy);
+
+    return x_copy;
+  };
+
+  array in = pad_array(in_pre);
+  array wt = pad_array(wt_pre);
+  auto new_params =
+      MLXConvParams<2>::with_padded_channels(conv_params, 0, extra_c);
+  implicit_gemm_conv_2D_gpu(s, d, in, wt, out, new_params);
+}
+
+void dispatch_conv_2D_gpu(
+    const Stream& s,
+    metal::Device& d,
+    const array& in,
+    const array& wt,
+    array& out,
+    const MLXConvParams<2>& conv_params,
+    std::vector<array>& copies) {
   bool is_stride_one = conv_params.str[0] == 1 && conv_params.str[1] == 1;
   bool is_kdil_one = conv_params.kdil[0] == 1 && conv_params.kdil[1] == 1;
   bool is_idil_one = conv_params.idil[0] == 1 && conv_params.idil[1] == 1;
 
-  bool inp_large = (conv_params.in_strides[0] >= 1ul << 18);
-  bool channels_large = (conv_params.C + conv_params.O) >= 512;
-  bool channels_med = (conv_params.C + conv_params.O) >= 256;
+  if (conv_params.groups > 1) {
+    const int C_per_group = conv_params.C / conv_params.groups;
+    const int O_per_group = conv_params.O / conv_params.groups;
+
+    if (!is_idil_one) {
+      return explicit_gemm_conv_group_ND_gpu(s, d, in, wt, out, conv_params);
+    }
+
+    if (C_per_group == 1 && O_per_group == 1 && is_kdil_one &&
+        conv_params.wS[0] <= 7 && conv_params.wS[1] <= 7 &&
+        conv_params.str[0] <= 2 && conv_params.str[1] <= 2 &&
+        conv_params.wt_strides[1] == conv_params.wS[1] &&
+        conv_params.C % 16 == 0 && conv_params.C == conv_params.O) {
+      return depthwise_conv_2D_gpu(s, d, in, wt, out, conv_params);
+    }
+
+    if ((C_per_group <= 4 || C_per_group % 16 == 0) &&
+        (O_per_group <= 16 || O_per_group % 16 == 0)) {
+      return implicit_gemm_conv_2D_gpu(s, d, in, wt, out, conv_params);
+    } else {
+      return explicit_gemm_conv_group_ND_gpu(s, d, in, wt, out, conv_params);
+    }
+  }
 
   // Direct to winograd conv
-  if (!flip && is_stride_one && is_kdil_one && is_idil_one &&
+  bool inp_large = (static_cast<int64_t>(conv_params.N) * conv_params.iS[0] *
+                    conv_params.iS[1]) >= 4096;
+  bool channels_large = (conv_params.C + conv_params.O) >= 256;
+  bool out_large = (static_cast<int64_t>(conv_params.N) * conv_params.oS[0] *
+                    conv_params.oS[1]) >= 256;
+  if (!conv_params.flip && is_stride_one && is_kdil_one && is_idil_one &&
       conv_params.wS[0] == 3 && conv_params.wS[1] == 3 &&
-      conv_params.C % 32 == 0 && conv_params.O % 32 == 0 &&
-      (channels_large || (channels_med && inp_large))) {
+      conv_params.C % 32 == 0 && conv_params.O % 32 == 0 && inp_large &&
+      channels_large) {
     return winograd_conv_2D_gpu(s, d, in, wt, out, conv_params, copies);
   }
 
+  // Whether the specialized implicit gemm kernel can take the channels as-is.
+  bool specialized_channels = (conv_params.C <= 4 || conv_params.C % 16 == 0) &&
+      (conv_params.O <= 16 || conv_params.O % 16 == 0);
+
+  // Pad the input channels up to a multiple of 16 to use the faster specialized
+  // kernel instead of the general one. Only worth the padded work for stride-1
+  // convs with a large enough output and kernel, and only when the output
+  // channels are already aligned so the kernel writes contiguously into out
+  // (padding those too needs a copy that can cost more than the kernel saves).
+  bool out_channels_aligned = conv_params.O <= 16 || conv_params.O % 16 == 0;
+  if (is_idil_one && is_stride_one && out_large && !specialized_channels &&
+      out_channels_aligned && (conv_params.wS[0] * conv_params.wS[1]) >= 9) {
+    return pad_in_channels_conv_2D_gpu(s, d, in, wt, out, conv_params);
+  }
+
   // Direct to implicit gemm conv
-  if (is_idil_one && (conv_params.C <= 4 || conv_params.C % 16 == 0) &&
-      (conv_params.O <= 16 || conv_params.O % 16 == 0)) {
+  if (is_idil_one && specialized_channels) {
     return implicit_gemm_conv_2D_gpu(s, d, in, wt, out, conv_params);
   }
 
-  else if (conv_params.C % 16 == 0 && conv_params.O % 16 == 0) {
+  else if ((conv_params.C % 16 == 0 && conv_params.O % 16 == 0) || out_large) {
     return implicit_gemm_conv_2D_general_gpu(s, d, in, wt, out, conv_params);
   }
 
@@ -757,6 +1151,184 @@ void conv_2D_gpu(
   else {
     return explicit_gemm_conv_ND_gpu(s, d, in, wt, out, conv_params);
   }
+}
+
+void depthwise_conv_1D_gpu(
+    const Stream& s,
+    metal::Device& d,
+    const array& in,
+    const array& wt,
+    array& out) {
+  bool large = in.size() > INT32_MAX || in.data_size() > INT32_MAX;
+  std::string base_name;
+  base_name.reserve(32);
+  concatenate(
+      base_name,
+      "depthwise_conv_1d_",
+      type_to_name(out),
+      large ? "_large" : "");
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = d.get_kernel(base_name);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  auto B = in.shape(0);
+  auto Tout = out.shape(1);
+  auto D = in.shape(2);
+  auto K = wt.shape(1);
+
+  compute_encoder.set_input_array(in, 0);
+  compute_encoder.set_input_array(wt, 1);
+  compute_encoder.set_output_array(out, 2);
+  if (large) {
+    int64_t strides[3] = {in.strides(0), in.strides(1), in.strides(2)};
+    compute_encoder.set_bytes(strides, 3, 3);
+
+  } else {
+    int strides[3] = {
+        static_cast<int>(in.strides(0)),
+        static_cast<int>(in.strides(1)),
+        static_cast<int>(in.strides(2))};
+    compute_encoder.set_bytes(strides, 3, 3);
+  }
+
+  compute_encoder.set_bytes(K, 4);
+  auto group_dims = get_block_dims(D, Tout, B);
+  MTL::Size grid_dims = MTL::Size(D, Tout, B);
+
+  compute_encoder.dispatch_threads(grid_dims, group_dims);
+}
+
+void conv_1D_gpu(
+    const Stream& s,
+    metal::Device& d,
+    const array& in_pre,
+    const array& wt_pre,
+    array& out,
+    const std::vector<int>& padding,
+    const std::vector<int>& wt_strides,
+    const std::vector<int>& wt_dilation,
+    const std::vector<int>& in_dilation,
+    int groups,
+    bool flip,
+    std::vector<array>& copies) {
+  // Allocate space and ensure weights are contiguous
+  out.set_data(allocator::malloc(out.nbytes()));
+  auto in = ensure_row_contiguous(in_pre, d, s);
+  auto wt = ensure_row_contiguous(wt_pre, d, s);
+
+  bool is_idil_one = in_dilation[0] == 1;
+  int C = in.shape(2);
+  int O = wt.shape(0);
+  // Fast path for fully separable 1D convolution
+  if (is_idil_one && (groups == C) && groups == O && wt_strides[0] == 1 &&
+      wt_dilation[0] == 1 && padding[0] == 0 && !flip) {
+    depthwise_conv_1D_gpu(s, d, in, wt, out);
+    return;
+  }
+
+  const int C_per_group = C / groups;
+  const int O_per_group = O / groups;
+
+  // Direct to implicit gemm conv
+  if (is_idil_one && (C_per_group <= 4 || C_per_group % 16 == 0) &&
+      (O_per_group <= 16 || O_per_group % 16 == 0)) {
+    MLXConvParams<2> conv_params{
+        /* const int  N = */ static_cast<int>(in.shape(0)),
+        /* const int  C = */ C,
+        /* const int  O = */ O,
+        /* const int iS[NDIM] = */ {static_cast<int>(in.shape(1)), 1},
+        /* const int wS[NDIM] = */ {static_cast<int>(wt.shape(1)), 1},
+        /* const int oS[NDIM] = */ {static_cast<int>(out.shape(1)), 1},
+        /* const int str[NDIM] = */ {wt_strides[0], 1},
+        /* const int pad[NDIM] = */ {padding[0], 0},
+        /* const int kdil[NDIM] = */ {wt_dilation[0], 1},
+        /* const int idil[NDIM] = */ {in_dilation[0], 1},
+        /* const size_t in_strides[NDIM + 2] = */
+        {in.strides()[0], in.strides()[1], 0, in.strides()[2]},
+        /* const size_t wt_strides[NDIM + 2] = */
+        {wt.strides()[0], wt.strides()[1], 0, wt.strides()[2]},
+        /* const size_t out_strides[NDIM + 2] = */
+        {out.strides()[0], out.strides()[1], 0, out.strides()[2]},
+        /* const int groups = */ groups,
+        /* const bool flip = */ flip};
+
+    dispatch_conv_2D_gpu(s, d, in, wt, out, conv_params, copies);
+    return;
+  }
+
+  // Make conv params
+  MLXConvParams<1> conv_params{
+      /* const int  N = */ static_cast<int>(in.shape(0)),
+      /* const int  C = */ static_cast<int>(in.shape(2)),
+      /* const int  O = */ static_cast<int>(wt.shape(0)),
+      /* const int iS[NDIM] = */ {static_cast<int>(in.shape(1))},
+      /* const int wS[NDIM] = */ {static_cast<int>(wt.shape(1))},
+      /* const int oS[NDIM] = */ {static_cast<int>(out.shape(1))},
+      /* const int str[NDIM] = */ {wt_strides[0]},
+      /* const int pad[NDIM] = */ {padding[0]},
+      /* const int kdil[NDIM] = */ {wt_dilation[0]},
+      /* const int idil[NDIM] = */ {in_dilation[0]},
+      /* const size_t in_strides[NDIM + 2] = */
+      {in.strides()[0], in.strides()[1], in.strides()[2]},
+      /* const size_t wt_strides[NDIM + 2] = */
+      {wt.strides()[0], wt.strides()[1], wt.strides()[2]},
+      /* const size_t out_strides[NDIM + 2] = */
+      {out.strides()[0], out.strides()[1], out.strides()[2]},
+      /* const int groups = */ groups,
+      /* const bool flip = */ flip};
+
+  // Direct to explicit gemm conv
+  if (groups > 1) {
+    return explicit_gemm_conv_group_ND_gpu(s, d, in, wt, out, conv_params);
+  } else {
+    return explicit_gemm_conv_ND_gpu(s, d, in, wt, out, conv_params);
+  }
+}
+
+void conv_2D_gpu(
+    const Stream& s,
+    metal::Device& d,
+    const array& in_pre,
+    const array& wt_pre,
+    array& out,
+    const std::vector<int>& padding,
+    const std::vector<int>& wt_strides,
+    const std::vector<int>& wt_dilation,
+    const std::vector<int>& in_dilation,
+    const int groups,
+    bool flip,
+    std::vector<array>& copies) {
+  // Allocate space and ensure weights are contiguous
+  out.set_data(allocator::malloc(out.nbytes()));
+  auto in = ensure_row_contiguous(in_pre, d, s);
+  auto wt = ensure_row_contiguous(wt_pre, d, s);
+
+  // Make conv params
+  MLXConvParams<2> conv_params{
+      /* const int  N = */ static_cast<int>(in.shape(0)),
+      /* const int  C = */ static_cast<int>(in.shape(3)),
+      /* const int  O = */ static_cast<int>(wt.shape(0)),
+      /* const int iS[NDIM] = */
+      {static_cast<int>(in.shape(1)), static_cast<int>(in.shape(2))},
+      /* const int wS[NDIM] = */
+      {static_cast<int>(wt.shape(1)), static_cast<int>(wt.shape(2))},
+      /* const int oS[NDIM] = */
+      {static_cast<int>(out.shape(1)), static_cast<int>(out.shape(2))},
+      /* const int str[NDIM] = */ {wt_strides[0], wt_strides[1]},
+      /* const int pad[NDIM] = */ {padding[0], padding[1]},
+      /* const int kdil[NDIM] = */ {wt_dilation[0], wt_dilation[1]},
+      /* const int idil[NDIM] = */ {in_dilation[0], in_dilation[1]},
+      /* const size_t in_strides[NDIM + 2] = */
+      {in.strides(0), in.strides(1), in.strides(2), in.strides(3)},
+      /* const size_t wt_strides[NDIM + 2] = */
+      {wt.strides(0), wt.strides(1), wt.strides(2), wt.strides(3)},
+      /* const size_t out_strides[NDIM + 2] = */
+      {out.strides(0), out.strides(1), out.strides(2), out.strides(3)},
+      /* const int groups = */ groups,
+      /* const bool flip = */ flip,
+  };
+  dispatch_conv_2D_gpu(s, d, in, wt, out, conv_params, copies);
 }
 
 void conv_3D_gpu(
@@ -769,16 +1341,37 @@ void conv_3D_gpu(
     const std::vector<int>& wt_strides,
     const std::vector<int>& wt_dilation,
     const std::vector<int>& in_dilation,
+    int groups,
     bool flip,
     std::vector<array>& copies) {
+  // We will use the contiguous strides for the conv params because that is
+  // what the rest of the code expects.
+  constexpr int NDIM = 3;
+  int64_t in_arr_strides[NDIM + 2];
+  int64_t wt_arr_strides[NDIM + 2];
+  in_arr_strides[NDIM + 1] = wt_arr_strides[NDIM + 1] = 1;
+  for (int i = NDIM; i >= 0; i--) {
+    in_arr_strides[i] = in_arr_strides[i + 1] * in.shape(i + 1);
+    wt_arr_strides[i] = wt_arr_strides[i + 1] * wt.shape(i + 1);
+  }
+
   // Make conv params
   MLXConvParams<3> conv_params{
-      /* const int  N = */ in.shape(0),
-      /* const int  C = */ in.shape(4),
-      /* const int  O = */ wt.shape(0),
-      /* const int iS[NDIM] = */ {in.shape(1), in.shape(2), in.shape(3)},
-      /* const int wS[NDIM] = */ {wt.shape(1), wt.shape(2), wt.shape(3)},
-      /* const int oS[NDIM] = */ {out.shape(1), out.shape(2), out.shape(3)},
+      /* const int  N = */ static_cast<int>(in.shape(0)),
+      /* const int  C = */ static_cast<int>(in.shape(4)),
+      /* const int  O = */ static_cast<int>(wt.shape(0)),
+      /* const int iS[NDIM] = */
+      {static_cast<int>(in.shape(1)),
+       static_cast<int>(in.shape(2)),
+       static_cast<int>(in.shape(3))},
+      /* const int wS[NDIM] = */
+      {static_cast<int>(wt.shape(1)),
+       static_cast<int>(wt.shape(2)),
+       static_cast<int>(wt.shape(3))},
+      /* const int oS[NDIM] = */
+      {static_cast<int>(out.shape(1)),
+       static_cast<int>(out.shape(2)),
+       static_cast<int>(out.shape(3))},
       /* const int str[NDIM] = */ {wt_strides[0], wt_strides[1], wt_strides[2]},
       /* const int pad[NDIM] = */ {padding[0], padding[1], padding[2]},
       /* const int kdil[NDIM] = */
@@ -786,52 +1379,42 @@ void conv_3D_gpu(
       /* const int idil[NDIM] = */
       {in_dilation[0], in_dilation[1], in_dilation[2]},
       /* const size_t in_strides[NDIM + 2] = */
-      {in.strides()[0],
-       in.strides()[1],
-       in.strides()[2],
-       in.strides()[3],
-       in.strides()[4]},
+      {in_arr_strides[0],
+       in_arr_strides[1],
+       in_arr_strides[2],
+       in_arr_strides[3],
+       in_arr_strides[4]},
       /* const size_t wt_strides[NDIM + 2] = */
-      {wt.strides()[0],
-       wt.strides()[1],
-       wt.strides()[2],
-       wt.strides()[3],
-       wt.strides()[4]},
+      {wt_arr_strides[0],
+       wt_arr_strides[1],
+       wt_arr_strides[2],
+       wt_arr_strides[3],
+       wt_arr_strides[4]},
       /* const size_t out_strides[NDIM + 2] = */
-      {out.strides()[0],
-       out.strides()[1],
-       out.strides()[2],
-       out.strides()[3],
-       out.strides()[4]},
-      /* const int groups = */ 1,
+      {out.strides(0),
+       out.strides(1),
+       out.strides(2),
+       out.strides(3),
+       out.strides(4)},
+      /* const int groups = */ groups,
       /* const bool flip = */ flip,
   };
-  return explicit_gemm_conv_ND_gpu(s, d, in, wt, out, conv_params);
+  return dispatch_conv_3D_gpu(s, d, in, wt, out, conv_params, copies);
 }
 
 } // namespace
 
 void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
-  out.set_data(allocator::malloc_or_wait(out.nbytes()));
   auto& s = stream();
   auto& d = metal::device(s.device);
 
-  // Ensure contiguity
+  // Intermediates that are put here will be added to the command encoder as
+  // temporaries.
   std::vector<array> copies;
-  auto in = inputs[0];
-  auto wt = inputs[1];
-  if (!in.flags().row_contiguous) {
-    array arr_copy(in.shape(), in.dtype(), nullptr, {});
-    copy_gpu(in, arr_copy, CopyType::General, s);
-    copies.push_back(arr_copy);
-    in = arr_copy;
-  }
-  if (!wt.flags().row_contiguous) {
-    array arr_copy(wt.shape(), wt.dtype(), nullptr, {});
-    copy_gpu(wt, arr_copy, CopyType::General, s);
-    copies.push_back(arr_copy);
-    wt = arr_copy;
-  }
+
+  // Some shortcuts for brevity
+  const array& in = inputs[0];
+  const array& wt = inputs[1];
 
   // 3D conv
   if (out.ndim() == 5) {
@@ -841,10 +1424,11 @@ void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
         in,
         wt,
         out,
-        padding_,
+        padding_lo_,
         kernel_strides_,
         kernel_dilation_,
         input_dilation_,
+        groups_,
         flip_,
         copies);
   }
@@ -856,10 +1440,11 @@ void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
         in,
         wt,
         out,
-        padding_,
+        padding_lo_,
         kernel_strides_,
         kernel_dilation_,
         input_dilation_,
+        groups_,
         flip_,
         copies);
   }
@@ -871,24 +1456,23 @@ void Convolution::eval_gpu(const std::vector<array>& inputs, array& out) {
         in,
         wt,
         out,
-        padding_,
+        padding_lo_,
         kernel_strides_,
         kernel_dilation_,
         input_dilation_,
         groups_,
-        flip_);
+        flip_,
+        copies);
   }
   // Throw error
   else {
     throw std::invalid_argument(
-        "[Convolution::eval_gpu] Only supports 1D or 2D convolutions.");
+        "[Convolution::eval_gpu] Only supports 1D, 2D or 3D convolutions.");
   }
 
-  // Clear copies
-  if (copies.size() > 0) {
-    auto command_buffer = d.get_command_buffer(s.index);
-    command_buffer->addCompletedHandler(
-        [copies](MTL::CommandBuffer*) mutable { copies.clear(); });
+  // Record copies
+  if (!copies.empty()) {
+    metal::get_command_encoder(s).add_temporaries(std::move(copies));
   }
 }
 

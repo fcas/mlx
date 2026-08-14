@@ -2,107 +2,22 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include "mlx/array.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/primitives.h"
 
 namespace mlx::core {
 
-namespace {
+MLX_API std::string type_to_name(const Dtype& t);
+MLX_API std::string type_to_name(const array& a);
 
-using metal::CommandEncoder;
-
-template <typename T>
-inline void set_vector_bytes(
-    CommandEncoder& enc,
-    const std::vector<T>& vec,
-    size_t nelems,
-    int idx) {
-  enc->setBytes(vec.data(), nelems * sizeof(T), idx);
-}
-
-template <typename T>
-inline void
-set_vector_bytes(CommandEncoder& enc, const std::vector<T>& vec, int idx) {
-  return set_vector_bytes(enc, vec, vec.size(), idx);
-}
-
-std::string type_to_name(const array& a) {
-  std::string tname;
-  switch (a.dtype()) {
-    case bool_:
-      tname = "bool_";
-      break;
-    case uint8:
-      tname = "uint8";
-      break;
-    case uint16:
-      tname = "uint16";
-      break;
-    case uint32:
-      tname = "uint32";
-      break;
-    case uint64:
-      tname = "uint64";
-      break;
-    case int8:
-      tname = "int8";
-      break;
-    case int16:
-      tname = "int16";
-      break;
-    case int32:
-      tname = "int32";
-      break;
-    case int64:
-      tname = "int64";
-      break;
-    case float16:
-      tname = "float16";
-      break;
-    case float32:
-      tname = "float32";
-      break;
-    case bfloat16:
-      tname = "bfloat16";
-      break;
-    case complex64:
-      tname = "complex64";
-      break;
-  }
-  return tname;
-}
-
-MTL::Size get_block_dims(int dim0, int dim1, int dim2) {
-  int pows[3] = {0, 0, 0};
-  int sum = 0;
-  while (true) {
-    int presum = sum;
-    // Check all the pows
-    if (dim0 >= (1 << (pows[0] + 1))) {
-      pows[0]++;
-      sum++;
-    }
-    if (sum == 10) {
-      break;
-    }
-    if (dim1 >= (1 << (pows[1] + 1))) {
-      pows[1]++;
-      sum++;
-    }
-    if (sum == 10) {
-      break;
-    }
-    if (dim2 >= (1 << (pows[2] + 1))) {
-      pows[2]++;
-      sum++;
-    }
-    if (sum == presum || sum == 10) {
-      break;
-    }
-  }
-  return MTL::Size{1ul << pows[0], 1ul << pows[1], 1ul << pows[2]};
-}
+// Compute the grid and block dimensions, check backend/common/utils.h for docs.
+MTL::Size get_block_dims(int dim0, int dim1, int dim2, int pow2 = 10);
+MTL::Size get_2d_grid_dims(const Shape& shape, const Strides& strides);
+MTL::Size
+get_2d_grid_dims(const Shape& shape, const Strides& strides, size_t divisor);
 
 inline NS::String* make_string(std::ostringstream& os) {
   std::string string = os.str();
@@ -125,15 +40,60 @@ inline void debug_set_primitive_buffer_label(
   if (auto cbuf_label = command_buffer->label(); cbuf_label) {
     label << cbuf_label->utf8String();
   }
-  primitive.print(label);
+  label << primitive.name();
   command_buffer->setLabel(make_string(label));
 #endif
 }
 
-bool is_power_of_2(int n) {
-  return ((n & (n - 1)) == 0) && n != 0;
+template <typename T>
+constexpr bool is_numeric_except_char = std::is_arithmetic_v<T> &&
+    !std::is_same_v<T, char> && !std::is_same_v<T, signed char> &&
+    !std::is_same_v<T, unsigned char> && !std::is_same_v<T, wchar_t>;
+
+template <typename T>
+void concatenate(std::string& acc, T first) {
+  if constexpr (is_numeric_except_char<T>) {
+    acc += std::to_string(first);
+  } else {
+    acc += first;
+  }
 }
 
-} // namespace
+template <typename T, typename... Args>
+void concatenate(std::string& acc, T first, Args... args) {
+  if constexpr (is_numeric_except_char<T>) {
+    acc += std::to_string(first);
+  } else {
+    acc += first;
+  }
+  concatenate(acc, args...);
+}
+
+inline int get_work_per_thread(Dtype dtype) {
+  return std::max(1, 8 / dtype.size());
+}
+inline int get_work_per_thread(Dtype dtype, size_t size) {
+  constexpr size_t wpt_threshold = 1 << 16;
+  return size < wpt_threshold ? 1 : std::max(1, 8 / dtype.size());
+}
+
+inline size_t ceildiv(size_t n, size_t m) {
+  return (n + m - 1) / m;
+}
+
+inline void check_kernel_threadgroup_size(
+    const MTL::ComputePipelineState* kernel,
+    MTL::Size group_dims,
+    const std::string& name) {
+  auto max_size = kernel->maxTotalThreadsPerThreadgroup();
+  auto requested_size = group_dims.width * group_dims.height * group_dims.depth;
+
+  if (max_size < requested_size) {
+    std::ostringstream msg;
+    msg << "Maximum threads per threadgroup is " << max_size
+        << " but requested " << requested_size << " for kernel " << name << ".";
+    throw std::runtime_error(msg.str());
+  }
+}
 
 } // namespace mlx::core

@@ -34,12 +34,8 @@ TEST_CASE("test simple vmap") {
     CHECK_THROWS_AS(vmap(fun, 0, -1), std::invalid_argument);
     CHECK_THROWS_AS(vmap(fun, -1, 0), std::invalid_argument);
 
-    auto vfun = vmap(fun, -1, -1);
-    auto x = zeros({2});
-    CHECK(array_equal(vfun(x), zeros({4, 2})).item<bool>());
-
-    vfun = vmap(fun);
-    x = zeros({3, 2});
+    auto vfun = vmap(fun);
+    auto x = zeros({3, 2});
     CHECK(array_equal(vfun(x), zeros({3, 4, 2})).item<bool>());
 
     vfun = vmap(fun, 0, 1);
@@ -121,15 +117,8 @@ TEST_CASE("test simple vmap") {
     out = vfun({x, y})[0];
     CHECK(array_equal(out, full({3, 2}, 2.0)).item<bool>());
 
-    CHECK_THROWS_AS(vmap(fun, {-1, -1}, {0}), std::invalid_argument);
     CHECK_THROWS_AS(vmap(fun, {-1, 0}, {-1}), std::invalid_argument);
     CHECK_THROWS_AS(vmap(fun, {0, -1}, {-1}), std::invalid_argument);
-
-    x = array(1.);
-    y = array(1.);
-    vfun = vmap(fun, {-1, -1}, {-1});
-    out = vfun({x, y})[0];
-    CHECK(array_equal(out, array(2.)).item<bool>());
 
     x = ones({3, 2, 1});
     y = ones({3, 2, 1});
@@ -186,13 +175,6 @@ TEST_CASE("test simple vmap") {
     CHECK_THROWS_AS(vmap(fun, {-1, 0, -1}, {-1}), std::invalid_argument);
     CHECK_THROWS_AS(vmap(fun, {-1, -1, 0}, {-1}), std::invalid_argument);
     CHECK_THROWS_AS(vmap(fun, {0, -1, -1}, {-1}), std::invalid_argument);
-
-    cond = array({true, false});
-    x = array(1.);
-    y = array(2.);
-    vfun = vmap(fun, {-1, -1, -1}, {-1});
-    out = vfun({cond, x, y})[0];
-    CHECK(array_equal(out, array({1.0, 2.0})).item<bool>());
 
     cond = array({1, 1, 1, 0, 0, 0}, {3, 2, 1});
     x = ones({3, 2, 1});
@@ -353,95 +335,270 @@ TEST_CASE("test vmap gather") {
     auto fun = [](std::vector<array> inputs) {
       auto src = inputs[0];
       auto indices = inputs[1];
-      std::vector<int> slice_sizes = {1, 2, 2};
-      auto out = squeeze(gather(src, indices, 0, slice_sizes), 2);
+      auto out = squeeze(gather(src, indices, 0, {1, 2, 2}), 2);
       return std::vector<array>{out};
     };
     auto x = zeros({2, 2, 2, 2});
     auto y = array({0, 1, 0, 0, 1, 0}, {2, 3});
     auto out = vmap(fun, {0, -1})({x, y})[0];
-    CHECK_EQ(out.shape(), std::vector<int>{2, 2, 3, 2, 2});
+    CHECK_EQ(out.shape(), Shape{2, 2, 3, 2, 2});
     out = vmap(fun, {0, -1}, {3})({x, y})[0];
-    CHECK_EQ(out.shape(), std::vector<int>{2, 3, 2, 2, 2});
+    CHECK_EQ(out.shape(), Shape{2, 3, 2, 2, 2});
   }
 
   {
     auto fun = [](std::vector<array> inputs) {
       auto src = inputs[0];
       auto indices = inputs[1];
-      std::vector<int> slice_sizes = {1, 2, 2};
-      auto out = squeeze(gather(src, indices, 0, slice_sizes), 1);
+      auto out = squeeze(gather(src, indices, 0, {1, 2, 2}), 1);
       return std::vector<array>{out};
     };
     auto x = zeros({2, 2, 2, 2});
     auto y = array({0, 1, 0, 0, 1, 0}, {2, 3});
     auto out = vmap(fun, {0, 0})({x, y})[0];
-    CHECK_EQ(out.shape(), std::vector<int>{2, 3, 2, 2});
+    CHECK_EQ(out.shape(), Shape{2, 3, 2, 2});
   }
 
   {
     auto fun = [](std::vector<array> inputs) {
       auto src = inputs[0];
       auto indices = inputs[1];
-      std::vector<int> slice_sizes = {1, 2, 2, 2};
-      auto out = squeeze(gather(src, indices, 0, slice_sizes), 1);
+      auto out = squeeze(gather(src, indices, 0, {1, 2, 2, 2}), 1);
       return std::vector<array>{out};
     };
     auto x = zeros({2, 2, 2, 2});
     auto y = array({0, 1, 0, 0, 1, 0}, {2, 3});
 
     auto out = vmap(fun, {-1, 0})({x, y})[0];
-    CHECK_EQ(out.shape(), std::vector<int>{2, 3, 2, 2, 2});
+    CHECK_EQ(out.shape(), Shape{2, 3, 2, 2, 2});
   }
 
   {
     auto fun = [](std::vector<array> inputs) {
       auto src = inputs[0];
       auto indices = std::vector<array>(inputs.begin() + 1, inputs.end());
-      std::vector<int> slice_sizes = {1, 1, 2, 2};
-      auto out = squeeze(gather(src, indices, {0, 1}, slice_sizes), {1, 2});
+      auto out = squeeze(gather(src, indices, {0, 1}, {1, 1, 2, 2}), {1, 2});
       return std::vector<array>{out};
     };
     auto x = zeros({2, 2, 2, 2});
     auto y = array({0, 1, 0, 0, 1, 0}, {2, 3});
     auto z = array({0, 1, 0, 0, 1, 0}, {2, 3});
     auto out = vmap(fun, {-1, 0, 0})({x, y, z})[0];
-    CHECK_EQ(out.shape(), std::vector<int>{2, 3, 2, 2});
+    CHECK_EQ(out.shape(), Shape{2, 3, 2, 2});
 
     z = array({0, 1, 0, 0, 1, 0}, {3, 2});
     out = vmap(fun, {-1, 0, 1})({x, y, z})[0];
-    CHECK_EQ(out.shape(), std::vector<int>{2, 3, 2, 2});
+    CHECK_EQ(out.shape(), Shape{2, 3, 2, 2});
+  }
+}
+
+TEST_CASE("test vmap take_along_axis with unmapped input and mapped index") {
+  auto fun = [](std::vector<array> inputs) {
+    return std::vector<array>{take_along_axis(inputs[0], inputs[1], 0)};
+  };
+
+  auto a = reshape(arange(60), {4, 5, 3});
+  auto idx = zeros({2, 2, 1, 3}, int32);
+
+  auto out = vmap(fun, {-1, 0})({a, idx})[0];
+  CHECK_EQ(out.shape(), Shape{2, 2, 5, 3});
+}
+
+TEST_CASE("test vmap scatter") {
+  auto make_scatter_fn = [](const std::vector<array>& indices,
+                            const array& updates,
+                            const std::vector<int>& axes) {
+    return [=](const std::vector<array>& inputs) {
+      auto a = inputs.at(0);
+      return std::vector<array>{scatter(a, indices, updates, axes)};
+    };
+  };
+
+  {
+    // vmap src on axis 0, scatter on axis 0.
+    auto a = zeros({2, 3, 4});
+    auto indices = array({1});
+    auto updates = reshape(array({1, 2}, float32), {1, 1, 2});
+
+    auto func = make_scatter_fn({indices}, updates, std::vector<int>{0});
+    auto out = vmap(func, /* in_axes = */ {0})({a})[0];
+    auto expected = array(
+        {0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0,
+         0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0},
+        {2, 3, 4},
+        float32);
+    CHECK(array_equal(out, expected).item<bool>());
+  }
+
+  {
+    // vmap src on axis 1, scatter on axis 0.
+    auto a = zeros({3, 2, 4});
+    auto indices = array({1});
+    auto updates = reshape(array({1, 2}, float32), {1, 1, 2});
+
+    auto func = make_scatter_fn({indices}, updates, std::vector<int>{0});
+    auto out = vmap(func, /* in_axes = */ {1}, /* out_axes = */ {1})({a})[0];
+    auto expected = array(
+        {0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0,
+         1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        {3, 2, 4},
+        float32);
+    CHECK(array_equal(out, expected).item<bool>());
+  }
+
+  {
+    // vmap src on axis 0, scatter on axis 1.
+    auto a = zeros({2, 3, 4});
+    auto indices = array({1});
+    auto updates = reshape(array({1, 2}, float32), {1, 2, 1});
+
+    auto func = make_scatter_fn({indices}, updates, std::vector<int>{1});
+    auto out = vmap(func, /* in_axes = */ {0})({a})[0];
+    auto expected = array(
+        {0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0,
+         0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0},
+        {2, 3, 4},
+        float32);
+    CHECK(array_equal(out, expected).item<bool>());
+  }
+
+  {
+    // vmap src on axis 2, scatter on axes (0, 1).
+    auto a = zeros({2, 3, 2});
+    auto indices = {array({1}), array({2})};
+    auto axes = {0, 1};
+    auto updates = reshape(array({1}, float32), {1, 1, 1});
+
+    auto func = make_scatter_fn(indices, updates, axes);
+    auto out = vmap(func, /* in_axes = */ {2}, /* out_axes = */ {2})({a})[0];
+    auto expected =
+        array({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1}, {2, 3, 2}, float32);
+    CHECK(array_equal(out, expected).item<bool>());
   }
 }
 
 TEST_CASE("test vmap SVD") {
-  auto fun = [](std::vector<array> inputs) {
-    return linalg::svd(inputs.at(0), Device::cpu);
+  auto svd_full = [](std::vector<array> inputs) {
+    return linalg::svd(inputs.at(0), true, Device::cpu);
+  };
+
+  auto svd_singular = [](std::vector<array> inputs) {
+    return linalg::svd(inputs.at(0), false, Device::cpu);
   };
 
   auto a = astype(reshape(arange(24), {3, 4, 2}), float32);
 
   // vmap over the second axis.
   {
-    auto out = vmap(fun, /* in_axes = */ {1})({a});
+    auto out = vmap(svd_full, /* in_axes = */ {1})({a});
     const auto& U = out.at(0);
     const auto& S = out.at(1);
     const auto& Vt = out.at(2);
 
-    CHECK_EQ(U.shape(), std::vector<int>{a.shape(1), a.shape(0), a.shape(0)});
-    CHECK_EQ(S.shape(), std::vector<int>{a.shape(1), a.shape(2)});
-    CHECK_EQ(Vt.shape(), std::vector<int>{a.shape(1), a.shape(2), a.shape(2)});
+    CHECK_EQ(U.shape(), Shape{a.shape(1), a.shape(0), a.shape(0)});
+    CHECK_EQ(S.shape(), Shape{a.shape(1), a.shape(2)});
+    CHECK_EQ(Vt.shape(), Shape{a.shape(1), a.shape(2), a.shape(2)});
   }
 
   // vmap over the third axis.
   {
-    auto out = vmap(fun, /* in_axes = */ {2})({a});
+    auto out = vmap(svd_full, /* in_axes = */ {2})({a});
     const auto& U = out.at(0);
     const auto& S = out.at(1);
     const auto& Vt = out.at(2);
 
-    CHECK_EQ(U.shape(), std::vector<int>{a.shape(2), a.shape(0), a.shape(0)});
-    CHECK_EQ(S.shape(), std::vector<int>{a.shape(2), a.shape(0)});
-    CHECK_EQ(Vt.shape(), std::vector<int>{a.shape(2), a.shape(1), a.shape(1)});
+    CHECK_EQ(U.shape(), Shape{a.shape(2), a.shape(0), a.shape(0)});
+    CHECK_EQ(S.shape(), Shape{a.shape(2), a.shape(0)});
+    CHECK_EQ(Vt.shape(), Shape{a.shape(2), a.shape(1), a.shape(1)});
+  }
+
+  // test singular values
+  {
+    auto out = vmap(svd_singular, /* in_axes = */ {1})({a});
+    const auto& S = out.at(0);
+
+    CHECK_EQ(S.shape(), Shape{a.shape(1), a.shape(2)});
+  }
+
+  {
+    auto out = vmap(svd_singular, /* in_axes = */ {2})({a});
+    const auto& S = out.at(0);
+
+    CHECK_EQ(S.shape(), Shape{a.shape(2), a.shape(0)});
+  }
+}
+
+TEST_CASE("test vmap dynamic slices") {
+  {
+    auto fun = [](std::vector<array> inputs) {
+      return std::vector<array>{slice(inputs[0], array({1}), {0}, {2})};
+    };
+    auto x = reshape(arange(12), {3, 4});
+    auto out = vmap(fun)({x})[0];
+    CHECK(array_equal(out, array({1, 2, 5, 6, 9, 10}, {3, 2})).item<bool>());
+
+    out = vmap(fun, /* in_axes */ {1}, /* out_axes */ {1})({x})[0];
+    CHECK(array_equal(out, array({4, 5, 6, 7, 8, 9, 10, 11}, {2, 4}))
+              .item<bool>());
+  }
+
+  {
+    auto fun = [](std::vector<array> inputs) {
+      return std::vector<array>{
+          slice_update(inputs[0], inputs[1], array({1}), {0})};
+    };
+    auto x = zeros({2, 2});
+    auto upd = ones({2, 1});
+
+    auto out = vmap(fun)({x, upd})[0];
+    CHECK(array_equal(out, array({0, 1, 0, 1}, {2, 2})).item<bool>());
+
+    out = vmap(fun, /* in_axes */ {1, 0}, /* out_axes */ {1})({x, upd})[0];
+    CHECK(array_equal(out, array({0, 0, 1, 1}, {2, 2})).item<bool>());
+  }
+}
+
+TEST_CASE("test vmap floor_divide integer") {
+  // floor_divide with integer inputs should preserve integer dtype under vmap.
+  // Bug: Divide::vmap called divide() which promotes integers to float.
+  {
+    auto x = arange(0, 25, int32);
+    auto divisor = array(5, int32);
+
+    // Without vmap: floor_divide returns int32
+    auto expected = floor_divide(x, divisor);
+    CHECK_EQ(expected.dtype(), int32);
+
+    // With vmap: should also return int32
+    auto vfun = vmap([&divisor](array s) { return floor_divide(s, divisor); });
+    auto result = vfun(x);
+    CHECK_EQ(result.dtype(), int32);
+    CHECK(array_equal(result, expected).item<bool>());
+  }
+
+  // Also check remainder preserves integer dtype under vmap
+  {
+    auto x = arange(0, 10, int32);
+    auto divisor = array(3, int32);
+
+    auto expected = remainder(x, divisor);
+    auto vfun = vmap([&divisor](array s) { return remainder(s, divisor); });
+    auto result = vfun(x);
+    CHECK_EQ(result.dtype(), int32);
+    CHECK(array_equal(result, expected).item<bool>());
+  }
+
+  // floor_divide + remainder: should reconstruct original
+  {
+    auto x = arange(0, 25, int32);
+    auto w = array(5, int32);
+
+    auto vfun = vmap([&w](array s) {
+      auto q = floor_divide(s, w);
+      auto r = remainder(s, w);
+      return add(multiply(q, w), r);
+    });
+    auto result = vfun(x);
+    CHECK(array_equal(result, x).item<bool>());
   }
 }

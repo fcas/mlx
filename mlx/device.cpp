@@ -1,31 +1,64 @@
-// Copyright © 2023 Apple Inc.
+// Copyright © 2023-2026 Apple Inc.
 
+#include <stdexcept>
+
+#include "mlx/backend/cpu/device_info.h"
+#include "mlx/backend/gpu/device_info.h"
 #include "mlx/device.h"
-#include "mlx/backend/metal/metal.h"
 
 namespace mlx::core {
 
-static Device default_device_{
-    metal::is_available() ? Device::gpu : Device::cpu};
+Device& mutable_default_device() {
+  static Device default_device{gpu::is_available() ? Device::gpu : Device::cpu};
+  return default_device;
+}
 
 const Device& default_device() {
-  return default_device_;
+  return mutable_default_device();
 }
 
 void set_default_device(const Device& d) {
-  if (!metal::is_available() && d == Device::gpu) {
+  if (!gpu::is_available() && d == Device::gpu) {
     throw std::invalid_argument(
         "[set_default_device] Cannot set gpu device without gpu backend.");
   }
-  default_device_ = d;
+  mutable_default_device() = d;
 }
 
-bool operator==(const Device& lhs, const Device& rhs) {
-  return lhs.type == rhs.type && lhs.index == rhs.index;
+bool is_available(const Device& d) {
+  switch (d.type) {
+    case Device::cpu:
+      return cpu::is_available() && (d.index < cpu::device_count());
+    case Device::gpu:
+      return gpu::is_available() && (d.index < gpu::device_count());
+  }
+  // appease compiler
+  return false;
 }
 
-bool operator!=(const Device& lhs, const Device& rhs) {
-  return !(lhs == rhs);
+int device_count(Device::DeviceType type) {
+  switch (type) {
+    case Device::cpu:
+      return cpu::device_count();
+    case Device::gpu:
+      return gpu::device_count();
+  }
+  // appease compiler
+  return 0;
+}
+
+const std::unordered_map<std::string, std::variant<std::string, size_t>>&
+device_info(const Device& d) {
+  switch (d.type) {
+    case Device::cpu:
+      return cpu::device_info(d.index);
+    case Device::gpu:
+      return gpu::device_info(d.index);
+  }
+  // appease compiler
+  static std::unordered_map<std::string, std::variant<std::string, size_t>>
+      empty;
+  return empty;
 }
 
 } // namespace mlx::core

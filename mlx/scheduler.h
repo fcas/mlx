@@ -5,11 +5,12 @@
 #include <atomic>
 #include <future>
 #include <queue>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 
-#include "mlx/backend/metal/metal.h"
-#include "mlx/backend/metal/metal_impl.h"
+#include "mlx/api.h"
+#include "mlx/backend/gpu/eval.h"
 #include "mlx/device.h"
 #include "mlx/stream.h"
 
@@ -20,18 +21,13 @@ struct StreamThread {
   std::queue<std::function<void()>> q;
   std::condition_variable cond;
   bool stop;
-  Stream stream;
   std::thread thread;
 
-  StreamThread(Stream stream)
-      : stop(false), stream(stream), thread(&StreamThread::thread_fn, this) {
-    metal::new_stream(stream);
-  }
+  StreamThread() : stop(false), thread(&StreamThread::thread_fn, this) {}
 
   ~StreamThread() {
-    synchronize(stream);
     {
-      std::unique_lock<std::mutex> lk(mtx);
+      std::lock_guard<std::mutex> lk(mtx);
       stop = true;
     }
     cond.notify_one();
@@ -55,28 +51,23 @@ struct StreamThread {
     }
   }
 
-  template <typename F>
-  void enqueue(F&& f) {
+  void enqueue(std::function<void()> f) {
     {
-      std::unique_lock<std::mutex> lk(mtx);
+      std::lock_guard<std::mutex> lk(mtx);
       if (stop) {
         throw std::runtime_error(
             "Cannot enqueue work after stream is stopped.");
       }
-      q.emplace(std::forward<F>(f));
+      q.emplace(std::move(f));
     }
     cond.notify_one();
   }
 };
 
-class Scheduler {
+class MLX_API Scheduler {
  public:
-  Scheduler() : n_active_tasks_(0) {
-    if (metal::is_available()) {
-      default_streams_.insert({Device::gpu, new_stream(Device::gpu)});
-    }
-    default_streams_.insert({Device::cpu, new_stream(Device::cpu)});
-  }
+  Scheduler();
+  ~Scheduler();
 
   // Not copyable or moveable
   Scheduler(const Scheduler&) = delete;
@@ -84,26 +75,11 @@ class Scheduler {
   Scheduler& operator=(const Scheduler&) = delete;
   Scheduler& operator=(Scheduler&&) = delete;
 
-  Stream new_stream(const Device& d) {
-    auto stream = Stream(streams_.size(), d);
-    streams_.push_back(new StreamThread{stream});
-    return stream;
-  }
-
-  template <typename F>
-  void enqueue(const Stream& stream, F&& f);
-
-  Stream get_default_stream(const Device& d) {
-    return default_streams_.at(d.type);
-  }
-
-  void set_default_stream(const Stream& s) {
-    default_streams_.at(s.device.type) = s;
-  }
+  void enqueue(Stream s, std::function<void()> task);
 
   void notify_new_task(const Stream& stream) {
     {
-      std::unique_lock<std::mutex> lk(mtx);
+      std::lock_guard<std::mutex> lk(mtx);
       n_active_tasks_++;
     }
     completion_cv.notify_all();
@@ -111,7 +87,7 @@ class Scheduler {
 
   void notify_task_completion(const Stream& stream) {
     {
-      std::unique_lock<std::mutex> lk(mtx);
+      std::lock_guard<std::mutex> lk(mtx);
       n_active_tasks_--;
     }
     completion_cv.notify_all();
@@ -126,31 +102,22 @@ class Scheduler {
     int n_tasks_old = n_active_tasks();
     if (n_tasks_old > 1) {
       completion_cv.wait(lk, [this, n_tasks_old] {
-        return this->n_active_tasks() != n_tasks_old;
+        return this->n_active_tasks() < n_tasks_old;
       });
     }
   }
 
-  ~Scheduler() {
-    for (auto s : streams_) {
-      delete s;
-    }
-  }
-
  private:
-  int n_active_tasks_;
-  std::vector<StreamThread*> streams_;
-  std::unordered_map<Device::DeviceType, Stream> default_streams_;
+  friend Stream mlx::core::new_stream(Device d);
+
+  int n_active_tasks_{0};
+  std::unordered_map<int, std::unique_ptr<StreamThread>> threads_;
+  std::shared_mutex threads_mtx_;
   std::condition_variable completion_cv;
   std::mutex mtx;
 };
 
-template <typename F>
-void Scheduler::enqueue(const Stream& stream, F&& f) {
-  streams_[stream.index]->enqueue(std::forward<F>(f));
-}
-
-Scheduler& scheduler();
+MLX_API Scheduler& scheduler();
 
 template <typename F>
 void enqueue(const Stream& stream, F&& f) {

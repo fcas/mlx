@@ -51,6 +51,8 @@ def step_decay(init: float, decay_rate: float, step_size: int) -> Callable:
         >>> optimizer.learning_rate
         array(0.081, dtype=float32)
     """
+    if step_size < 1:
+        raise ValueError(f"step_size must be greater than 0, but got {step_size}.")
 
     def schedule(step):
         return init * (decay_rate ** (step // step_size))
@@ -58,14 +60,14 @@ def step_decay(init: float, decay_rate: float, step_size: int) -> Callable:
     return schedule
 
 
-def cosine_decay(init: float, decay_steps: int, minimum: float = 0.0) -> Callable:
+def cosine_decay(init: float, decay_steps: int, end: float = 0.0) -> Callable:
     r"""Make a cosine decay scheduler.
 
     Args:
         init (float): Initial value.
         decay_steps (int): Number of steps to decay over. The decayed
             value is constant for steps beyond ``decay_steps``.
-        minimum (float, optional): Minimal value to decay to. Default: ``0``.
+        end (float, optional): Final value to decay to. Default: ``0``.
 
     Example:
 
@@ -79,13 +81,15 @@ def cosine_decay(init: float, decay_steps: int, minimum: float = 0.0) -> Callabl
         >>> optimizer.learning_rate
         array(0.0999961, dtype=float32)
     """
+    if decay_steps < 1:
+        raise ValueError(f"decay_steps must be greater than 0, but got {decay_steps}.")
 
-    def scheduler(step):
+    def schedule(step):
         s = mx.minimum(step, decay_steps)
         decay = 0.5 * (1.0 + mx.cos((math.pi / decay_steps) * s))
-        return mx.maximum(init * decay, minimum)
+        return end + decay * (init - end)
 
-    return scheduler
+    return schedule
 
 
 def join_schedules(schedules: List[Callable], boundaries: List[int]) -> Callable:
@@ -99,9 +103,9 @@ def join_schedules(schedules: List[Callable], boundaries: List[int]) -> Callable
           that indicates when to transition between schedules.
 
     Example:
-        >>> warmup = optim.linear_schedule(0, 1e-1, steps=10)
+        >>> linear = optim.linear_schedule(0, 1e-1, steps=10)
         >>> cosine = optim.cosine_decay(1e-1, 200)
-        >>> lr_schedule = optim.join_schedules([warmup, cosine], [10])
+        >>> lr_schedule = optim.join_schedules([linear, cosine], [10])
         >>> optimizer = optim.Adam(learning_rate=lr_schedule)
         >>> optimizer.learning_rate
         array(0.0, dtype=float32)
@@ -139,8 +143,8 @@ def linear_schedule(init: float, end: float, steps: int) -> Callable:
 
     Example:
 
-        >>> warmup = optim.linear_schedule(0, 1e-1, 100)
-        >>> optimizer = optim.Adam(learning_rate=warmup)
+        >>> lr_schedule = optim.linear_schedule(0, 1e-1, 100)
+        >>> optimizer = optim.Adam(learning_rate=lr_schedule)
         >>> optimizer.learning_rate
         array(0.0, dtype=float32)
         >>> for _ in range(101): optimizer.update({}, {})
@@ -151,8 +155,8 @@ def linear_schedule(init: float, end: float, steps: int) -> Callable:
     if steps < 1:
         raise ValueError(f"steps must be greater than 0, but got {steps}.")
 
-    def step_fn(step):
+    def schedule(step):
         step = mx.minimum(step, steps)
         return step * ((end - init) / steps) + init
 
-    return step_fn
+    return schedule
